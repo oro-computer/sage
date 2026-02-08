@@ -1,0 +1,82 @@
+module sage::os;
+
+import std::runtime::posix::fs;
+
+// ---------------------------------------------------------------------------
+// POSIX/libc bindings used by `sage`.
+//
+// NOTE: These are intentionally centralized so platform assumptions stay in
+// one place. The hosted baseline here is linux/glibc on x86_64.
+
+/**
+ * `isatty(3)` — test whether a file descriptor refers to a terminal.
+ *
+ * @returns int 1 for yes, 0 for no, -1 for error.
+ */
+export ext isatty = fn (int) -> int;
+
+/**
+ * `memchr(3)` — find the first byte in a memory region.
+ */
+export ext memchr = fn (u64, int, i64) -> u64;
+
+/**
+ * `memmem(3)` — find a byte substring in a memory region (glibc).
+ */
+export ext memmem = fn (u64, i64, u64, i64) -> u64;
+
+/**
+ * `memrchr(3)` — find the last byte in a memory region (glibc).
+ */
+export ext memrchr = fn (u64, int, i64) -> u64;
+
+/**
+ * `mmap(2)` — map a file into memory.
+ */
+export ext mmap = fn (u64, i64, int, int, int, i64) -> u64;
+
+/**
+ * `munmap(2)` — unmap a memory mapping.
+ */
+export ext munmap = fn (u64, i64) -> int;
+
+/**
+ * `ioctl(2)` — device control (used for TTY window size).
+ */
+export ext ioctl = fn (int, u64, u64) -> int;
+
+/**
+ * `tcgetattr(3)` — get terminal attributes (termios).
+ */
+export ext tcgetattr = fn (int, u64) -> int;
+
+/**
+ * `tcsetattr(3)` — set terminal attributes (termios).
+ */
+export ext tcsetattr = fn (int, int, u64) -> int;
+
+/**
+ * `mkstemp(3)` — create a unique temporary file from a template.
+ *
+ * The template must be a writable NUL-terminated byte string ending in
+ * `XXXXXX`. `mkstemp` modifies it in place.
+ */
+export ext mkstemp = fn (u64) -> int;
+
+// `mmap` constants (linux hosted baseline).
+export const PROT_READ: int = 1;
+export const MAP_PRIVATE: int = 2;
+export const MAP_FAILED: u64 = 18446744073709551615;
+
+// `tcsetattr` actions (termios).
+export const TCSAFLUSH: int = 2;
+
+// `ioctl` requests (linux hosted baseline).
+export const TIOCGWINSZ: u64 = 21523; // 0x5413
+
+/**
+ * Read `errno` via the hosted POSIX backend.
+ */
+export fn errno () -> int {
+  return std::runtime::posix::fs::errno();
+}

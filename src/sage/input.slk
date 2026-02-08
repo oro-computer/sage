@@ -1,0 +1,229 @@
+module sage::input;
+
+import std::interfaces;
+import std::runtime::mem;
+import std::runtime::posix::io;
+
+// Poll bits.
+let POLLIN: int = 1;
+
+// `struct pollfd` layout (linux/glibc baseline).
+let POLLFD_BYTES: i64 = 8;
+let OFF_POLLFD_FD: i64 = 0;
+let OFF_POLLFD_EVENTS: i64 = 4;
+let OFF_POLLFD_REVENTS: i64 = 6;
+
+fn store_u16_le (ptr: u64, off: i64, v: int) -> void {
+  let u: u64 = v as u64;
+  std::runtime::mem::store_u8(ptr, off + 0, (u & 255) as u8);
+  std::runtime::mem::store_u8(ptr, off + 1, ((u >> 8) & 255) as u8);
+}
+
+fn store_u32_le (ptr: u64, off: i64, v: int) -> void {
+  let u: u64 = v as u64;
+  std::runtime::mem::store_u8(ptr, off + 0, (u & 255) as u8);
+  std::runtime::mem::store_u8(ptr, off + 1, ((u >> 8) & 255) as u8);
+  std::runtime::mem::store_u8(ptr, off + 2, ((u >> 16) & 255) as u8);
+  std::runtime::mem::store_u8(ptr, off + 3, ((u >> 24) & 255) as u8);
+}
+
+fn load_u16_le (ptr: u64, off: i64) -> int {
+  let b0: u64 = std::runtime::mem::load_u8(ptr, off + 0) as u64;
+  let b1: u64 = std::runtime::mem::load_u8(ptr, off + 1) as u64;
+  return (b0 | (b1 << 8)) as int;
+}
+
+fn poll_readable (pollfd_ptr: u64, fd: int, timeout_ms: int) -> bool {
+  if pollfd_ptr == 0 {
+    return false;
+  }
+  store_u32_le(pollfd_ptr, OFF_POLLFD_FD, fd);
+  store_u16_le(pollfd_ptr, OFF_POLLFD_EVENTS, POLLIN);
+  store_u16_le(pollfd_ptr, OFF_POLLFD_REVENTS, 0);
+
+  let rc: int = std::runtime::posix::io::poll(pollfd_ptr, 1, timeout_ms) as int;
+  if rc <= 0 {
+    return false;
+  }
+
+  let revents: int = load_u16_le(pollfd_ptr, OFF_POLLFD_REVENTS);
+  return (revents & POLLIN) != 0;
+}
+
+export let KEY_BYTE: int = 0;
+export let KEY_UP: int = 1;
+export let KEY_DOWN: int = 2;
+export let KEY_LEFT: int = 3;
+export let KEY_RIGHT: int = 4;
+export let KEY_PAGE_UP: int = 5;
+export let KEY_PAGE_DOWN: int = 6;
+export let KEY_HOME: int = 7;
+export let KEY_END: int = 8;
+export let KEY_ENTER: int = 9;
+export let KEY_BACKSPACE: int = 10;
+export let KEY_ESC: int = 11;
+export let KEY_EOF: int = 12;
+export let KEY_NONE: int = 13;
+
+export struct Key {
+  kind: int,
+  byte: u8,
+}
+
+export struct Input {
+  fd: int,
+  buf_ptr: u64,
+  buf_len: i64,
+  buf_off: i64,
+  pollfd_ptr: u64,
+}
+
+export fn input_init (fd: int) -> Input? {
+  let buf_ptr: u64 = std::runtime::mem::alloc(64);
+  if buf_ptr == 0 {
+    return None;
+  }
+  let pollfd_ptr: u64 = std::runtime::mem::alloc(POLLFD_BYTES);
+  if pollfd_ptr == 0 {
+    std::runtime::mem::free(buf_ptr);
+    return None;
+  }
+  return Some(Input{ fd: fd, buf_ptr: buf_ptr, buf_len: 0, buf_off: 0, pollfd_ptr: pollfd_ptr });
+}
+
+fn take_next_byte (mut inp: &Input) -> u8? {
+  if inp.buf_off < inp.buf_len {
+    let b: u8 = std::runtime::mem::load_u8(inp.buf_ptr, inp.buf_off);
+    inp.buf_off = inp.buf_off + 1;
+    return Some(b);
+  }
+
+  inp.buf_off = 0;
+  let n: int = std::runtime::posix::io::read(inp.fd, inp.buf_ptr, 64);
+  if n <= 0 {
+    inp.buf_len = 0;
+    return None;
+  }
+  inp.buf_len = n as i64;
+  let b0: u8 = std::runtime::mem::load_u8(inp.buf_ptr, 0);
+  inp.buf_off = 1;
+  return Some(b0);
+}
+
+fn maybe_next_byte_after_esc (mut inp: &Input, timeout_ms: int) -> u8? {
+  if inp.buf_off < inp.buf_len {
+    return take_next_byte(mut inp);
+  }
+  if !poll_readable(inp.pollfd_ptr, inp.fd, timeout_ms) {
+    return None;
+  }
+  return take_next_byte(mut inp);
+}
+
+export fn read_key (mut inp: &Input) -> Key {
+  let b0_opt: u8? = take_next_byte(mut inp);
+  if b0_opt == None {
+    return Key{ kind: KEY_EOF, byte: 0 };
+  }
+  let b0: u8 = match (b0_opt) { Some(v) => v, None => 0 };
+
+  if b0 == 27 { // ESC
+    let b1_opt: u8? = maybe_next_byte_after_esc(mut inp, 8);
+    if b1_opt == None {
+      return Key{ kind: KEY_ESC, byte: 0 };
+    }
+    let b1: u8 = match (b1_opt) { Some(v) => v, None => 0 };
+
+    if b1 == 91 { // '['
+      let b2_opt: u8? = maybe_next_byte_after_esc(mut inp, 8);
+      if b2_opt == None {
+        return Key{ kind: KEY_ESC, byte: 0 };
+      }
+      let b2: u8 = match (b2_opt) { Some(v) => v, None => 0 };
+
+      if b2 == 65 { return Key{ kind: KEY_UP, byte: 0 }; }
+      if b2 == 66 { return Key{ kind: KEY_DOWN, byte: 0 }; }
+      if b2 == 67 { return Key{ kind: KEY_RIGHT, byte: 0 }; }
+      if b2 == 68 { return Key{ kind: KEY_LEFT, byte: 0 }; }
+      if b2 == 72 { return Key{ kind: KEY_HOME, byte: 0 }; }
+      if b2 == 70 { return Key{ kind: KEY_END, byte: 0 }; }
+
+      // Page/Home/End sequences: ESC [ <n> ~
+      if b2 == 53 { // '5'
+        let b3_opt: u8? = maybe_next_byte_after_esc(mut inp, 8);
+        if b3_opt != None {
+          let b3: u8 = match (b3_opt) { Some(v) => v, None => 0 };
+          if b3 == 126 { return Key{ kind: KEY_PAGE_UP, byte: 0 }; }
+        }
+        return Key{ kind: KEY_ESC, byte: 0 };
+      }
+      if b2 == 54 { // '6'
+        let b3_opt: u8? = maybe_next_byte_after_esc(mut inp, 8);
+        if b3_opt != None {
+          let b3: u8 = match (b3_opt) { Some(v) => v, None => 0 };
+          if b3 == 126 { return Key{ kind: KEY_PAGE_DOWN, byte: 0 }; }
+        }
+        return Key{ kind: KEY_ESC, byte: 0 };
+      }
+
+      return Key{ kind: KEY_ESC, byte: 0 };
+    }
+
+    if b1 == 79 { // 'O' (SS3)
+      let b2_opt: u8? = maybe_next_byte_after_esc(mut inp, 8);
+      if b2_opt == None {
+        return Key{ kind: KEY_ESC, byte: 0 };
+      }
+      let b2: u8 = match (b2_opt) { Some(v) => v, None => 0 };
+      if b2 == 65 { return Key{ kind: KEY_UP, byte: 0 }; }
+      if b2 == 66 { return Key{ kind: KEY_DOWN, byte: 0 }; }
+      if b2 == 67 { return Key{ kind: KEY_RIGHT, byte: 0 }; }
+      if b2 == 68 { return Key{ kind: KEY_LEFT, byte: 0 }; }
+      if b2 == 72 { return Key{ kind: KEY_HOME, byte: 0 }; }
+      if b2 == 70 { return Key{ kind: KEY_END, byte: 0 }; }
+      return Key{ kind: KEY_ESC, byte: 0 };
+    }
+
+    return Key{ kind: KEY_ESC, byte: 0 };
+  }
+
+  if b0 == 127 {
+    return Key{ kind: KEY_BACKSPACE, byte: 0 };
+  }
+  if b0 == 13 || b0 == 10 {
+    return Key{ kind: KEY_ENTER, byte: 0 };
+  }
+
+  return Key{ kind: KEY_BYTE, byte: b0 };
+}
+
+/**
+ * Read one key with a timeout.
+ *
+ * - If `timeout_ms` elapses with no input available, returns `KEY_NONE`.
+ * - If bytes are already buffered, it consumes them immediately (no poll).
+ */
+export fn read_key_timeout (mut inp: &Input, timeout_ms: int) -> Key {
+  if inp.buf_off < inp.buf_len {
+    return read_key(mut inp);
+  }
+  if timeout_ms < 0 {
+    return read_key(mut inp);
+  }
+  if !poll_readable(inp.pollfd_ptr, inp.fd, timeout_ms) {
+    return Key{ kind: KEY_NONE, byte: 0 };
+  }
+  return read_key(mut inp);
+}
+
+impl Input as std::interfaces::Drop {
+  public fn drop (mut self: &Input) -> void {
+    std::runtime::mem::free(self.buf_ptr);
+    std::runtime::mem::free(self.pollfd_ptr);
+    self.fd = -1;
+    self.buf_ptr = 0;
+    self.buf_len = 0;
+    self.buf_off = 0;
+    self.pollfd_ptr = 0;
+  }
+}

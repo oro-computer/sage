@@ -1,0 +1,23 @@
+[package]
+name = "sage"
+version = "0.1.0"
+description = "sage - a fast, ergonomic terminal pager (inspired by most)"
+
+[sources]
+include = [
+  "src/**/*.slk"
+]
+
+[build]
+default_target = "sage"
+profile = "release"
+
+[test]
+command = "silk test --package ."
+
+[[target]]
+name = "sage"
+kind = "executable"
+entry = "src/main.slk"
+output = "build/bin/sage"
+

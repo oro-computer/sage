@@ -1,0 +1,271 @@
+module sage::index;
+
+import std::runtime::mem;
+import std::sync;
+import { OutOfMemory } from "std/memory";
+
+import { memchr } from "./os.slk";
+import { VecU64 } from "./buf.slk";
+
+let NL: int = 10;
+let CHUNK_MAX: i64 = 8192;
+let SCAN_CHUNK_BYTES: i64 = 4194304; // 4 MiB
+let PROGRESS_BYTES: i64 = 67108864; // 64 MiB
+
+export let INDEX_STRIDE: i64 = 256;
+
+fn flush_chunk (ch: std::sync::ChannelBorrow(u64), buf: u64, n: i64, scan_off: i64, lines: i64) -> bool {
+  let count: i64 = if n > 0 { n } else { 0 };
+
+  // Layout: [count:u64][scan_off:u64][lines:u64][off0:u64]...[offN:u64]
+  let bytes: i64 = (count + 3) * 8;
+  let p: u64 = std::runtime::mem::alloc(bytes);
+  if p == 0 {
+    return false;
+  }
+
+  std::runtime::mem::store_u64(p, 0, count as u64);
+  std::runtime::mem::store_u64(p, 8, scan_off as u64);
+  std::runtime::mem::store_u64(p, 16, lines as u64);
+  var i: i64 = 0;
+  while i < count {
+    std::runtime::mem::store_u64(p, 24 + (i * 8), std::runtime::mem::load_u64(buf, i * 8));
+    i = i + 1;
+  }
+
+  let err: std::sync::SyncFailed? = ch.send(p);
+  if err != None {
+    std::runtime::mem::free(p);
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Background line-index builder.
+ *
+ * Sends pointer messages into `ch`:
+ * - `0` is a sentinel meaning "done".
+ * - otherwise the pointer is a heap block:
+ *   `[count:u64][scan_off:u64][lines:u64][off0:u64]...[offN:u64]`.
+ *
+ * To keep memory bounded on extremely large inputs, `sage` only emits
+ * checkpoint offsets for every `INDEX_STRIDE`th line. The UI uses these
+ * checkpoints to compute line numbers without storing every line start.
+ */
+export task fn build_line_index (
+  ptr: u64,
+  len: i64,
+  ch: std::sync::ChannelBorrow(u64),
+  cancel: std::sync::CancellationTokenBorrow,
+  check_cancel: bool
+) -> int {
+  if ptr == 0 || len <= 0 {
+    let _ = ch.send(0 as u64);
+    return 0;
+  }
+
+  // Reusable local chunk buffer (stores u64 checkpoint offsets).
+  let buf: u64 = std::runtime::mem::alloc(CHUNK_MAX * 8);
+  if buf == 0 {
+    let _ = ch.send(0 as u64);
+    return 1;
+  }
+
+  var n: i64 = 0;
+  var scan_off: i64 = 0;
+  var lines: i64 = 1;
+  var next_checkpoint: i64 = INDEX_STRIDE;
+  var last_progress_off: i64 = 0;
+  var tick: i64 = 0;
+  var cancelled: bool = false;
+
+  while scan_off < len {
+    if check_cancel && cancel.is_cancelled() {
+      cancelled = true;
+      break;
+    }
+
+    let rem: i64 = len - scan_off;
+    let chunk_len: i64 = if rem < SCAN_CHUNK_BYTES { rem } else { SCAN_CHUNK_BYTES };
+    let chunk_end: i64 = scan_off + chunk_len;
+
+    var cur: i64 = scan_off;
+    while cur < chunk_end {
+      if check_cancel && (tick & 4095) == 0 {
+        if cancel.is_cancelled() {
+          cancelled = true;
+          break;
+        }
+      }
+      tick = tick + 1;
+
+      let tail_ptr: u64 = ptr + (cur as u64);
+      let tail_len: i64 = chunk_end - cur;
+      let nl_ptr: u64 = if tail_len > 0 { memchr(tail_ptr, NL, tail_len) } else { 0 };
+      if nl_ptr == 0 {
+        cur = chunk_end;
+        break;
+      }
+
+      let pos: i64 = (nl_ptr - ptr) as i64;
+      let next: i64 = pos + 1;
+
+      lines = lines + 1;
+      if (lines - 1) == next_checkpoint {
+        std::runtime::mem::store_u64(buf, n * 8, next as u64);
+        n = n + 1;
+        next_checkpoint = next_checkpoint + INDEX_STRIDE;
+      }
+      cur = next;
+
+      if n >= CHUNK_MAX {
+        let ok: bool = flush_chunk(ch, buf, n, cur, lines);
+        n = 0;
+        if !ok {
+          std::runtime::mem::free(buf);
+          // Channel borrows do not auto-close: always send a done sentinel so
+          // receivers never block forever.
+          let _ = ch.send(0 as u64);
+          return 2;
+        }
+      }
+    }
+
+    if cancelled {
+      scan_off = cur;
+      break;
+    }
+
+    scan_off = chunk_end;
+
+    if (scan_off - last_progress_off) >= PROGRESS_BYTES {
+      last_progress_off = scan_off;
+      let okp: bool = flush_chunk(ch, buf, n, scan_off, lines);
+      if !okp {
+        std::runtime::mem::free(buf);
+        let _ = ch.send(0 as u64);
+        return 2;
+      }
+      n = 0;
+    }
+  }
+
+  let ok: bool = flush_chunk(ch, buf, n, scan_off, lines);
+  if !ok {
+    std::runtime::mem::free(buf);
+    let _ = ch.send(0 as u64);
+    return 2;
+  }
+
+  std::runtime::mem::free(buf);
+  let _ = ch.send(0 as u64);
+  return 0;
+}
+
+export struct ConsumeOutcome {
+  kind: int,
+  scan_off: i64,
+  lines: i64,
+}
+
+export let CONSUME_OK: int = 0;
+export let CONSUME_DONE: int = 1;
+export let CONSUME_OUT_OF_MEMORY: int = 2;
+export let CONSUME_INVALID: int = 3;
+
+export fn consume_msg (msg: u64, mut offsets: &VecU64) -> ConsumeOutcome {
+  if msg == 0 {
+    return ConsumeOutcome{ kind: CONSUME_DONE, scan_off: 0, lines: 0 };
+  }
+
+  let count_u64: u64 = std::runtime::mem::load_u64(msg, 0);
+  let count: i64 = count_u64 as i64;
+  if count < 0 || count > 1000000000 {
+    std::runtime::mem::free(msg);
+    return ConsumeOutcome{ kind: CONSUME_INVALID, scan_off: 0, lines: 0 };
+  }
+
+  let so: u64 = std::runtime::mem::load_u64(msg, 8);
+  let scan_off: i64 = so as i64;
+
+  let lo: u64 = std::runtime::mem::load_u64(msg, 16);
+  let lines: i64 = lo as i64;
+
+  let err_r: OutOfMemory? = offsets.reserve_additional(count);
+  if err_r != None {
+    std::runtime::mem::free(msg);
+    return ConsumeOutcome{ kind: CONSUME_OUT_OF_MEMORY, scan_off: scan_off, lines: lines };
+  }
+
+  var i: i64 = 0;
+  while i < count {
+    let off: u64 = std::runtime::mem::load_u64(msg, 24 + (i * 8));
+    let err: OutOfMemory? = offsets.push(off);
+    if err != None {
+      std::runtime::mem::free(msg);
+      return ConsumeOutcome{ kind: CONSUME_OUT_OF_MEMORY, scan_off: scan_off, lines: lines };
+    }
+    i = i + 1;
+  }
+
+  std::runtime::mem::free(msg);
+  return ConsumeOutcome{ kind: CONSUME_OK, scan_off: scan_off, lines: lines };
+}
+
+test "sage::index consume_msg - done sentinel" {
+  let v_opt: VecU64? = VecU64.init(4);
+  assert(v_opt != None, "VecU64.init should succeed");
+  let mut v: VecU64 = match (v_opt) { Some(x) => x, None => VecU64.empty() };
+
+  let out: ConsumeOutcome = consume_msg(0 as u64, mut v);
+  assert(out.kind == CONSUME_DONE, "expected done");
+  assert(out.scan_off == 0, "scan_off should be 0");
+  assert(out.lines == 0, "lines should be 0");
+}
+
+test "sage::index consume_msg - appends offsets" {
+  let v_opt: VecU64? = VecU64.init(4);
+  assert(v_opt != None, "VecU64.init should succeed");
+  let mut v: VecU64 = match (v_opt) { Some(x) => x, None => VecU64.empty() };
+  let _ = v.push(0);
+
+  // Build a chunk message: count=3, scan_off=123, lines=999, offsets=[5, 10, 20].
+  let msg: u64 = std::runtime::mem::alloc((3 + 3) * 8);
+  assert(msg != 0, "alloc should succeed");
+  std::runtime::mem::store_u64(msg, 0, 3);
+  std::runtime::mem::store_u64(msg, 8, 123);
+  std::runtime::mem::store_u64(msg, 16, 999);
+  std::runtime::mem::store_u64(msg, 24, 5);
+  std::runtime::mem::store_u64(msg, 32, 10);
+  std::runtime::mem::store_u64(msg, 40, 20);
+
+  let out: ConsumeOutcome = consume_msg(msg, mut v);
+  assert(out.kind == CONSUME_OK, "expected ok");
+  assert(out.scan_off == 123, "scan_off mismatch");
+  assert(out.lines == 999, "lines mismatch");
+  assert(v.len == 4, "unexpected len");
+  assert(v.get(1) == 5, "off1");
+  assert(v.get(2) == 10, "off2");
+  assert(v.get(3) == 20, "off3");
+}
+
+test "sage::index consume_msg - progress only (count=0)" {
+  let v_opt: VecU64? = VecU64.init(4);
+  assert(v_opt != None, "VecU64.init should succeed");
+  let mut v: VecU64 = match (v_opt) { Some(x) => x, None => VecU64.empty() };
+  let _ = v.push(0);
+
+  let msg: u64 = std::runtime::mem::alloc(3 * 8);
+  assert(msg != 0, "alloc should succeed");
+  std::runtime::mem::store_u64(msg, 0, 0);
+  std::runtime::mem::store_u64(msg, 8, 777);
+  std::runtime::mem::store_u64(msg, 16, 42);
+
+  let out: ConsumeOutcome = consume_msg(msg, mut v);
+  assert(out.kind == CONSUME_OK, "expected ok");
+  assert(out.scan_off == 777, "scan_off mismatch");
+  assert(out.lines == 42, "lines mismatch");
+  assert(v.len == 1, "offsets should be unchanged");
+  assert(v.get(0) == 0, "offset 0");
+}

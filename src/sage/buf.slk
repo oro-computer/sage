@@ -1,0 +1,220 @@
+module sage::buf;
+
+import std::interfaces;
+import std::runtime::mem;
+import { OutOfMemory } from "std/memory";
+
+/**
+ * A non-owning byte slice view (`ptr`, `len`).
+ */
+export struct ByteSlice {
+  ptr: u64,
+  len: i64,
+}
+
+fn oom (requested: i64) -> OutOfMemory {
+  return OutOfMemory{ requested: requested };
+}
+
+/**
+ * A minimal growable byte buffer.
+ */
+export struct BufferU8 {
+  ptr: u64,
+  len: i64,
+  cap: i64,
+}
+
+impl BufferU8 {
+  public fn empty () -> BufferU8 {
+    return BufferU8{ ptr: 0, len: 0, cap: 0 };
+  }
+
+  public fn init (cap: i64) -> BufferU8? {
+    if cap <= 0 {
+      return Some(BufferU8.empty());
+    }
+    let ptr: u64 = std::runtime::mem::alloc(cap);
+    if ptr == 0 {
+      return None;
+    }
+    return Some(BufferU8{ ptr: ptr, len: 0, cap: cap });
+  }
+
+  public fn as_bytes (self: &BufferU8) -> ByteSlice {
+    return ByteSlice{ ptr: self.ptr, len: self.len };
+  }
+
+  public fn clear (mut self: &BufferU8) -> void {
+    self.len = 0;
+  }
+
+  public fn reserve_additional (mut self: &BufferU8, additional: i64) -> OutOfMemory? {
+    if additional <= 0 {
+      return None;
+    }
+    if self.len < 0 || self.cap < 0 {
+      return Some(oom(additional));
+    }
+    let needed: i64 = self.len + additional;
+    if needed <= self.cap {
+      return None;
+    }
+
+    let max_i64: i64 = 9223372036854775807 as i64;
+    var new_cap: i64 = if self.cap > 0 { self.cap } else { 64 };
+    while new_cap < needed {
+      if new_cap > max_i64 / 2 {
+        new_cap = needed;
+        break;
+      }
+      new_cap = new_cap * 2;
+    }
+
+    let new_ptr: u64 = std::runtime::mem::realloc(self.ptr, new_cap);
+    if new_ptr == 0 {
+      return Some(oom(new_cap));
+    }
+    self.ptr = new_ptr;
+    self.cap = new_cap;
+    return None;
+  }
+
+  public fn push_u8 (mut self: &BufferU8, value: u8) -> OutOfMemory? {
+    let err: OutOfMemory? = self.reserve_additional(1);
+    if err != None {
+      return err;
+    }
+    std::runtime::mem::store_u8(self.ptr, self.len, value);
+    self.len = self.len + 1;
+    return None;
+  }
+
+  public fn push_ptr_len (mut self: &BufferU8, ptr: u64, len: i64) -> OutOfMemory? {
+    if len <= 0 {
+      return None;
+    }
+    if ptr == 0 {
+      return Some(oom(len));
+    }
+    let err: OutOfMemory? = self.reserve_additional(len);
+    if err != None {
+      return err;
+    }
+
+    var i: i64 = 0;
+    while i < len {
+      std::runtime::mem::store_u8(self.ptr, self.len + i, std::runtime::mem::load_u8(ptr, i));
+      i = i + 1;
+    }
+    self.len = self.len + len;
+    return None;
+  }
+
+  public fn push_str (mut self: &BufferU8, s: string) -> OutOfMemory? {
+    let ptr: u64 = std::runtime::mem::string_ptr(s);
+    let len: i64 = std::runtime::mem::string_len(s);
+    return self.push_ptr_len(ptr, len);
+  }
+
+  public fn pop_u8 (mut self: &BufferU8) -> u8? {
+    if self.len <= 0 {
+      return None;
+    }
+    let idx: i64 = self.len - 1;
+    self.len = idx;
+    return Some(std::runtime::mem::load_u8(self.ptr, idx));
+  }
+}
+
+impl BufferU8 as std::interfaces::Drop {
+  public fn drop (mut self: &BufferU8) -> void {
+    std::runtime::mem::free(self.ptr);
+    self.ptr = 0;
+    self.len = 0;
+    self.cap = 0;
+  }
+}
+
+/**
+ * A minimal growable `u64` vector.
+ *
+ * Used for the line-start index.
+ */
+export struct VecU64 {
+  ptr: u64,
+  len: i64, // element count
+  cap: i64, // element capacity
+}
+
+impl VecU64 {
+  public fn empty () -> VecU64 {
+    return VecU64{ ptr: 0, len: 0, cap: 0 };
+  }
+
+  public fn init (cap: i64) -> VecU64? {
+    if cap <= 0 {
+      return Some(VecU64.empty());
+    }
+    let bytes: i64 = cap * 8;
+    let ptr: u64 = std::runtime::mem::alloc(bytes);
+    if ptr == 0 {
+      return None;
+    }
+    return Some(VecU64{ ptr: ptr, len: 0, cap: cap });
+  }
+
+  public fn reserve_additional (mut self: &VecU64, additional: i64) -> OutOfMemory? {
+    if additional <= 0 {
+      return None;
+    }
+    if self.len < 0 || self.cap < 0 {
+      return Some(oom(additional));
+    }
+    let needed: i64 = self.len + additional;
+    if needed <= self.cap {
+      return None;
+    }
+
+    let max_i64: i64 = 9223372036854775807 as i64;
+    var new_cap: i64 = if self.cap > 0 { self.cap } else { 64 };
+    while new_cap < needed {
+      if new_cap > max_i64 / 2 {
+        new_cap = needed;
+        break;
+      }
+      new_cap = new_cap * 2;
+    }
+
+    let new_ptr: u64 = std::runtime::mem::realloc(self.ptr, new_cap * 8);
+    if new_ptr == 0 {
+      return Some(oom(new_cap));
+    }
+    self.ptr = new_ptr;
+    self.cap = new_cap;
+    return None;
+  }
+
+  public fn push (mut self: &VecU64, value: u64) -> OutOfMemory? {
+    let err: OutOfMemory? = self.reserve_additional(1);
+    if err != None {
+      return err;
+    }
+    std::runtime::mem::store_u64(self.ptr, (self.len * 8), value);
+    self.len = self.len + 1;
+    return None;
+  }
+
+  public fn get (self: &VecU64, index: i64) -> u64 {
+    return std::runtime::mem::load_u64(self.ptr, index * 8);
+  }
+}
+
+impl VecU64 as std::interfaces::Drop {
+  public fn drop (mut self: &VecU64) -> void {
+    std::runtime::mem::free(self.ptr);
+    self.ptr = 0;
+    self.len = 0;
+    self.cap = 0;
+  }
+}

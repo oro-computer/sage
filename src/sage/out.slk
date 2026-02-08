@@ -1,0 +1,188 @@
+module sage::out;
+
+import std::interfaces;
+import std::runtime::mem;
+import std::runtime::posix::io;
+import { OutOfMemory } from "std/memory";
+
+import { BufferU8, ByteSlice } from "./buf.slk";
+
+export fn write_all (fd: int, ptr: u64, len: i64) -> bool {
+  if len <= 0 {
+    return true;
+  }
+  if ptr == 0 {
+    return false;
+  }
+
+  var off: i64 = 0;
+  while off < len {
+    let n: int = std::runtime::posix::io::write(fd, ptr + (off as u64), len - off);
+    if n <= 0 {
+      return false;
+    }
+    off = off + (n as i64);
+  }
+  return true;
+}
+
+export fn write_str (fd: int, s: string) -> bool {
+  let ptr: u64 = std::runtime::mem::string_ptr(s);
+  let len: i64 = std::runtime::mem::string_len(s);
+  return write_all(fd, ptr, len);
+}
+
+export struct Writer {
+  fd: int,
+  color: bool,
+  buf: BufferU8,
+}
+
+fn writer_init (fd: int, color: bool, cap: i64) -> Writer? {
+  let b_opt: BufferU8? = BufferU8.init(cap);
+  if b_opt == None {
+    return None;
+  }
+  let b: BufferU8 = match (b_opt) {
+    Some(v) => v,
+    None => BufferU8.empty(),
+  };
+  return Some(Writer{ fd: fd, color: color, buf: b });
+}
+
+fn take_buf (mut w: &Writer) -> BufferU8 {
+  let b: BufferU8 = w.buf;
+  w.buf = BufferU8.empty();
+  return b;
+}
+
+fn put_buf (mut w: &Writer, mut b: BufferU8) -> void {
+  w.buf = b;
+  b.ptr = 0;
+  b.len = 0;
+  b.cap = 0;
+}
+
+impl Writer {
+  public fn stdout (color: bool, cap: i64 = 32768) -> Writer? {
+    return writer_init(std::runtime::posix::io::STDOUT_FD, color, cap);
+  }
+
+  public fn stderr (color: bool, cap: i64 = 8192) -> Writer? {
+    return writer_init(std::runtime::posix::io::STDERR_FD, color, cap);
+  }
+
+  public fn clear (mut self: &Writer) -> void {
+    let mut b: BufferU8 = take_buf(mut self);
+    b.clear();
+    put_buf(mut self, b);
+  }
+
+  public fn push_u8 (mut self: &Writer, value: u8) -> OutOfMemory? {
+    let mut b: BufferU8 = take_buf(mut self);
+    let err: OutOfMemory? = b.push_u8(value);
+    put_buf(mut self, b);
+    return err;
+  }
+
+  public fn push_ptr_len (mut self: &Writer, ptr: u64, len: i64) -> OutOfMemory? {
+    let mut b: BufferU8 = take_buf(mut self);
+    let err: OutOfMemory? = b.push_ptr_len(ptr, len);
+    put_buf(mut self, b);
+    return err;
+  }
+
+  public fn push_str (mut self: &Writer, s: string) -> OutOfMemory? {
+    let mut b: BufferU8 = take_buf(mut self);
+    let err: OutOfMemory? = b.push_str(s);
+    put_buf(mut self, b);
+    return err;
+  }
+
+  public fn push_slice (mut self: &Writer, s: ByteSlice) -> OutOfMemory? {
+    return self.push_ptr_len(s.ptr, s.len);
+  }
+
+  public fn push_u64 (mut self: &Writer, value: u64) -> OutOfMemory? {
+    let mut b: BufferU8 = take_buf(mut self);
+    if value == 0 {
+      let err0: OutOfMemory? = b.push_u8(48);
+      put_buf(mut self, b);
+      return err0;
+    }
+
+    let mut v: u64 = value;
+    let mut tmp: u8[32] = [
+      0, 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 0, 0, 0, 0, 0
+    ];
+
+    var n: i64 = 0;
+    while v != 0 {
+      let digit: u64 = v % 10;
+      tmp[n] = std::runtime::mem::trunc_u8(48 + (digit as int));
+      n = n + 1;
+      v = v / 10;
+    }
+
+    var i: i64 = n - 1;
+    while i >= 0 {
+      let err: OutOfMemory? = b.push_u8(tmp[i]);
+      if err != None {
+        put_buf(mut self, b);
+        return err;
+      }
+      i = i - 1;
+    }
+
+    put_buf(mut self, b);
+    return None;
+  }
+
+  public fn push_i64 (mut self: &Writer, value: i64) -> OutOfMemory? {
+    let mut b: BufferU8 = take_buf(mut self);
+    if value == 0 {
+      let err0: OutOfMemory? = b.push_u8(48);
+      put_buf(mut self, b);
+      return err0;
+    }
+
+    let mut v: u64 = 0;
+    if value < 0 {
+      let err0: OutOfMemory? = b.push_u8(45);
+      if err0 != None {
+        put_buf(mut self, b);
+        return err0;
+      }
+      v = (0 - value) as u64;
+    } else {
+      v = value as u64;
+    }
+
+    put_buf(mut self, b);
+    return self.push_u64(v);
+  }
+
+  public fn flush (mut self: &Writer) -> bool {
+    let mut b: BufferU8 = take_buf(mut self);
+    let bytes = b.as_bytes();
+    let ok: bool = write_all(self.fd, bytes.ptr, bytes.len);
+    b.clear();
+    put_buf(mut self, b);
+    return ok;
+  }
+
+  public fn write_str (self: &Writer, s: string) -> bool {
+    return write_str(self.fd, s);
+  }
+}
+
+impl Writer as std::interfaces::Drop {
+  public fn drop (mut self: &Writer) -> void {
+    let _b: BufferU8 = take_buf(mut self);
+    self.fd = -1;
+    self.color = false;
+  }
+}

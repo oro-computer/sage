@@ -1,0 +1,173 @@
+module sage::file;
+
+import std::interfaces;
+import std::runtime::mem;
+import std::runtime::posix::fs;
+
+import { MAP_FAILED, MAP_PRIVATE, PROT_READ, memchr, mmap, mkstemp, munmap } from "./os.slk";
+
+fn cstr_len (cstr: u64, max: i64) -> i64 {
+  if cstr == 0 || max <= 0 {
+    return 0;
+  }
+  var i: i64 = 0;
+  while i < max {
+    if std::runtime::mem::load_u8(cstr, i) == 0 {
+      return i;
+    }
+    i = i + 1;
+  }
+  return max;
+}
+
+fn detect_binary (ptr: u64, len: i64) -> bool {
+  if ptr == 0 || len <= 0 {
+    return false;
+  }
+  let scan: i64 = if len < 1024 { len } else { 1024 };
+  return memchr(ptr, 0, scan) != 0;
+}
+
+export struct MappedFile {
+  ptr: u64,
+  len: i64,
+}
+
+export fn mapped_empty () -> MappedFile {
+  return MappedFile{ ptr: 0, len: 0 };
+}
+
+fn map_fd (fd: int, len: i64) -> MappedFile? {
+  if len <= 0 {
+    let _ = std::runtime::posix::fs::close(fd);
+    return Some(mapped_empty());
+  }
+
+  let ptr: u64 = mmap(0, len, PROT_READ, MAP_PRIVATE, fd, 0);
+  let _ = std::runtime::posix::fs::close(fd);
+  if ptr == MAP_FAILED {
+    return None;
+  }
+  return Some(MappedFile{ ptr: ptr, len: len });
+}
+
+export fn map_path (path: string, allow_binary: bool) -> MappedFile? {
+  let fd: int = std::runtime::posix::fs::open(path, std::runtime::posix::fs::O_RDONLY, 0) as int;
+  if fd < 0 {
+    return None;
+  }
+
+  let size: i64 = std::runtime::posix::fs::lseek(fd, 0, std::runtime::posix::fs::SEEK_END);
+  if size < 0 {
+    let _ = std::runtime::posix::fs::close(fd);
+    return None;
+  }
+
+  let m_opt: MappedFile? = map_fd(fd, size);
+  if m_opt == None {
+    return None;
+  }
+
+  let mut m: MappedFile = match (m_opt) { Some(v) => v, None => mapped_empty() };
+  if !allow_binary && detect_binary(m.ptr, m.len) {
+    return None;
+  }
+  return Some(m);
+}
+
+fn write_tmp_template (p: u64) -> void {
+  // "/tmp/sageXXXXXX\0"
+  std::runtime::mem::store_u8(p, 0, 47);  // /
+  std::runtime::mem::store_u8(p, 1, 116); // t
+  std::runtime::mem::store_u8(p, 2, 109); // m
+  std::runtime::mem::store_u8(p, 3, 112); // p
+  std::runtime::mem::store_u8(p, 4, 47);  // /
+  std::runtime::mem::store_u8(p, 5, 115); // s
+  std::runtime::mem::store_u8(p, 6, 97);  // a
+  std::runtime::mem::store_u8(p, 7, 103); // g
+  std::runtime::mem::store_u8(p, 8, 101); // e
+  std::runtime::mem::store_u8(p, 9, 88);  // X
+  std::runtime::mem::store_u8(p, 10, 88);
+  std::runtime::mem::store_u8(p, 11, 88);
+  std::runtime::mem::store_u8(p, 12, 88);
+  std::runtime::mem::store_u8(p, 13, 88);
+  std::runtime::mem::store_u8(p, 14, 88);
+  std::runtime::mem::store_u8(p, 15, 0);
+}
+
+export fn map_stdin_spool (allow_binary: bool) -> MappedFile? {
+  // Create a temp file and unlink it immediately (it will be removed on close).
+  let tmpl: u64 = std::runtime::mem::alloc(16);
+  if tmpl == 0 {
+    return None;
+  }
+  write_tmp_template(tmpl);
+
+  let fd: int = mkstemp(tmpl) as int;
+  if fd < 0 {
+    std::runtime::mem::free(tmpl);
+    return None;
+  }
+
+  let nlen: i64 = cstr_len(tmpl, 256);
+  let path: string = std::runtime::mem::string_from_ptr_len(tmpl, nlen as int);
+  let _ = std::runtime::posix::fs::unlink(path);
+  std::runtime::mem::free(tmpl);
+
+  let buf: u64 = std::runtime::mem::alloc(65536);
+  if buf == 0 {
+    let _ = std::runtime::posix::fs::close(fd);
+    return None;
+  }
+
+  var total: i64 = 0;
+  while true {
+    let n: int = std::runtime::posix::fs::read(0, buf, 65536);
+    if n < 0 {
+      std::runtime::mem::free(buf);
+      let _ = std::runtime::posix::fs::close(fd);
+      return None;
+    }
+    if n == 0 {
+      break;
+    }
+
+    var off: i64 = 0;
+    let want: i64 = n as i64;
+    while off < want {
+      let w: int = std::runtime::posix::fs::write(fd, buf + (off as u64), want - off);
+      if w <= 0 {
+        std::runtime::mem::free(buf);
+        let _ = std::runtime::posix::fs::close(fd);
+        return None;
+      }
+      off = off + (w as i64);
+    }
+
+    total = total + want;
+  }
+
+  std::runtime::mem::free(buf);
+
+  // Map the file.
+  let m_opt: MappedFile? = map_fd(fd, total);
+  if m_opt == None {
+    return None;
+  }
+
+  let mut m: MappedFile = match (m_opt) { Some(v) => v, None => mapped_empty() };
+  if !allow_binary && detect_binary(m.ptr, m.len) {
+    return None;
+  }
+  return Some(m);
+}
+
+impl MappedFile as std::interfaces::Drop {
+  public fn drop (mut self: &MappedFile) -> void {
+    if self.ptr != 0 && self.len > 0 {
+      let _ = munmap(self.ptr, self.len);
+    }
+    self.ptr = 0;
+    self.len = 0;
+  }
+}

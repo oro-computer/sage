@@ -1,0 +1,185 @@
+module sage::term;
+
+import std::interfaces;
+import std::runtime::mem;
+
+import { TCSAFLUSH, TIOCGWINSZ, errno, ioctl, tcgetattr, tcsetattr } from "./os.slk";
+
+// `struct termios` layout (linux/glibc x86_64 baseline).
+let TERMIOS_BYTES: i64 = 60;
+let OFF_IFLAG: i64 = 0;
+let OFF_OFLAG: i64 = 4;
+let OFF_CFLAG: i64 = 8;
+let OFF_LFLAG: i64 = 12;
+let OFF_CC: i64 = 17;
+
+// termios flags (linux baseline; values are octal in headers).
+let LFLAG_ISIG: u64 = 1;
+let LFLAG_ICANON: u64 = 2;
+let LFLAG_ECHO: u64 = 8;
+let LFLAG_IEXTEN: u64 = 32768;
+
+let IFLAG_ICRNL: u64 = 256;
+let IFLAG_IXON: u64 = 1024;
+
+let OFLAG_OPOST: u64 = 1;
+
+let CFLAG_CS8: u64 = 48;
+
+// c_cc indices.
+let CC_VTIME: i64 = 5;
+let CC_VMIN: i64 = 6;
+
+fn load_u16_le (ptr: u64, off: i64) -> int {
+  let b0: u64 = std::runtime::mem::load_u8(ptr, off + 0) as u64;
+  let b1: u64 = std::runtime::mem::load_u8(ptr, off + 1) as u64;
+  return (b0 | (b1 << 8)) as int;
+}
+
+fn load_u32_le (ptr: u64, off: i64) -> u64 {
+  let b0: u64 = std::runtime::mem::load_u8(ptr, off + 0) as u64;
+  let b1: u64 = std::runtime::mem::load_u8(ptr, off + 1) as u64;
+  let b2: u64 = std::runtime::mem::load_u8(ptr, off + 2) as u64;
+  let b3: u64 = std::runtime::mem::load_u8(ptr, off + 3) as u64;
+  return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+}
+
+fn store_u32_le (ptr: u64, off: i64, v: u64) -> void {
+  std::runtime::mem::store_u8(ptr, off + 0, (v & 255) as u8);
+  std::runtime::mem::store_u8(ptr, off + 1, ((v >> 8) & 255) as u8);
+  std::runtime::mem::store_u8(ptr, off + 2, ((v >> 16) & 255) as u8);
+  std::runtime::mem::store_u8(ptr, off + 3, ((v >> 24) & 255) as u8);
+}
+
+fn copy_bytes (dst: u64, src: u64, len: i64) -> void {
+  if dst == 0 || src == 0 || len <= 0 {
+    return;
+  }
+  var i: i64 = 0;
+  while i < len {
+    std::runtime::mem::store_u8(dst, i, std::runtime::mem::load_u8(src, i));
+    i = i + 1;
+  }
+}
+
+export struct Size {
+  rows: int,
+  cols: int,
+}
+
+export fn size_default () -> Size {
+  return Size{ rows: 24, cols: 80 };
+}
+
+export fn get_size (fd: int) -> Size {
+  let p: u64 = std::runtime::mem::alloc(8);
+  if p == 0 {
+    return size_default();
+  }
+
+  let rc: int = ioctl(fd, TIOCGWINSZ, p);
+  if rc != 0 {
+    std::runtime::mem::free(p);
+    return size_default();
+  }
+
+  let rows: int = load_u16_le(p, 0);
+  let cols: int = load_u16_le(p, 2);
+  std::runtime::mem::free(p);
+
+  if rows <= 0 || cols <= 0 {
+    return size_default();
+  }
+  return Size{ rows: rows, cols: cols };
+}
+
+/**
+ * A small RAII guard that switches a TTY into raw mode and restores it on drop.
+ */
+export struct RawMode {
+  fd: int,
+  orig: u64,
+  raw_ptr: u64,
+  enabled: bool,
+}
+
+export fn raw_mode_enable (fd: int) -> RawMode? {
+  let orig: u64 = std::runtime::mem::alloc(TERMIOS_BYTES);
+  if orig == 0 {
+    return None;
+  }
+  let raw_ptr: u64 = std::runtime::mem::alloc(TERMIOS_BYTES);
+  if raw_ptr == 0 {
+    std::runtime::mem::free(orig);
+    return None;
+  }
+
+  let rc0: int = tcgetattr(fd, orig);
+  if rc0 != 0 {
+    std::runtime::mem::free(orig);
+    std::runtime::mem::free(raw_ptr);
+    return None;
+  }
+
+  copy_bytes(raw_ptr, orig, TERMIOS_BYTES);
+
+  // iflag
+  let iflag: u64 = load_u32_le(raw_ptr, OFF_IFLAG);
+  let iflag2: u64 = iflag & ~(IFLAG_ICRNL | IFLAG_IXON);
+  store_u32_le(raw_ptr, OFF_IFLAG, iflag2);
+
+  // oflag
+  let oflag: u64 = load_u32_le(raw_ptr, OFF_OFLAG);
+  let oflag2: u64 = oflag & ~(OFLAG_OPOST);
+  store_u32_le(raw_ptr, OFF_OFLAG, oflag2);
+
+  // cflag
+  let cflag: u64 = load_u32_le(raw_ptr, OFF_CFLAG);
+  store_u32_le(raw_ptr, OFF_CFLAG, cflag | CFLAG_CS8);
+
+  // lflag
+  let lflag: u64 = load_u32_le(raw_ptr, OFF_LFLAG);
+  let lmask: u64 = (LFLAG_ISIG | LFLAG_ICANON | LFLAG_ECHO | LFLAG_IEXTEN);
+  store_u32_le(raw_ptr, OFF_LFLAG, lflag & ~(lmask));
+
+  // control chars
+  std::runtime::mem::store_u8(raw_ptr, OFF_CC + CC_VTIME, 0);
+  std::runtime::mem::store_u8(raw_ptr, OFF_CC + CC_VMIN, 1);
+
+  let rc1: int = tcsetattr(fd, TCSAFLUSH, raw_ptr);
+  if rc1 != 0 {
+    std::runtime::mem::free(orig);
+    std::runtime::mem::free(raw_ptr);
+    return None;
+  }
+
+  return Some(RawMode{ fd: fd, orig: orig, raw_ptr: raw_ptr, enabled: true });
+}
+
+impl RawMode {
+  public fn is_enabled (self: &RawMode) -> bool {
+    return self.enabled;
+  }
+
+  public fn restore (mut self: &RawMode) -> void {
+    if !self.enabled {
+      return;
+    }
+    let _ = tcsetattr(self.fd, TCSAFLUSH, self.orig);
+    self.enabled = false;
+  }
+}
+
+impl RawMode as std::interfaces::Drop {
+  public fn drop (mut self: &RawMode) -> void {
+    if self.enabled {
+      let _ = tcsetattr(self.fd, TCSAFLUSH, self.orig);
+    }
+    std::runtime::mem::free(self.orig);
+    std::runtime::mem::free(self.raw_ptr);
+    self.fd = -1;
+    self.orig = 0;
+    self.raw_ptr = 0;
+    self.enabled = false;
+  }
+}

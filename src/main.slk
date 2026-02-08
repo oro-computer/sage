@@ -1,0 +1,2874 @@
+package sage;
+
+import { Args } from "std/args";
+import std::runtime::mem;
+import std::runtime::env;
+import std::runtime::posix::fs;
+import std::runtime::posix::io;
+import std::runtime::posix::time;
+import std::result;
+import std::sync;
+import std::regex;
+
+import { isatty, memchr, memmem, memrchr } from "./sage/os.slk";
+import { MappedFile, map_path, map_stdin_spool } from "./sage/file.slk";
+import { BufferU8, VecU64 } from "./sage/buf.slk";
+import { Writer, write_str } from "./sage/out.slk";
+import {
+  Input,
+  Key,
+  KEY_BACKSPACE,
+  KEY_BYTE,
+  KEY_DOWN,
+  KEY_END,
+  KEY_ENTER,
+  KEY_ESC,
+  KEY_EOF,
+  KEY_NONE,
+  KEY_LEFT,
+  KEY_RIGHT,
+  KEY_HOME,
+  KEY_PAGE_DOWN,
+  KEY_PAGE_UP,
+  KEY_UP,
+  input_init,
+  read_key_timeout
+} from "./sage/input.slk";
+import { RawMode, Size, get_size, raw_mode_enable } from "./sage/term.slk";
+import {
+  CONSUME_DONE,
+  CONSUME_OK,
+  ConsumeOutcome,
+  INDEX_STRIDE,
+  build_line_index,
+  consume_msg
+} from "./sage/index.slk";
+
+type ChanU64 = std::sync::Channel(u64);
+type ReCompileResult = std::result::Result(std::regex::RegExp, std::regex::CompileFailed);
+
+struct IndexState {
+  done: bool,
+  scan_off: i64,
+  lines: i64,
+}
+
+struct Config {
+  help: bool,
+  version: bool,
+  unsafe_raw: bool,
+  allow_binary: bool,
+  index_only: bool,
+  regex: bool,
+  ignore_case: bool,
+  no_alt_screen: bool,
+  ansi: bool,
+  color: int,
+  path: string?,
+}
+
+let COLOR_AUTO: int = 0;
+let COLOR_ALWAYS: int = 1;
+let COLOR_NEVER: int = 2;
+
+fn cfg_default () -> Config {
+  return Config{
+    help: false,
+    version: false,
+    unsafe_raw: false,
+    allow_binary: false,
+    index_only: false,
+    regex: false,
+    ignore_case: false,
+    no_alt_screen: false,
+    ansi: true,
+    color: COLOR_AUTO,
+    path: None
+  };
+}
+
+fn streq (a: string, b: string) -> bool {
+  return a == b;
+}
+
+fn parse_cli (args: Args) -> Config? {
+  let n: int = args.count();
+  let mut cfg: Config = cfg_default();
+
+  var i: int = 1;
+  while i < n {
+    let a: string = args.get(i);
+
+    if streq(a, "--help") || streq(a, "-h") {
+      cfg.help = true;
+      i = i + 1;
+      continue;
+    }
+    if streq(a, "--version") || streq(a, "-V") {
+      cfg.version = true;
+      i = i + 1;
+      continue;
+    }
+    if streq(a, "--color") {
+      if (i + 1) >= n {
+        return None;
+      }
+      let v: string = args.get(i + 1);
+      if streq(v, "auto") {
+        cfg.color = COLOR_AUTO;
+      } else if streq(v, "always") {
+        cfg.color = COLOR_ALWAYS;
+      } else if streq(v, "never") {
+        cfg.color = COLOR_NEVER;
+      } else {
+        return None;
+      }
+      i = i + 2;
+      continue;
+    }
+    if streq(a, "--no-color") {
+      cfg.color = COLOR_NEVER;
+      i = i + 1;
+      continue;
+    }
+    if streq(a, "--no-alt-screen") {
+      cfg.no_alt_screen = true;
+      i = i + 1;
+      continue;
+    }
+    if streq(a, "--ansi") {
+      cfg.ansi = true;
+      i = i + 1;
+      continue;
+    }
+    if streq(a, "--no-ansi") {
+      cfg.ansi = false;
+      i = i + 1;
+      continue;
+    }
+    if streq(a, "--raw") {
+      cfg.unsafe_raw = true;
+      i = i + 1;
+      continue;
+    }
+    if streq(a, "--binary") {
+      cfg.allow_binary = true;
+      i = i + 1;
+      continue;
+    }
+    if streq(a, "--regex") || streq(a, "-R") {
+      cfg.regex = true;
+      i = i + 1;
+      continue;
+    }
+    if streq(a, "--ignore-case") || streq(a, "-i") {
+      cfg.ignore_case = true;
+      i = i + 1;
+      continue;
+    }
+    if streq(a, "--index-only") {
+      cfg.index_only = true;
+      i = i + 1;
+      continue;
+    }
+    if streq(a, "--") {
+      if (i + 1) < n {
+        cfg.path = Some(args.get(i + 1));
+      }
+      break;
+    }
+
+    if std::runtime::mem::string_len(a) > 0 && std::runtime::mem::load_u8(std::runtime::mem::string_ptr(a), 0) == 45 {
+      // Unknown flag.
+      return None;
+    }
+
+    cfg.path = Some(a);
+    break;
+  }
+
+  return Some(cfg);
+}
+
+fn print_help () -> void {
+  let w_opt: Writer? = Writer.stderr(false, 8192);
+  if w_opt == None { return; }
+  let mut w: Writer = match (w_opt) { Some(v) => v, None => Writer{ fd: -1, color: false, buf: BufferU8.empty() } };
+
+  let _ = w.push_str("sage — a fast, ergonomic terminal pager (WIP)\n");
+  let _ = w.push_str("\n");
+  let _ = w.push_str("Usage:\n");
+  let _ = w.push_str("  sage <path>\n");
+  let _ = w.push_str("  cat <path> | sage\n");
+  let _ = w.push_str("\n");
+  let _ = w.push_str("Options:\n");
+  let _ = w.push_str("  -h, --help        Show help\n");
+  let _ = w.push_str("  -V, --version     Show version\n");
+  let _ = w.push_str("      --color <mode> Colorize UI (auto|always|never)\n");
+  let _ = w.push_str("      --no-color     Disable colors (same as --color never)\n");
+  let _ = w.push_str("      --no-alt-screen Do not use the terminal alternate screen\n");
+  let _ = w.push_str("      --[no-]ansi    Allow ANSI SGR in content (default: on)\n");
+  let _ = w.push_str("      --raw         Render bytes as-is (unsafe)\n");
+  let _ = w.push_str("      --binary      Allow NUL bytes\n");
+  let _ = w.push_str("  -R, --regex       Search uses regex (via std::regex)\n");
+  let _ = w.push_str("  -i, --ignore-case Case-insensitive search\n");
+  let _ = w.push_str("      --index-only  Build line index, print stats, exit\n");
+  let _ = w.push_str("\n");
+  let _ = w.push_str("Keys: q/Ctrl-C quit, j/k/Up/Down scroll, Left/Right page, Space/b page, g/G top/bottom, / search, n next, Esc cancel search, ? help\n");
+
+  let _ = w.flush();
+}
+
+fn print_version () -> void {
+  let _ = write_str(std::runtime::posix::io::STDOUT_FD, "sage 0.1.0\n");
+}
+
+fn stream_fd_to_stdout (fd: int) -> int {
+  let buf: u64 = std::runtime::mem::alloc(65536);
+  if buf == 0 {
+    return 2;
+  }
+
+  while true {
+    let n: int = std::runtime::posix::fs::read(fd, buf, 65536);
+    if n < 0 {
+      std::runtime::mem::free(buf);
+      return 2;
+    }
+    if n == 0 {
+      break;
+    }
+
+    var off: i64 = 0;
+    let want: i64 = n as i64;
+    while off < want {
+      let w: int = std::runtime::posix::fs::write(std::runtime::posix::io::STDOUT_FD, buf + (off as u64), want - off);
+      if w <= 0 {
+        std::runtime::mem::free(buf);
+        return 2;
+      }
+      off = off + (w as i64);
+    }
+  }
+
+  std::runtime::mem::free(buf);
+  return 0;
+}
+
+fn stream_path_to_stdout (path: string) -> int {
+  let fd: int = std::runtime::posix::fs::open(path, std::runtime::posix::fs::O_RDONLY, 0) as int;
+  if fd < 0 {
+    return 2;
+  }
+  let rc: int = stream_fd_to_stdout(fd);
+  let _ = std::runtime::posix::fs::close(fd);
+  return rc;
+}
+
+fn stream_stdin_to_stdout () -> int {
+  return stream_fd_to_stdout(std::runtime::posix::io::STDIN_FD);
+}
+
+fn ansi_csi (mut w: &Writer) -> void {
+  let _ = w.push_u8(27);
+  let _ = w.push_u8(91); // '['
+}
+
+fn ansi_home (mut w: &Writer) -> void {
+  ansi_csi(mut w);
+  let _ = w.push_u8(72); // 'H'
+}
+
+fn ansi_clear_eol (mut w: &Writer) -> void {
+  ansi_csi(mut w);
+  let _ = w.push_u8(75); // 'K'
+}
+
+fn ansi_hide_cursor (mut w: &Writer) -> void {
+  ansi_csi(mut w);
+  let _ = w.push_u8(63); // '?'
+  let _ = w.push_u8(50); // '2'
+  let _ = w.push_u8(53); // '5'
+  let _ = w.push_u8(108); // 'l'
+}
+
+fn ansi_show_cursor (mut w: &Writer) -> void {
+  ansi_csi(mut w);
+  let _ = w.push_u8(63); // '?'
+  let _ = w.push_u8(50); // '2'
+  let _ = w.push_u8(53); // '5'
+  let _ = w.push_u8(104); // 'h'
+}
+
+fn ansi_alt_on (mut w: &Writer) -> void {
+  ansi_csi(mut w);
+  let _ = w.push_u8(63); // '?'
+  let _ = w.push_u8(49); // '1'
+  let _ = w.push_u8(48); // '0'
+  let _ = w.push_u8(52); // '4'
+  let _ = w.push_u8(57); // '9'
+  let _ = w.push_u8(104); // 'h'
+}
+
+fn ansi_alt_off (mut w: &Writer) -> void {
+  ansi_csi(mut w);
+  let _ = w.push_u8(63); // '?'
+  let _ = w.push_u8(49); // '1'
+  let _ = w.push_u8(48); // '0'
+  let _ = w.push_u8(52); // '4'
+  let _ = w.push_u8(57); // '9'
+  let _ = w.push_u8(108); // 'l'
+}
+
+fn ansi_inverse_on (mut w: &Writer) -> void {
+  if !w.color { return; }
+  ansi_csi(mut w);
+  let _ = w.push_u8(55); // '7'
+  let _ = w.push_u8(109); // 'm'
+}
+
+fn ansi_sgr (mut w: &Writer, code: int) -> void {
+  if !w.color { return; }
+  ansi_csi(mut w);
+  let _ = w.push_i64(code as i64);
+  let _ = w.push_u8(109); // 'm'
+}
+
+fn ansi_intensity_normal (mut w: &Writer) -> void {
+  // SGR 22: normal intensity (clears bold + dim).
+  ansi_sgr(mut w, 22);
+}
+
+fn ansi_bold_on (mut w: &Writer) -> void {
+  ansi_sgr(mut w, 1);
+}
+
+fn ansi_dim_on (mut w: &Writer) -> void {
+  ansi_sgr(mut w, 2);
+}
+
+fn ansi_fg_256 (mut w: &Writer, color: int) -> void {
+  if !w.color { return; }
+  // ESC [ 38 ; 5 ; <n> m
+  ansi_csi(mut w);
+  let _ = w.push_u8(51); // '3'
+  let _ = w.push_u8(56); // '8'
+  let _ = w.push_u8(59); // ';'
+  let _ = w.push_u8(53); // '5'
+  let _ = w.push_u8(59); // ';'
+  let _ = w.push_i64(color as i64);
+  let _ = w.push_u8(109); // 'm'
+}
+
+fn ansi_bg_256 (mut w: &Writer, color: int) -> void {
+  if !w.color { return; }
+  // ESC [ 48 ; 5 ; <n> m
+  ansi_csi(mut w);
+  let _ = w.push_u8(52); // '4'
+  let _ = w.push_u8(56); // '8'
+  let _ = w.push_u8(59); // ';'
+  let _ = w.push_u8(53); // '5'
+  let _ = w.push_u8(59); // ';'
+  let _ = w.push_i64(color as i64);
+  let _ = w.push_u8(109); // 'm'
+}
+
+fn ansi_reset (mut w: &Writer) -> void {
+  if !w.color { return; }
+  ansi_csi(mut w);
+  let _ = w.push_u8(48); // '0'
+  let _ = w.push_u8(109); // 'm'
+}
+
+fn ansi_move (mut w: &Writer, row: int, col: int) -> void {
+  let _ = w.push_u8(27);
+  let _ = w.push_u8(91); // '['
+  let _ = w.push_i64(row as i64);
+  let _ = w.push_u8(59); // ';'
+  let _ = w.push_i64(col as i64);
+  let _ = w.push_u8(72); // 'H'
+}
+
+fn clamp_i64 (v: i64, lo: i64, hi: i64) -> i64 {
+  if v < lo { return lo; }
+  if v > hi { return hi; }
+  return v;
+}
+
+fn min_i64 (a: i64, b: i64) -> i64 {
+  if a < b { return a; }
+  return b;
+}
+
+fn max_i64 (a: i64, b: i64) -> i64 {
+  if a > b { return a; }
+  return b;
+}
+
+// ANSI / escape handling:
+// - safe mode: pass through CSI SGR (`ESC [ ... m`) for colored output, while
+//   still sanitizing other control bytes.
+// - `--raw`: bytes as-is (unsafe).
+let ANSI_BYTES_PER_COL: i64 = 32;
+let ANSI_SGR_MAX_BYTES: i64 = 64;
+
+fn csi_sgr_len (ptr: u64, rem: i64) -> i64 {
+  // Recognize a bounded CSI SGR sequence:
+  //   ESC '[' [0-9;:]* 'm'
+  // Returns the byte length to consume, or 0 if not recognized.
+  if ptr == 0 || rem < 3 {
+    return 0;
+  }
+  if std::runtime::mem::load_u8(ptr, 1) != 91 { // '['
+    return 0;
+  }
+
+  var i: i64 = 2;
+  while i < rem && i < ANSI_SGR_MAX_BYTES {
+    let c: u8 = std::runtime::mem::load_u8(ptr, i);
+    if c == 109 { // 'm'
+      return i + 1;
+    }
+    if (c >= 48 && c <= 57) || c == 59 || c == 58 { // digit / ';' / ':'
+      i = i + 1;
+      continue;
+    }
+    return 0;
+  }
+  return 0;
+}
+
+// Match highlighting (content area).
+let COLOR_MATCH_BG: int = 24;
+let COLOR_MATCH_FG: int = 231;
+
+fn render_line (mut w: &Writer, ptr: u64, len: i64, width: int, unsafe_raw: bool, allow_ansi: bool, hl_start: i64, hl_end: i64) -> i64 {
+  if width <= 0 {
+    return 0;
+  }
+
+  if unsafe_raw {
+    let take: i64 = min_i64(len, width as i64);
+    if take > 0 {
+      let _ = w.push_ptr_len(ptr, take);
+    }
+    return take;
+  }
+
+  let use_hl: bool = hl_start >= 0 && hl_end > hl_start && hl_start < len;
+  var hl_on: bool = false;
+
+  var col: int = 0;
+  var i: i64 = 0;
+  while i < len && col < width {
+    if use_hl && !hl_on && i == hl_start {
+      // When ANSI is enabled for content, use inverse-video highlighting so we
+      // don't clobber the underlying SGR state.
+      if allow_ansi {
+        ansi_inverse_on(mut w);
+      } else {
+        ansi_bg_256(mut w, COLOR_MATCH_BG);
+        ansi_fg_256(mut w, COLOR_MATCH_FG);
+        ansi_bold_on(mut w);
+      }
+      hl_on = true;
+    }
+    if use_hl && hl_on && i == hl_end {
+      if allow_ansi {
+        // SGR 27: positive image (inverse off).
+        ansi_sgr(mut w, 27);
+      } else {
+        ansi_reset(mut w);
+      }
+      hl_on = false;
+    }
+
+    let b: u8 = std::runtime::mem::load_u8(ptr, i);
+
+    // Safe rendering: escape control bytes.
+    if b == 9 { // tab
+      let tabw: int = 8 - (col & 7);
+      var s: int = 0;
+      while s < tabw && col < width {
+        let _ = w.push_u8(32);
+        s = s + 1;
+        col = col + 1;
+      }
+      i = i + 1;
+      continue;
+    }
+
+    if b == 27 { // ESC
+      if allow_ansi {
+        let rem: i64 = len - i;
+        let seq_len: i64 = csi_sgr_len(ptr + (i as u64), rem);
+        if seq_len > 0 {
+          let _ = w.push_ptr_len(ptr + (i as u64), seq_len);
+          i = i + seq_len;
+          continue;
+        }
+      }
+      if (col + 2) > width { break; }
+      let _ = w.push_u8(94); // ^
+      let _ = w.push_u8(91); // [
+      col = col + 2;
+      i = i + 1;
+      continue;
+    }
+
+    if b < 32 {
+      if (col + 2) > width { break; }
+      let _ = w.push_u8(94); // ^
+      let _ = w.push_u8(b + 64);
+      col = col + 2;
+      i = i + 1;
+      continue;
+    }
+
+    if b == 127 {
+      if (col + 2) > width { break; }
+      let _ = w.push_u8(94); // ^
+      let _ = w.push_u8(63); // ?
+      col = col + 2;
+      i = i + 1;
+      continue;
+    }
+
+    let _ = w.push_u8(b);
+    col = col + 1;
+    i = i + 1;
+  }
+
+  if use_hl && hl_on {
+    if allow_ansi {
+      ansi_sgr(mut w, 27);
+    } else {
+      ansi_reset(mut w);
+    }
+  }
+  return i;
+}
+
+fn measure_line_consumed (ptr: u64, len: i64, width: int, unsafe_raw: bool, allow_ansi: bool) -> i64 {
+  if width <= 0 {
+    return 0;
+  }
+  if ptr == 0 || len <= 0 {
+    return 0;
+  }
+
+  if unsafe_raw {
+    return min_i64(len, width as i64);
+  }
+
+  var col: int = 0;
+  var i: i64 = 0;
+  while i < len && col < width {
+    let b: u8 = std::runtime::mem::load_u8(ptr, i);
+
+    if b == 9 { // tab
+      let tabw: int = 8 - (col & 7);
+      col = col + tabw;
+      i = i + 1;
+      continue;
+    }
+
+    if b == 27 { // ESC
+      if allow_ansi {
+        let rem: i64 = len - i;
+        let seq_len: i64 = csi_sgr_len(ptr + (i as u64), rem);
+        if seq_len > 0 {
+          i = i + seq_len;
+          continue;
+        }
+      }
+      if (col + 2) > width { break; }
+      col = col + 2;
+      i = i + 1;
+      continue;
+    }
+
+    if b < 32 {
+      if (col + 2) > width { break; }
+      col = col + 2;
+      i = i + 1;
+      continue;
+    }
+
+    if b == 127 {
+      if (col + 2) > width { break; }
+      col = col + 2;
+      i = i + 1;
+      continue;
+    }
+
+    col = col + 1;
+    i = i + 1;
+  }
+
+  return i;
+}
+
+fn visual_next_off (file_ptr: u64, file_len: i64, off: i64, width: int, unsafe_raw: bool, allow_ansi: bool) -> i64 {
+  if file_ptr == 0 || file_len <= 0 {
+    return 0;
+  }
+  if off < 0 {
+    return 0;
+  }
+  if off >= file_len {
+    return file_len;
+  }
+  if width <= 0 {
+    let n0: i64 = off + 1;
+    return if n0 <= file_len { n0 } else { file_len };
+  }
+
+  let tail_len: i64 = file_len - off;
+  let mult: i64 = if allow_ansi && !unsafe_raw { ANSI_BYTES_PER_COL } else { 1 };
+  let scan_len: i64 = min_i64(tail_len, ((width as i64) * mult) + 1);
+  let nl_ptr: u64 = if scan_len > 0 { memchr(file_ptr + (off as u64), 10, scan_len) } else { 0 };
+
+  var has_nl: bool = false;
+  var nl_next: i64 = file_len;
+  var seg_len: i64 = 0;
+  if nl_ptr != 0 {
+    has_nl = true;
+    let nl_pos: i64 = (nl_ptr - file_ptr) as i64;
+    nl_next = nl_pos + 1;
+    seg_len = nl_pos - off;
+
+    // Trim CR in CRLF.
+    if seg_len > 0 {
+      let last_b: u8 = std::runtime::mem::load_u8(file_ptr, (off + seg_len) - 1);
+      if last_b == 13 {
+        seg_len = seg_len - 1;
+      }
+    }
+  } else {
+    seg_len = min_i64(tail_len, (width as i64) * mult);
+  }
+
+  let consumed: i64 = measure_line_consumed(file_ptr + (off as u64), seg_len, width, unsafe_raw, allow_ansi);
+  if consumed <= 0 {
+    let n: i64 = off + 1;
+    return if n <= file_len { n } else { file_len };
+  }
+  if has_nl && consumed == seg_len {
+    return nl_next;
+  }
+  let n2: i64 = off + consumed;
+  return if n2 <= file_len { n2 } else { file_len };
+}
+
+fn visual_prev_off (file_ptr: u64, file_len: i64, off: i64, width: int, unsafe_raw: bool, allow_ansi: bool) -> i64 {
+  if file_ptr == 0 || file_len <= 0 {
+    return 0;
+  }
+  if off <= 0 {
+    return 0;
+  }
+  if width <= 0 {
+    let p0: i64 = off - 1;
+    return if p0 > 0 { p0 } else { 0 };
+  }
+
+  // If we're at the start of a logical line (previous byte is '\n'), move to the
+  // previous line's last visual segment rather than landing on the newline byte.
+  if off > 0 {
+    let prev_b: u8 = std::runtime::mem::load_u8(file_ptr, off - 1);
+    if prev_b == 10 {
+      var target: i64 = off - 2;
+      if target < 0 {
+        return 0;
+      }
+      // Skip CR in CRLF.
+      let b2: u8 = std::runtime::mem::load_u8(file_ptr, target);
+      if b2 == 13 {
+        target = target - 1;
+        if target < 0 { return 0; }
+      }
+      return visual_start_for_offset(file_ptr, file_len, target, width, unsafe_raw, allow_ansi);
+    }
+  }
+
+  // If we're not aligned to a visual line boundary (e.g. after a resize),
+  // step back to the start of the current visual line first.
+  if off < file_len {
+    let aligned: i64 = visual_start_for_offset(file_ptr, file_len, off, width, unsafe_raw, allow_ansi);
+    if aligned < off {
+      return aligned;
+    }
+  }
+
+  let mult: i64 = if allow_ansi && !unsafe_raw { ANSI_BYTES_PER_COL } else { 1 };
+  let max_back: i64 = ((width as i64) * mult) + 1;
+  var min_start: i64 = off - max_back;
+  if min_start < 0 {
+    min_start = 0;
+  }
+
+  var s: i64 = off - 1;
+  while true {
+    if s < min_start {
+      break;
+    }
+    let n: i64 = visual_next_off(file_ptr, file_len, s, width, unsafe_raw, allow_ansi);
+    if n == off {
+      return s;
+    }
+    if s == 0 {
+      break;
+    }
+    s = s - 1;
+  }
+
+  return min_start;
+}
+
+let VISUAL_START_MAX_BACK: i64 = 65536;
+
+fn visual_start_for_offset (file_ptr: u64, file_len: i64, off: i64, width: int, unsafe_raw: bool, allow_ansi: bool) -> i64 {
+  if file_ptr == 0 || file_len <= 0 {
+    return 0;
+  }
+  if off <= 0 {
+    return 0;
+  }
+  if off >= file_len {
+    return visual_prev_off(file_ptr, file_len, file_len, width, unsafe_raw, allow_ansi);
+  }
+  if width <= 0 {
+    return off;
+  }
+
+  let w: i64 = width as i64;
+  let mult: i64 = if allow_ansi && !unsafe_raw { ANSI_BYTES_PER_COL } else { 1 };
+  let w_bytes: i64 = w * mult;
+  var max_back: i64 = VISUAL_START_MAX_BACK;
+  if max_back < (w_bytes + 1) { max_back = w_bytes + 1; }
+
+  var start0: i64 = off - max_back;
+  if start0 < 0 { start0 = 0; }
+
+  // Find a nearby logical line start (fast, bounded scan).
+  let search_len: i64 = off - start0;
+  let p: u64 = if search_len > 0 { memrchr(file_ptr + (start0 as u64), 10, search_len) } else { 0 };
+  if p == 0 {
+    // No newline in the window (very long line): approximate wrap alignment.
+    let modv: i64 = off % w;
+    return off - modv;
+  }
+
+  let line_start: i64 = ((p - file_ptr) as i64) + 1;
+  var cur: i64 = line_start;
+  while cur < off {
+    let n: i64 = visual_next_off(file_ptr, file_len, cur, width, unsafe_raw, allow_ansi);
+    if n <= cur {
+      break;
+    }
+    if n > off {
+      break;
+    }
+    cur = n;
+  }
+  return cur;
+}
+
+// ---------------------------------------------------------------------------
+// Theme (256-color palette).
+
+let COLOR_STATUS_BG: int = 236;
+let COLOR_STATUS_FG: int = 252;
+let COLOR_STATUS_DIM: int = 244;
+let COLOR_BRAND: int = 114;
+let COLOR_ACCENT: int = 81;
+let COLOR_WARN: int = 214;
+let COLOR_ERROR: int = 203;
+let COLOR_MODE_REGEX: int = 141;
+
+fn ansi_status_on (mut w: &Writer) -> void {
+  ansi_reset(mut w);
+  ansi_bg_256(mut w, COLOR_STATUS_BG);
+  ansi_fg_256(mut w, COLOR_STATUS_FG);
+}
+
+fn digits_u64 (v: u64) -> int {
+  if v == 0 { return 1; }
+  var x: u64 = v;
+  var n: int = 0;
+  while x != 0 {
+    n = n + 1;
+    x = x / 10;
+  }
+  return n;
+}
+
+fn digits_i64 (v: i64) -> int {
+  if v < 0 {
+    return 1 + digits_u64((0 - v) as u64);
+  }
+  return digits_u64(v as u64);
+}
+
+fn status_alert_len (alert: int) -> int {
+  if alert == 1 { return 9; }  // "regex>2GB"
+  if alert == 2 { return 13; } // "regex compile"
+  if alert == 3 { return 13; } // "regex runtime"
+  if alert == 4 { return 9; }  // "searching"
+  if alert == 5 { return 9; }  // "not found"
+  return 5;                    // "error"
+}
+
+fn status_sep (mut w: &Writer) -> void {
+  ansi_fg_256(mut w, COLOR_STATUS_DIM);
+  let _ = w.push_str(" │ ");
+  ansi_fg_256(mut w, COLOR_STATUS_FG);
+}
+
+fn push_path_slice_pretty (mut w: &Writer, ptr: u64, len: i64) -> int {
+  if ptr == 0 || len <= 0 {
+    return 0;
+  }
+
+  let slash: u64 = memrchr(ptr, 47, len); // '/'
+  if slash != 0 {
+    let dir_len: i64 = ((slash - ptr) as i64) + 1;
+    ansi_fg_256(mut w, COLOR_STATUS_DIM);
+    ansi_dim_on(mut w);
+    let _ = w.push_ptr_len(ptr, dir_len);
+    ansi_intensity_normal(mut w);
+
+    ansi_fg_256(mut w, COLOR_ACCENT);
+    ansi_bold_on(mut w);
+    let _ = w.push_ptr_len(ptr + (dir_len as u64), len - dir_len);
+    ansi_intensity_normal(mut w);
+
+    ansi_fg_256(mut w, COLOR_STATUS_FG);
+    return len as int;
+  }
+
+  ansi_fg_256(mut w, COLOR_ACCENT);
+  ansi_bold_on(mut w);
+  let _ = w.push_ptr_len(ptr, len);
+  ansi_intensity_normal(mut w);
+  ansi_fg_256(mut w, COLOR_STATUS_FG);
+  return len as int;
+}
+
+fn push_path_pretty (mut w: &Writer, path: string, max: int) -> int {
+  if max <= 0 {
+    return 0;
+  }
+
+  let ptr: u64 = std::runtime::mem::string_ptr(path);
+  let len: i64 = std::runtime::mem::string_len(path);
+  if ptr == 0 || len <= 0 {
+    return 0;
+  }
+
+  if len <= (max as i64) {
+    return push_path_slice_pretty(mut w, ptr, len);
+  }
+
+  if max <= 3 {
+    let take: i64 = max as i64;
+    let tail_ptr: u64 = ptr + ((len - take) as u64);
+    return push_path_slice_pretty(mut w, tail_ptr, take);
+  }
+
+  let tail_len: i64 = (max - 3) as i64;
+  let tail_ptr: u64 = ptr + ((len - tail_len) as u64);
+
+  ansi_fg_256(mut w, COLOR_STATUS_DIM);
+  ansi_dim_on(mut w);
+  let _ = w.push_str("...");
+  ansi_intensity_normal(mut w);
+  ansi_fg_256(mut w, COLOR_STATUS_FG);
+
+  let tail_n: int = push_path_slice_pretty(mut w, tail_ptr, tail_len);
+  return 3 + tail_n;
+}
+
+fn status_right_len (
+  top_line: i64,
+  top_off: i64,
+  file_len: i64,
+  indexed_done: bool,
+  scan_off: i64,
+  lines: i64,
+  alert: int,
+  use_regex: bool,
+  ignore_case: bool,
+  show_off: bool,
+  show_lines: bool,
+  show_index: bool,
+  show_mode: bool,
+  show_pct: bool
+) -> int {
+  let sep: int = 3;
+
+  var len: int = 0;
+  // "Ln " + digits / "?"
+  len = 3 + (if top_line >= 0 { digits_i64(top_line + 1) } else { 1 });
+
+  if show_off {
+    len = len + sep + 4 + digits_i64(top_off);
+  }
+
+  if show_pct && file_len > 0 {
+    let pct: i64 = (top_off * 100) / file_len;
+    len = len + sep + digits_i64(pct) + 1; // "%"
+  }
+
+  if show_lines && lines > 0 {
+    len = len + sep + 2 + digits_i64(lines); // "L "
+  }
+
+  if show_index && !indexed_done {
+    if file_len > 0 && scan_off > 0 {
+      let ipct: i64 = (scan_off * 100) / file_len;
+      len = len + sep + 4 + digits_i64(ipct) + 1; // "idx " + "%""
+    } else {
+      len = len + sep + 7; // "idx ..."
+    }
+  }
+
+  if show_mode {
+    let base: int = if use_regex { 2 } else { 3 }; // "re" / "str"
+    let extra: int = if ignore_case { 2 } else { 0 }; // " i"
+    len = len + sep + base + extra;
+  }
+
+  if alert != 0 {
+    len = len + sep + 2 + status_alert_len(alert);
+  }
+
+  return len;
+}
+
+fn push_status_right (
+  mut w: &Writer,
+  top_line: i64,
+  top_off: i64,
+  file_len: i64,
+  indexed_done: bool,
+  scan_off: i64,
+  lines: i64,
+  alert: int,
+  use_regex: bool,
+  ignore_case: bool,
+  show_off: bool,
+  show_lines: bool,
+  show_index: bool,
+  show_mode: bool,
+  show_pct: bool
+) -> void {
+  // Ln
+  ansi_fg_256(mut w, COLOR_STATUS_DIM);
+  let _ = w.push_str("Ln ");
+  ansi_fg_256(mut w, COLOR_STATUS_FG);
+  if top_line >= 0 {
+    let _ = w.push_i64(top_line + 1);
+  } else {
+    let _ = w.push_str("?");
+  }
+
+  if show_off {
+    status_sep(mut w);
+    ansi_fg_256(mut w, COLOR_STATUS_DIM);
+    let _ = w.push_str("Off ");
+    ansi_fg_256(mut w, COLOR_STATUS_FG);
+    let _ = w.push_i64(top_off);
+  }
+
+  if show_pct && file_len > 0 {
+    status_sep(mut w);
+    let pct: i64 = (top_off * 100) / file_len;
+    ansi_fg_256(mut w, COLOR_BRAND);
+    let _ = w.push_i64(pct);
+    let _ = w.push_str("%");
+    ansi_fg_256(mut w, COLOR_STATUS_FG);
+  }
+
+  if show_lines && lines > 0 {
+    status_sep(mut w);
+    ansi_fg_256(mut w, COLOR_STATUS_DIM);
+    let _ = w.push_str("L ");
+    ansi_fg_256(mut w, COLOR_STATUS_FG);
+    let _ = w.push_i64(lines);
+  }
+
+  if show_index && !indexed_done {
+    status_sep(mut w);
+    ansi_fg_256(mut w, COLOR_WARN);
+    let _ = w.push_str("idx ");
+    if file_len > 0 && scan_off > 0 {
+      let ipct: i64 = (scan_off * 100) / file_len;
+      let _ = w.push_i64(ipct);
+      let _ = w.push_str("%");
+    } else {
+      let _ = w.push_str("...");
+    }
+    ansi_fg_256(mut w, COLOR_STATUS_FG);
+  }
+
+  if show_mode {
+    status_sep(mut w);
+    if use_regex {
+      ansi_fg_256(mut w, COLOR_MODE_REGEX);
+      let _ = w.push_str("re");
+    } else {
+      ansi_fg_256(mut w, COLOR_BRAND);
+      let _ = w.push_str("str");
+    }
+    if ignore_case {
+      ansi_fg_256(mut w, COLOR_ACCENT);
+      let _ = w.push_str(" i");
+    }
+    ansi_fg_256(mut w, COLOR_STATUS_FG);
+  }
+
+  if alert != 0 {
+    status_sep(mut w);
+    if alert == 4 {
+      ansi_fg_256(mut w, COLOR_WARN);
+    } else {
+      ansi_fg_256(mut w, COLOR_ERROR);
+    }
+    let _ = w.push_str("[");
+    if alert == 1 {
+      let _ = w.push_str("regex>2GB");
+    } else if alert == 2 {
+      let _ = w.push_str("regex compile");
+    } else if alert == 3 {
+      let _ = w.push_str("regex runtime");
+    } else if alert == 4 {
+      let _ = w.push_str("searching");
+    } else if alert == 5 {
+      let _ = w.push_str("not found");
+    } else {
+      let _ = w.push_str("error");
+    }
+    let _ = w.push_str("]");
+    ansi_fg_256(mut w, COLOR_STATUS_FG);
+  }
+}
+
+fn draw_help (
+  mut w: &Writer,
+  content_rows: int,
+  cols: int,
+  use_regex: bool,
+  ignore_case: bool,
+  unsafe_raw: bool
+) -> void {
+  // `cols` is currently only used for future layout tweaks.
+  let _ = cols;
+
+  var r: int = 0;
+  ansi_reset(mut w);
+
+  // Header.
+  if r < content_rows {
+    ansi_move(mut w, r + 1, 1);
+    ansi_fg_256(mut w, COLOR_BRAND);
+    ansi_bold_on(mut w);
+    let _ = w.push_str("sage");
+    ansi_intensity_normal(mut w);
+    ansi_fg_256(mut w, COLOR_STATUS_DIM);
+    let _ = w.push_str(" — a fast, ergonomic terminal pager");
+    ansi_reset(mut w);
+    ansi_clear_eol(mut w);
+    r = r + 1;
+  }
+
+  // Mode line.
+  if r < content_rows {
+    ansi_move(mut w, r + 1, 1);
+    ansi_fg_256(mut w, COLOR_STATUS_DIM);
+    let _ = w.push_str("Mode: ");
+    if use_regex {
+      ansi_fg_256(mut w, COLOR_MODE_REGEX);
+      let _ = w.push_str("re");
+    } else {
+      ansi_fg_256(mut w, COLOR_BRAND);
+      let _ = w.push_str("str");
+    }
+    if ignore_case {
+      ansi_fg_256(mut w, COLOR_ACCENT);
+      let _ = w.push_str(" i");
+    }
+    if unsafe_raw {
+      ansi_fg_256(mut w, COLOR_ERROR);
+      let _ = w.push_str(" raw");
+    }
+    ansi_reset(mut w);
+    ansi_clear_eol(mut w);
+    r = r + 1;
+  }
+
+  // Blank.
+  if r < content_rows {
+    ansi_move(mut w, r + 1, 1);
+    ansi_clear_eol(mut w);
+    r = r + 1;
+  }
+
+  // Navigation.
+  if r < content_rows {
+    ansi_move(mut w, r + 1, 1);
+    ansi_fg_256(mut w, COLOR_ACCENT);
+    ansi_bold_on(mut w);
+    let _ = w.push_str("Navigation");
+    ansi_reset(mut w);
+    ansi_clear_eol(mut w);
+    r = r + 1;
+  }
+  if r < content_rows {
+    ansi_move(mut w, r + 1, 1);
+    let _ = w.push_str("  ");
+    ansi_fg_256(mut w, COLOR_ACCENT);
+    ansi_bold_on(mut w);
+    let _ = w.push_str("j / Down");
+    ansi_reset(mut w);
+    let _ = w.push_str("      down one visual line");
+    ansi_clear_eol(mut w);
+    r = r + 1;
+  }
+  if r < content_rows {
+    ansi_move(mut w, r + 1, 1);
+    let _ = w.push_str("  ");
+    ansi_fg_256(mut w, COLOR_ACCENT);
+    ansi_bold_on(mut w);
+    let _ = w.push_str("k / Up");
+    ansi_reset(mut w);
+    let _ = w.push_str("        up one visual line");
+    ansi_clear_eol(mut w);
+    r = r + 1;
+  }
+  if r < content_rows {
+    ansi_move(mut w, r + 1, 1);
+    let _ = w.push_str("  ");
+    ansi_fg_256(mut w, COLOR_ACCENT);
+    ansi_bold_on(mut w);
+    let _ = w.push_str("Space / PgDn");
+    ansi_reset(mut w);
+    let _ = w.push_str(" down one page");
+    ansi_clear_eol(mut w);
+    r = r + 1;
+  }
+  if r < content_rows {
+    ansi_move(mut w, r + 1, 1);
+    let _ = w.push_str("  ");
+    ansi_fg_256(mut w, COLOR_ACCENT);
+    ansi_bold_on(mut w);
+    let _ = w.push_str("b / PgUp");
+    ansi_reset(mut w);
+    let _ = w.push_str("     up one page");
+    ansi_clear_eol(mut w);
+    r = r + 1;
+  }
+  if r < content_rows {
+    ansi_move(mut w, r + 1, 1);
+    let _ = w.push_str("  ");
+    ansi_fg_256(mut w, COLOR_ACCENT);
+    ansi_bold_on(mut w);
+    let _ = w.push_str("Right / Left");
+    ansi_reset(mut w);
+    let _ = w.push_str(" forward/back a page");
+    ansi_clear_eol(mut w);
+    r = r + 1;
+  }
+  if r < content_rows {
+    ansi_move(mut w, r + 1, 1);
+    let _ = w.push_str("  ");
+    ansi_fg_256(mut w, COLOR_ACCENT);
+    ansi_bold_on(mut w);
+    let _ = w.push_str("g / Home");
+    ansi_reset(mut w);
+    let _ = w.push_str("    top");
+    ansi_clear_eol(mut w);
+    r = r + 1;
+  }
+  if r < content_rows {
+    ansi_move(mut w, r + 1, 1);
+    let _ = w.push_str("  ");
+    ansi_fg_256(mut w, COLOR_ACCENT);
+    ansi_bold_on(mut w);
+    let _ = w.push_str("G / End");
+    ansi_reset(mut w);
+    let _ = w.push_str("     bottom");
+    ansi_clear_eol(mut w);
+    r = r + 1;
+  }
+
+  // Blank.
+  if r < content_rows {
+    ansi_move(mut w, r + 1, 1);
+    ansi_clear_eol(mut w);
+    r = r + 1;
+  }
+
+  // Search.
+  if r < content_rows {
+    ansi_move(mut w, r + 1, 1);
+    ansi_fg_256(mut w, COLOR_ACCENT);
+    ansi_bold_on(mut w);
+    let _ = w.push_str("Search");
+    ansi_reset(mut w);
+    ansi_clear_eol(mut w);
+    r = r + 1;
+  }
+  if r < content_rows {
+    ansi_move(mut w, r + 1, 1);
+    let _ = w.push_str("  ");
+    ansi_fg_256(mut w, COLOR_ACCENT);
+    ansi_bold_on(mut w);
+    let _ = w.push_str("/");
+    ansi_reset(mut w);
+    let _ = w.push_str("            enter a query (jumps to first match)");
+    ansi_clear_eol(mut w);
+    r = r + 1;
+  }
+  if r < content_rows {
+    ansi_move(mut w, r + 1, 1);
+    let _ = w.push_str("  ");
+    ansi_fg_256(mut w, COLOR_ACCENT);
+    ansi_bold_on(mut w);
+    let _ = w.push_str("n");
+    ansi_reset(mut w);
+    let _ = w.push_str("            next match");
+    ansi_clear_eol(mut w);
+    r = r + 1;
+  }
+
+  // Blank.
+  if r < content_rows {
+    ansi_move(mut w, r + 1, 1);
+    ansi_clear_eol(mut w);
+    r = r + 1;
+  }
+
+  // Options.
+  if r < content_rows {
+    ansi_move(mut w, r + 1, 1);
+    ansi_fg_256(mut w, COLOR_ACCENT);
+    ansi_bold_on(mut w);
+    let _ = w.push_str("Options");
+    ansi_reset(mut w);
+    ansi_clear_eol(mut w);
+    r = r + 1;
+  }
+  if r < content_rows {
+    ansi_move(mut w, r + 1, 1);
+    let _ = w.push_str("  ");
+    ansi_fg_256(mut w, COLOR_BRAND);
+    ansi_bold_on(mut w);
+    let _ = w.push_str("-R");
+    ansi_reset(mut w);
+    let _ = w.push_str("           regex search");
+    ansi_clear_eol(mut w);
+    r = r + 1;
+  }
+  if r < content_rows {
+    ansi_move(mut w, r + 1, 1);
+    let _ = w.push_str("  ");
+    ansi_fg_256(mut w, COLOR_BRAND);
+    ansi_bold_on(mut w);
+    let _ = w.push_str("-i");
+    ansi_reset(mut w);
+    let _ = w.push_str("           ignore case (ASCII for literal search)");
+    ansi_clear_eol(mut w);
+    r = r + 1;
+  }
+  if r < content_rows {
+    ansi_move(mut w, r + 1, 1);
+    let _ = w.push_str("  ");
+    ansi_fg_256(mut w, COLOR_ERROR);
+    ansi_bold_on(mut w);
+    let _ = w.push_str("--raw");
+    ansi_reset(mut w);
+    let _ = w.push_str("        render bytes as-is (unsafe)");
+    ansi_clear_eol(mut w);
+    r = r + 1;
+  }
+
+  // Footer.
+  if r < content_rows {
+    ansi_move(mut w, r + 1, 1);
+    ansi_clear_eol(mut w);
+    r = r + 1;
+  }
+  if r < content_rows {
+    ansi_move(mut w, r + 1, 1);
+    ansi_fg_256(mut w, COLOR_STATUS_DIM);
+    let _ = w.push_str("Press ");
+    ansi_fg_256(mut w, COLOR_ACCENT);
+    ansi_bold_on(mut w);
+    let _ = w.push_str("?");
+    ansi_reset(mut w);
+    ansi_fg_256(mut w, COLOR_STATUS_DIM);
+    let _ = w.push_str(" or ");
+    ansi_fg_256(mut w, COLOR_ACCENT);
+    ansi_bold_on(mut w);
+    let _ = w.push_str("h");
+    ansi_reset(mut w);
+    ansi_fg_256(mut w, COLOR_STATUS_DIM);
+    let _ = w.push_str(" to close help, ");
+    ansi_fg_256(mut w, COLOR_ACCENT);
+    ansi_bold_on(mut w);
+    let _ = w.push_str("q");
+    ansi_reset(mut w);
+    ansi_fg_256(mut w, COLOR_STATUS_DIM);
+    let _ = w.push_str(" to quit.");
+    ansi_reset(mut w);
+    ansi_clear_eol(mut w);
+    r = r + 1;
+  }
+
+  // Fill remaining rows so stale content never shows through.
+  while r < content_rows {
+    ansi_move(mut w, r + 1, 1);
+    ansi_clear_eol(mut w);
+    r = r + 1;
+  }
+}
+
+fn status_line (
+  mut w: &Writer,
+  path: string,
+  top_line: i64,
+  top_off: i64,
+  file_len: i64,
+  rows: int,
+  cols: int,
+  indexed_done: bool,
+  scan_off: i64,
+  lines: i64,
+  alert: int,
+  use_regex: bool,
+  ignore_case: bool
+) -> void {
+  ansi_move(mut w, rows, 1);
+
+  // Fill the entire status row with a consistent background.
+  ansi_status_on(mut w);
+  ansi_clear_eol(mut w);
+  ansi_move(mut w, rows, 1);
+
+  let left_fixed: int = 8; // " " + "sage" + " │ "
+  let min_space: int = 1;
+
+  var show_off: bool = true;
+  var show_lines: bool = lines > 0;
+  var show_index: bool = !indexed_done;
+  var show_mode: bool = true;
+  var show_pct: bool = file_len > 0;
+
+  // If the terminal is narrow, drop less-important fields first so we don't wrap.
+  var right_len: int = status_right_len(
+    top_line, top_off, file_len, indexed_done, scan_off, lines, alert,
+    use_regex, ignore_case,
+    show_off, show_lines, show_index, show_mode, show_pct
+  );
+  var path_avail: int = cols - left_fixed - min_space - right_len;
+  while path_avail < 0 {
+    if show_off {
+      show_off = false;
+    } else if show_lines {
+      show_lines = false;
+    } else if show_mode {
+      show_mode = false;
+    } else if show_index {
+      show_index = false;
+    } else if show_pct {
+      show_pct = false;
+    } else {
+      break;
+    }
+    right_len = status_right_len(
+      top_line, top_off, file_len, indexed_done, scan_off, lines, alert,
+      use_regex, ignore_case,
+      show_off, show_lines, show_index, show_mode, show_pct
+    );
+    path_avail = cols - left_fixed - min_space - right_len;
+  }
+  if path_avail < 0 { path_avail = 0; }
+
+  // Left: " sage │ <path>"
+  let _ = w.push_str(" ");
+  ansi_fg_256(mut w, COLOR_BRAND);
+  ansi_bold_on(mut w);
+  let _ = w.push_str("sage");
+  ansi_intensity_normal(mut w);
+  ansi_fg_256(mut w, COLOR_STATUS_FG);
+  ansi_fg_256(mut w, COLOR_STATUS_DIM);
+  let _ = w.push_str(" │ ");
+  ansi_fg_256(mut w, COLOR_STATUS_FG);
+
+  let path_len: int = push_path_pretty(mut w, path, path_avail);
+
+  // Padding to right-aligned fields.
+  var used_left: int = left_fixed + path_len;
+  var spaces: int = cols - right_len - used_left;
+  if spaces < min_space { spaces = min_space; }
+  var s: int = 0;
+  while s < spaces {
+    let _ = w.push_u8(32);
+    s = s + 1;
+  }
+
+  // Right.
+  push_status_right(
+    mut w,
+    top_line, top_off, file_len, indexed_done, scan_off, lines, alert,
+    use_regex, ignore_case,
+    show_off, show_lines, show_index, show_mode, show_pct
+  );
+
+  ansi_clear_eol(mut w);
+  ansi_reset(mut w);
+}
+
+fn index_pump_try (mut ch: &ChanU64, mut offsets: &VecU64, mut idx: &IndexState) -> bool {
+  while true {
+    let m_opt: u64? = ch.try_recv();
+    if m_opt == None {
+      break;
+    }
+    let m: u64 = match (m_opt) { Some(v) => v, None => 0 };
+    let out: ConsumeOutcome = consume_msg(m, mut offsets);
+    if out.kind == CONSUME_DONE {
+      idx.done = true;
+      break;
+    }
+    if out.kind == CONSUME_OK {
+      idx.scan_off = out.scan_off;
+      idx.lines = out.lines;
+      continue;
+    }
+    // OOM or invalid message; stop indexing.
+    idx.done = true;
+    ch.close();
+    break;
+  }
+  return true;
+}
+
+fn index_ensure_line (target_line: i64, mut ch: &ChanU64, mut offsets: &VecU64, mut idx: &IndexState) -> bool {
+  while !idx.done && offsets.len <= target_line {
+    let m_opt: u64? = ch.recv();
+    if m_opt == None {
+      idx.done = true;
+      break;
+    }
+    let m: u64 = match (m_opt) { Some(v) => v, None => 0 };
+    let out: ConsumeOutcome = consume_msg(m, mut offsets);
+    if out.kind == CONSUME_DONE {
+      idx.done = true;
+      break;
+    }
+    if out.kind == CONSUME_OK {
+      idx.scan_off = out.scan_off;
+      idx.lines = out.lines;
+      continue;
+    }
+    idx.done = true;
+    ch.close();
+    break;
+  }
+  return true;
+}
+
+fn index_ensure_scanned_to (target_off: i64, mut ch: &ChanU64, mut offsets: &VecU64, mut idx: &IndexState) -> bool {
+  while !idx.done && idx.scan_off < target_off {
+    let m_opt: u64? = ch.recv();
+    if m_opt == None {
+      idx.done = true;
+      break;
+    }
+    let m: u64 = match (m_opt) { Some(v) => v, None => 0 };
+    let out: ConsumeOutcome = consume_msg(m, mut offsets);
+    if out.kind == CONSUME_DONE {
+      idx.done = true;
+      break;
+    }
+    if out.kind == CONSUME_OK {
+      idx.scan_off = out.scan_off;
+      idx.lines = out.lines;
+      continue;
+    }
+    idx.done = true;
+    ch.close();
+    break;
+  }
+  return true;
+}
+
+fn line_for_offset (offsets: &VecU64, off: i64) -> i64 {
+  if offsets.len <= 0 {
+    return 0;
+  }
+
+  var lo: i64 = 0;
+  var hi: i64 = offsets.len;
+  while (lo + 1) < hi {
+    let mid: i64 = (lo + hi) / 2;
+    let mid_off: i64 = offsets.get(mid) as i64;
+    if mid_off <= off {
+      lo = mid;
+    } else {
+      hi = mid;
+    }
+  }
+  return lo;
+}
+
+fn line_start_for_offset (file_ptr: u64, off: i64) -> i64 {
+  if file_ptr == 0 || off <= 0 {
+    return 0;
+  }
+  let p: u64 = memrchr(file_ptr, 10, off);
+  if p == 0 {
+    return 0;
+  }
+  return ((p - file_ptr) as i64) + 1;
+}
+
+fn prev_line_start (file_ptr: u64, file_len: i64, off: i64) -> i64 {
+  if file_ptr == 0 || file_len <= 0 {
+    return 0;
+  }
+  if off <= 0 {
+    return 0;
+  }
+  let search_len: i64 = off - 1;
+  if search_len <= 0 {
+    return 0;
+  }
+  let p: u64 = memrchr(file_ptr, 10, search_len);
+  if p == 0 {
+    return 0;
+  }
+  return ((p - file_ptr) as i64) + 1;
+}
+
+fn next_line_start (file_ptr: u64, file_len: i64, off: i64) -> i64 {
+  if file_ptr == 0 || file_len <= 0 {
+    return 0;
+  }
+  if off >= file_len {
+    return file_len;
+  }
+  let p: u64 = memchr(file_ptr + (off as u64), 10, file_len - off);
+  if p == 0 {
+    return off;
+  }
+  return ((p - file_ptr) as i64) + 1;
+}
+
+fn advance_lines (file_ptr: u64, file_len: i64, off: i64, nlines: int) -> i64 {
+  if nlines <= 0 {
+    return off;
+  }
+  var cur: i64 = off;
+  var i: int = 0;
+  while i < nlines {
+    let next: i64 = next_line_start(file_ptr, file_len, cur);
+    if next == cur {
+      break;
+    }
+    cur = next;
+    i = i + 1;
+  }
+  return cur;
+}
+
+fn rewind_lines (file_ptr: u64, file_len: i64, off: i64, nlines: int) -> i64 {
+  if nlines <= 0 {
+    return off;
+  }
+  var cur: i64 = off;
+  var i: int = 0;
+  while i < nlines {
+    let prev: i64 = prev_line_start(file_ptr, file_len, cur);
+    if prev == cur {
+      break;
+    }
+    cur = prev;
+    i = i + 1;
+  }
+  return cur;
+}
+
+fn last_page_start (file_ptr: u64, file_len: i64, content_rows: int) -> i64 {
+  if file_ptr == 0 || file_len <= 0 {
+    return 0;
+  }
+  if content_rows <= 1 {
+    return 0;
+  }
+  return rewind_lines(file_ptr, file_len, file_len, content_rows - 1);
+}
+
+fn line_number_for_offset (file_ptr: u64, checkpoints: &VecU64, off: i64) -> i64 {
+  if file_ptr == 0 || off <= 0 {
+    return 0;
+  }
+  if checkpoints.len <= 0 {
+    return 0;
+  }
+
+  let ck: i64 = line_for_offset(checkpoints, off);
+  let base_line: i64 = ck * INDEX_STRIDE;
+  let base_off: i64 = checkpoints.get(ck) as i64;
+
+  var line: i64 = base_line;
+  var cur: i64 = base_off;
+  while cur < off {
+    let p: u64 = memchr(file_ptr + (cur as u64), 10, off - cur);
+    if p == 0 {
+      break;
+    }
+    line = line + 1;
+    cur = ((p - file_ptr) as i64) + 1;
+  }
+  return line;
+}
+
+fn push_tail_trunc (mut w: &Writer, ptr: u64, len: i64, max: int) -> int {
+  if ptr == 0 || len <= 0 || max <= 0 {
+    return 0;
+  }
+  if len <= (max as i64) {
+    let _ = w.push_ptr_len(ptr, len);
+    return len as int;
+  }
+
+  if max <= 3 {
+    let take: i64 = max as i64;
+    let tail_ptr: u64 = ptr + ((len - take) as u64);
+    let _ = w.push_ptr_len(tail_ptr, take);
+    return max;
+  }
+
+  let tail_len: i64 = (max - 3) as i64;
+  let tail_ptr: u64 = ptr + ((len - tail_len) as u64);
+
+  ansi_fg_256(mut w, COLOR_STATUS_DIM);
+  ansi_dim_on(mut w);
+  let _ = w.push_str("...");
+  ansi_intensity_normal(mut w);
+  ansi_fg_256(mut w, COLOR_STATUS_FG);
+
+  let _ = w.push_ptr_len(tail_ptr, tail_len);
+  return max;
+}
+
+fn prompt_search (
+  mut w: &Writer,
+  mut inp: &Input,
+  rows: int,
+  cols: int,
+  mut out_query: &BufferU8,
+  use_regex: bool,
+  ignore_case: bool
+) -> bool {
+  out_query.clear();
+
+  while true {
+    // Draw only the status line prompt.
+    w.clear();
+    ansi_move(mut w, rows, 1);
+    ansi_status_on(mut w);
+    ansi_clear_eol(mut w);
+    ansi_move(mut w, rows, 1);
+
+    // Right-side hint (depends on available width).
+    var mode_len: int = if use_regex { 2 } else { 3 };
+    if ignore_case { mode_len = mode_len + 2; }
+
+    var hint_kind: int = 0;
+    // 0: "ESC cancel"
+    // 1: "<mode>  ESC cancel"
+    // 2: "<mode>  Enter search  ESC cancel"
+    if cols >= 60 {
+      hint_kind = 2;
+    } else if cols >= 45 {
+      hint_kind = 1;
+    } else {
+      hint_kind = 0;
+    }
+
+    var right_len: int = 10; // "ESC cancel"
+    if hint_kind == 1 {
+      right_len = mode_len + 2 + 10;
+    } else if hint_kind == 2 {
+      // "Enter search" is 12 chars; we print two extra spaces after it.
+      right_len = mode_len + 2 + 12 + 2 + 10;
+    }
+
+    let min_space: int = 1;
+    let left_fixed: int = 2; // " " + "/"
+    var q_avail: int = cols - right_len - left_fixed - min_space;
+    if q_avail < 0 { q_avail = 0; }
+
+    // Left: " /<query>"
+    let _ = w.push_u8(32);
+    ansi_fg_256(mut w, COLOR_ACCENT);
+    ansi_bold_on(mut w);
+    let _ = w.push_str("/");
+    ansi_intensity_normal(mut w);
+    ansi_fg_256(mut w, COLOR_STATUS_FG);
+
+    let bytes = out_query.as_bytes();
+    let q_len: int = push_tail_trunc(mut w, bytes.ptr, bytes.len, q_avail);
+
+    // Pad.
+    var used_left: int = left_fixed + q_len;
+    var spaces: int = cols - right_len - used_left;
+    if spaces < min_space { spaces = min_space; }
+    var s: int = 0;
+    while s < spaces {
+      let _ = w.push_u8(32);
+      s = s + 1;
+    }
+
+    // Right hint.
+    ansi_fg_256(mut w, COLOR_STATUS_DIM);
+    if hint_kind >= 1 {
+      if use_regex {
+        ansi_fg_256(mut w, COLOR_MODE_REGEX);
+        let _ = w.push_str("re");
+      } else {
+        ansi_fg_256(mut w, COLOR_BRAND);
+        let _ = w.push_str("str");
+      }
+      if ignore_case {
+        ansi_fg_256(mut w, COLOR_ACCENT);
+        let _ = w.push_str(" i");
+      }
+      ansi_fg_256(mut w, COLOR_STATUS_DIM);
+      let _ = w.push_str("  ");
+    }
+    if hint_kind == 2 {
+      let _ = w.push_str("Enter search  ");
+    }
+    let _ = w.push_str("ESC cancel");
+
+    ansi_clear_eol(mut w);
+    ansi_reset(mut w);
+    let _ = w.flush();
+
+    let k: Key = read_key_timeout(mut inp, -1);
+    if k.kind == KEY_EOF {
+      return false;
+    }
+    if k.kind == KEY_ESC {
+      return false;
+    }
+    if k.kind == KEY_ENTER {
+      return out_query.len > 0;
+    }
+    if k.kind == KEY_BACKSPACE {
+      let _ = out_query.pop_u8();
+      continue;
+    }
+
+    if k.kind == KEY_BYTE {
+      let b: u8 = k.byte;
+      if b >= 32 && b != 127 {
+        let _ = out_query.push_u8(b);
+      }
+    }
+  }
+  return false;
+}
+
+struct FindNextResult {
+  kind: int,
+  off: i64,
+  end: i64,
+}
+
+let FIND_FOUND: int = 0;
+let FIND_NOT_FOUND: int = 1;
+let FIND_INVALID_QUERY: int = 2;
+let FIND_REGEX_TOO_LARGE: int = 3;
+let FIND_REGEX_COMPILE_FAILED: int = 4;
+let FIND_REGEX_RUNTIME_FAILED: int = 5;
+
+struct SearchState {
+  active: bool,
+  phase: int,
+  cur: i64,
+  end: i64,
+  start_off: i64,
+}
+
+let SEARCH_PHASE_FWD: int = 0;
+let SEARCH_PHASE_WRAP: int = 1;
+
+let MAX_I32: i64 = 2147483647;
+let LIT_CHUNK_BYTES: i64 = 16777216;    // 16 MiB
+let REGEX_CHUNK_BYTES: i64 = 16777216;  // 16 MiB
+let REGEX_CHUNK_OVERLAP: i64 = 1048576; // 1 MiB
+
+fn lower_ascii (b: u8) -> u8 {
+  if b >= 65 && b <= 90 {
+    return b + 32;
+  }
+  return b;
+}
+
+fn bytes_match_nocase (hay_ptr: u64, needle_ptr: u64, needle_len: i64) -> bool {
+  if needle_ptr == 0 || needle_len <= 0 {
+    return false;
+  }
+  var i: i64 = 0;
+  while i < needle_len {
+    let a: u8 = std::runtime::mem::load_u8(hay_ptr, i);
+    let b: u8 = std::runtime::mem::load_u8(needle_ptr, i);
+    if lower_ascii(a) != lower_ascii(b) {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+fn find_next_literal (file: &MappedFile, q_ptr: u64, q_len: i64, start_off: i64) -> i64? {
+  if start_off < 0 || start_off >= file.len {
+    return None;
+  }
+
+  let p1: u64 = memmem(file.ptr + (start_off as u64), file.len - start_off, q_ptr, q_len);
+  if p1 != 0 {
+    return Some((p1 - file.ptr) as i64);
+  }
+  let p2: u64 = memmem(file.ptr, file.len, q_ptr, q_len);
+  if p2 != 0 {
+    return Some((p2 - file.ptr) as i64);
+  }
+  return None;
+}
+
+fn find_next_literal_nocase_phase (file: &MappedFile, q_ptr: u64, q_len: i64, start: i64, end: i64) -> i64? {
+  if q_len <= 0 || q_ptr == 0 {
+    return None;
+  }
+  if start < 0 || end > file.len || start >= end {
+    return None;
+  }
+  if (end - start) < q_len {
+    return None;
+  }
+
+  let q0: u8 = std::runtime::mem::load_u8(q_ptr, 0);
+  let q0_l: u8 = lower_ascii(q0);
+  var q0_u: u8 = q0_l;
+  if q0_l >= 97 && q0_l <= 122 {
+    q0_u = q0_l - 32;
+  }
+
+  var off: i64 = start;
+  let limit: i64 = end - q_len;
+  while off <= limit {
+    let tail_ptr: u64 = file.ptr + (off as u64);
+    let tail_len: i64 = (limit - off) + 1;
+    var p: u64 = memchr(tail_ptr, q0_l as int, tail_len);
+    if q0_u != q0_l {
+      let p2: u64 = memchr(tail_ptr, q0_u as int, tail_len);
+      if p == 0 {
+        p = p2;
+      } else if p2 != 0 && p2 < p {
+        p = p2;
+      }
+    }
+    if p == 0 {
+      return None;
+    }
+
+    let pos: i64 = (p - file.ptr) as i64;
+    if (pos + q_len) > end {
+      return None;
+    }
+    if bytes_match_nocase(file.ptr + (pos as u64), q_ptr, q_len) {
+      return Some(pos);
+    }
+    off = pos + 1;
+  }
+
+  return None;
+}
+
+fn find_next_literal_nocase (file: &MappedFile, q_ptr: u64, q_len: i64, start_off: i64) -> i64? {
+  if start_off < 0 || start_off >= file.len {
+    return None;
+  }
+
+  let a: i64? = find_next_literal_nocase_phase(file, q_ptr, q_len, start_off, file.len);
+  if a != None {
+    return a;
+  }
+  return find_next_literal_nocase_phase(file, q_ptr, q_len, 0, start_off);
+}
+
+fn find_next_regex_with_re (file: &MappedFile, re: &std::regex::RegExp, start_off: i64) -> FindNextResult {
+  if start_off < 0 || start_off >= file.len {
+    return FindNextResult{ kind: FIND_NOT_FOUND, off: 0, end: 0 };
+  }
+  if file.len > MAX_I32 {
+    return FindNextResult{ kind: FIND_REGEX_TOO_LARGE, off: 0, end: 0 };
+  }
+
+  let input: string = std::runtime::mem::string_from_ptr_len(file.ptr, file.len as int);
+
+  let r1: std::regex::ExecResult = std::regex::search(re.as_regexp(), input, start_off as int);
+  if r1.code == std::regex::EXEC_MATCH {
+    return FindNextResult{ kind: FIND_FOUND, off: r1.start as i64, end: r1.end as i64 };
+  }
+  if r1.code != std::regex::EXEC_NO_MATCH {
+    return FindNextResult{ kind: FIND_REGEX_RUNTIME_FAILED, off: 0, end: 0 };
+  }
+
+  let r2: std::regex::ExecResult = std::regex::search(re.as_regexp(), input, 0);
+  if r2.code == std::regex::EXEC_MATCH {
+    return FindNextResult{ kind: FIND_FOUND, off: r2.start as i64, end: r2.end as i64 };
+  }
+  if r2.code != std::regex::EXEC_NO_MATCH {
+    return FindNextResult{ kind: FIND_REGEX_RUNTIME_FAILED, off: 0, end: 0 };
+  }
+
+  return FindNextResult{ kind: FIND_NOT_FOUND, off: 0, end: 0 };
+}
+
+fn find_next_regex_range_chunked (file: &MappedFile, re: &std::regex::RegExp, start: i64, end: i64) -> FindNextResult {
+  if file.ptr == 0 || file.len <= 0 {
+    return FindNextResult{ kind: FIND_NOT_FOUND, off: 0, end: 0 };
+  }
+
+  var s: i64 = start;
+  var e: i64 = end;
+  if s < 0 { s = 0; }
+  if e > file.len { e = file.len; }
+  if s >= e {
+    return FindNextResult{ kind: FIND_NOT_FOUND, off: 0, end: 0 };
+  }
+
+  var step: i64 = REGEX_CHUNK_BYTES - REGEX_CHUNK_OVERLAP;
+  if step <= 0 {
+    step = REGEX_CHUNK_BYTES;
+  }
+
+  var base: i64 = s;
+  while base < e {
+    let rem: i64 = e - base;
+    let take0: i64 = if rem < REGEX_CHUNK_BYTES { rem } else { REGEX_CHUNK_BYTES };
+    let take: i64 = if take0 > MAX_I32 { MAX_I32 } else { take0 };
+    if take <= 0 {
+      break;
+    }
+
+    let input: string = std::runtime::mem::string_from_ptr_len(file.ptr + (base as u64), take as int);
+    let r: std::regex::ExecResult = std::regex::search(re.as_regexp(), input, 0);
+    if r.code == std::regex::EXEC_MATCH {
+      let mo: i64 = base + (r.start as i64);
+      let me: i64 = base + (r.end as i64);
+      return FindNextResult{ kind: FIND_FOUND, off: mo, end: me };
+    }
+    if r.code != std::regex::EXEC_NO_MATCH {
+      return FindNextResult{ kind: FIND_REGEX_RUNTIME_FAILED, off: 0, end: 0 };
+    }
+
+    if rem <= REGEX_CHUNK_BYTES {
+      break;
+    }
+    base = base + step;
+  }
+
+  return FindNextResult{ kind: FIND_NOT_FOUND, off: 0, end: 0 };
+}
+
+fn find_next_regex_any (file: &MappedFile, re: &std::regex::RegExp, start_off: i64) -> FindNextResult {
+  if file.ptr == 0 || file.len <= 0 {
+    return FindNextResult{ kind: FIND_NOT_FOUND, off: 0, end: 0 };
+  }
+  if start_off < 0 || start_off >= file.len {
+    return FindNextResult{ kind: FIND_NOT_FOUND, off: 0, end: 0 };
+  }
+
+  if file.len <= MAX_I32 {
+    return find_next_regex_with_re(file, re, start_off);
+  }
+
+  let r1: FindNextResult = find_next_regex_range_chunked(file, re, start_off, file.len);
+  if r1.kind != FIND_NOT_FOUND {
+    return r1;
+  }
+  return find_next_regex_range_chunked(file, re, 0, start_off);
+}
+
+fn find_next_literal_any (file: &MappedFile, query: &BufferU8, start_off: i64, ignore_case: bool) -> FindNextResult {
+  if file.ptr == 0 || file.len <= 0 {
+    return FindNextResult{ kind: FIND_NOT_FOUND, off: 0, end: 0 };
+  }
+
+  let q = query.as_bytes();
+  if q.ptr == 0 || q.len <= 0 {
+    return FindNextResult{ kind: FIND_INVALID_QUERY, off: 0, end: 0 };
+  }
+
+  var m_opt: i64? = None;
+  if ignore_case {
+    m_opt = find_next_literal_nocase(file, q.ptr, q.len, start_off);
+  } else {
+    m_opt = find_next_literal(file, q.ptr, q.len, start_off);
+  }
+
+  if m_opt != None {
+    let m: i64 = match (m_opt) { Some(v) => v, None => 0 };
+    return FindNextResult{ kind: FIND_FOUND, off: m, end: m + q.len };
+  }
+  return FindNextResult{ kind: FIND_NOT_FOUND, off: 0, end: 0 };
+}
+
+export async fn main (argc: int, argv: u64) -> int {
+  let args: Args = Args.init(argc, argv);
+  let cfg_opt: Config? = parse_cli(args);
+  if cfg_opt == None {
+    print_help();
+    return 2;
+  }
+  let cfg: Config = match (cfg_opt) { Some(v) => v, None => cfg_default() };
+
+  if cfg.help {
+    print_help();
+    return 0;
+  }
+  if cfg.version {
+    print_version();
+    return 0;
+  }
+
+  let stdout_is_tty: bool = isatty(std::runtime::posix::io::STDOUT_FD) == 1;
+
+  task {
+    if cfg.index_only {
+      let stdin_is_tty: bool = isatty(std::runtime::posix::io::STDIN_FD) == 1;
+      let path: string = match (cfg.path) { Some(v) => v, None => "-" };
+      if path == "-" && stdin_is_tty {
+        print_help();
+        return 0;
+      }
+
+      // Map file contents.
+      var m_opt: MappedFile? = None;
+      if path == "-" {
+        m_opt = map_stdin_spool(cfg.allow_binary);
+      } else {
+        m_opt = map_path(path, cfg.allow_binary);
+      }
+      if m_opt == None {
+        let _ = write_str(std::runtime::posix::io::STDERR_FD, "sage: failed to open input\n");
+        return 2;
+      }
+      let mut file: MappedFile = match (m_opt) { Some(v) => v, None => MappedFile{ ptr: 0, len: 0 } };
+
+      let start_ns_opt: i64? = std::runtime::posix::time::monotonic_now_ns();
+      let start_ns: i64 = match (start_ns_opt) { Some(v) => v, None => 0 };
+
+      let ch_r = ChanU64.init(256);
+      if ch_r.is_err() {
+        return 2;
+      }
+      let mut ch: ChanU64 = match (ch_r) { Ok(v) => v, Err(_) => ChanU64.invalid() };
+
+      let tok_r = std::sync::CancellationToken.init();
+      let check_cancel: bool = !tok_r.is_err();
+      let mut tok: std::sync::CancellationToken = match (tok_r) {
+        Ok(v) => v,
+        Err(_) => std::sync::CancellationToken.invalid(),
+      };
+
+      let idx_task = build_line_index(file.ptr, file.len, ch.borrow(), tok.borrow(), check_cancel);
+
+      let off_opt: VecU64? = VecU64.init(4096);
+      if off_opt == None {
+        tok.cancel();
+        ch.close();
+        let _ = yield idx_task;
+        return 2;
+      }
+      let mut offsets: VecU64 = match (off_opt) { Some(v) => v, None => VecU64.empty() };
+      let _ = offsets.push(0);
+
+      let mut idx: IndexState = IndexState{ done: false, scan_off: 0, lines: if file.len > 0 { 1 } else { 0 } };
+      while !idx.done {
+        let m_opt2: u64? = ch.recv();
+        if m_opt2 == None {
+          idx.done = true;
+          break;
+        }
+        let m: u64 = match (m_opt2) { Some(v) => v, None => 0 };
+        let out: ConsumeOutcome = consume_msg(m, mut offsets);
+        if out.kind == CONSUME_DONE {
+          idx.done = true;
+          break;
+        }
+        if out.kind == CONSUME_OK {
+          idx.scan_off = out.scan_off;
+          idx.lines = out.lines;
+          continue;
+        }
+        idx.done = true;
+        ch.close();
+        break;
+      }
+
+      tok.cancel();
+      ch.close();
+      let _ = yield idx_task;
+
+      let end_ns_opt: i64? = std::runtime::posix::time::monotonic_now_ns();
+      let end_ns: i64 = match (end_ns_opt) { Some(v) => v, None => start_ns };
+      let elapsed_ns: i64 = end_ns - start_ns;
+      let ms: i64 = if elapsed_ns >= 0 { elapsed_ns / 1000000 } else { -1 };
+
+      let w_opt: Writer? = Writer.stdout(false, 8192);
+      if w_opt != None {
+        let mut w: Writer = match (w_opt) { Some(v) => v, None => Writer{ fd: -1, color: false, buf: BufferU8.empty() } };
+        let _ = w.push_str("sage index: lines=");
+        let _ = w.push_i64(idx.lines);
+        let _ = w.push_str(" bytes=");
+        let _ = w.push_i64(file.len);
+        let _ = w.push_str(" time_ms=");
+        let _ = w.push_i64(ms);
+        let _ = w.push_u8(10);
+        let _ = w.flush();
+      }
+
+      return 0;
+    }
+
+    // If stdout isn't a TTY, behave like a pass-through filter.
+    if !stdout_is_tty {
+      let p: string = match (cfg.path) { Some(v) => v, None => "-" };
+      if p == "-" {
+        return stream_stdin_to_stdout();
+      }
+      return stream_path_to_stdout(p);
+    }
+
+    // Determine input source.
+    let stdin_is_tty: bool = isatty(std::runtime::posix::io::STDIN_FD) == 1;
+    let path: string = match (cfg.path) { Some(v) => v, None => "-" };
+    if path == "-" && stdin_is_tty {
+      print_help();
+      return 0;
+    }
+
+    // Map file contents.
+    var m_opt: MappedFile? = None;
+    if path == "-" {
+      m_opt = map_stdin_spool(cfg.allow_binary);
+    } else {
+      m_opt = map_path(path, cfg.allow_binary);
+    }
+    if m_opt == None {
+      let _ = write_str(std::runtime::posix::io::STDERR_FD, "sage: failed to open input\n");
+      return 2;
+    }
+    let mut file: MappedFile = match (m_opt) { Some(v) => v, None => MappedFile{ ptr: 0, len: 0 } };
+
+    // Keyboard input fd: stdin if TTY, otherwise /dev/tty.
+    var in_fd: int = std::runtime::posix::io::STDIN_FD;
+    if !stdin_is_tty {
+      let fd2: int = std::runtime::posix::fs::open("/dev/tty", std::runtime::posix::fs::O_RDONLY, 0) as int;
+      if fd2 >= 0 {
+        in_fd = fd2;
+      }
+    }
+
+    let raw_opt: RawMode? = raw_mode_enable(in_fd);
+    if raw_opt == None {
+      let _ = write_str(std::runtime::posix::io::STDERR_FD, "sage: failed to enable raw mode\n");
+      if in_fd != std::runtime::posix::io::STDIN_FD { let _ = std::runtime::posix::fs::close(in_fd); }
+      return 2;
+    }
+    let mut raw_mode: RawMode = match (raw_opt) { Some(v) => v, None => RawMode{ fd: -1, orig: 0, raw_ptr: 0, enabled: false } };
+
+    // Color mode (default: auto; respects NO_COLOR).
+    var use_color: bool = true;
+    if cfg.color == COLOR_NEVER {
+      use_color = false;
+    } else if cfg.color == COLOR_AUTO {
+      if std::runtime::env::getenv("NO_COLOR") != 0 {
+        use_color = false;
+      }
+    }
+
+    // Pass through ANSI SGR sequences from content (for `man`, `git diff`, etc).
+    // This is separate from UI coloring so `NO_COLOR` can disable the chrome
+    // while still allowing formatted content.
+    let allow_ansi: bool = cfg.ansi;
+
+    let w_opt: Writer? = Writer.stdout(use_color, 65536);
+    if w_opt == None {
+      raw_mode.restore();
+      if in_fd != std::runtime::posix::io::STDIN_FD { let _ = std::runtime::posix::fs::close(in_fd); }
+      return 2;
+    }
+    let mut w: Writer = match (w_opt) { Some(v) => v, None => Writer{ fd: -1, color: use_color, buf: BufferU8.empty() } };
+
+    // Enter alternate screen + hide cursor.
+    w.clear();
+    let use_alt: bool = !cfg.no_alt_screen;
+    if use_alt { ansi_alt_on(mut w); }
+    ansi_hide_cursor(mut w);
+    ansi_home(mut w);
+    ansi_csi(mut w);
+    let _ = w.push_u8(50); // '2'
+    let _ = w.push_u8(74); // 'J'
+    let _ = w.flush();
+
+    let inp_opt: Input? = input_init(in_fd);
+    if inp_opt == None {
+      ansi_show_cursor(mut w);
+      if use_alt { ansi_alt_off(mut w); }
+      let _ = w.flush();
+      raw_mode.restore();
+      if in_fd != std::runtime::posix::io::STDIN_FD { let _ = std::runtime::posix::fs::close(in_fd); }
+      return 2;
+    }
+    let mut inp: Input = match (inp_opt) { Some(v) => v, None => Input{ fd: -1, buf_ptr: 0, buf_len: 0, buf_off: 0, pollfd_ptr: 0 } };
+
+    // Index channel + cancellation token.
+    let ch_r = ChanU64.init(256);
+    if ch_r.is_err() {
+      ansi_show_cursor(mut w);
+      if use_alt { ansi_alt_off(mut w); }
+      let _ = w.flush();
+      raw_mode.restore();
+      if in_fd != std::runtime::posix::io::STDIN_FD { let _ = std::runtime::posix::fs::close(in_fd); }
+      return 2;
+    }
+    let mut ch: ChanU64 = match (ch_r) { Ok(v) => v, Err(_) => ChanU64.invalid() };
+
+    let tok_r = std::sync::CancellationToken.init();
+    let check_cancel: bool = !tok_r.is_err();
+    let mut tok: std::sync::CancellationToken = match (tok_r) {
+      Ok(v) => v,
+      Err(_) => std::sync::CancellationToken.invalid(),
+    };
+
+    // Spawn background indexer (line checkpoints + progress).
+    let idx_task = build_line_index(file.ptr, file.len, ch.borrow(), tok.borrow(), check_cancel);
+
+    // Local checkpoint table; always contains line 0 start.
+    let off_opt: VecU64? = VecU64.init(4096);
+    if off_opt == None {
+      tok.cancel();
+      ch.close();
+      let _ = yield idx_task;
+      ansi_show_cursor(mut w);
+      if use_alt { ansi_alt_off(mut w); }
+      let _ = w.flush();
+      raw_mode.restore();
+      if in_fd != std::runtime::posix::io::STDIN_FD { let _ = std::runtime::posix::fs::close(in_fd); }
+      return 2;
+    }
+    let mut offsets: VecU64 = match (off_opt) { Some(v) => v, None => VecU64.empty() };
+    let _ = offsets.push(0);
+
+    let mut idx: IndexState = IndexState{ done: false, scan_off: 0, lines: if file.len > 0 { 1 } else { 0 } };
+
+    let q_opt: BufferU8? = BufferU8.init(256);
+    let mut last_query: BufferU8 = match (q_opt) { Some(v) => v, None => BufferU8.empty() };
+    let tmp_opt: BufferU8? = BufferU8.init(256);
+    let mut tmp_query: BufferU8 = match (tmp_opt) { Some(v) => v, None => BufferU8.empty() };
+    var last_match_off: i64 = -1;
+    var last_match_end: i64 = -1;
+
+    // Cached compiled regex for repeated `n` searches (avoids recompile work).
+    var regex_ready: bool = false;
+    let mut regex_re: std::regex::RegExp = std::regex::RegExp.empty();
+
+    // Incremental search state (keeps UI responsive on huge inputs).
+    var search: SearchState = SearchState{ active: false, phase: SEARCH_PHASE_FWD, cur: 0, end: 0, start_off: 0 };
+
+    var top_off: i64 = 0;
+    var alert: int = 0;
+    var show_help: bool = false;
+    var need_redraw: bool = true;
+    var last_rows: int = 0;
+    var last_cols: int = 0;
+    var last_status_scan_off: i64 = -1;
+    var last_status_lines: i64 = -1;
+    var last_status_alert: int = -1;
+
+    // Main UI loop.
+    while true {
+      // Drain any pending index chunks without blocking.
+      let _ = index_pump_try(mut ch, mut offsets, mut idx);
+
+      // Incremental search step (keeps UI responsive on huge inputs).
+      if search.active {
+        let qb = last_query.as_bytes();
+        if qb.ptr == 0 || qb.len <= 0 || file.len <= 0 {
+          search.active = false;
+          if alert == 4 { alert = 0; }
+        } else if cfg.regex {
+          // Ensure regex is compiled.
+          if !regex_ready {
+            let pat: string = std::runtime::mem::string_from_ptr_len(qb.ptr, qb.len as int);
+            var flags: string = "";
+            if cfg.ignore_case { flags = "i"; }
+
+            let cr: ReCompileResult = std::regex::RegExp.compile(pat, flags);
+            if cr.is_err() {
+              alert = 2;
+              search.active = false;
+              regex_ready = false;
+              regex_re = std::regex::RegExp.empty();
+            } else {
+              let re2: std::regex::RegExp = ReCompileResult.unwrap_or(cr, std::regex::RegExp.empty());
+              regex_re = move re2;
+              regex_ready = true;
+            }
+          }
+
+          if search.active && regex_ready {
+            let rem: i64 = search.end - search.cur;
+            if rem <= 0 {
+              // End of this phase.
+              if search.phase == SEARCH_PHASE_FWD && search.start_off > 0 {
+                search.phase = SEARCH_PHASE_WRAP;
+                search.cur = 0;
+                search.end = search.start_off;
+              } else {
+                search.active = false;
+                alert = 5;
+              }
+            } else {
+              let take0: i64 = if rem < REGEX_CHUNK_BYTES { rem } else { REGEX_CHUNK_BYTES };
+              let take: i64 = if take0 > MAX_I32 { MAX_I32 } else { take0 };
+
+              if take <= 0 {
+                // End of this phase.
+                if search.phase == SEARCH_PHASE_FWD && search.start_off > 0 {
+                  search.phase = SEARCH_PHASE_WRAP;
+                  search.cur = 0;
+                  search.end = search.start_off;
+                } else {
+                  search.active = false;
+                  alert = 5;
+                }
+              } else {
+                let input: string = std::runtime::mem::string_from_ptr_len(file.ptr + (search.cur as u64), take as int);
+                let r: std::regex::ExecResult = std::regex::search(regex_re.as_regexp(), input, 0);
+                if r.code == std::regex::EXEC_MATCH {
+                  let m_off: i64 = search.cur + (r.start as i64);
+                  let m_end: i64 = search.cur + (r.end as i64);
+                  let view_cols: int = if last_cols > 0 { last_cols } else { 80 };
+                  top_off = visual_start_for_offset(file.ptr, file.len, m_off, view_cols, cfg.unsafe_raw, allow_ansi);
+                  last_match_off = m_off;
+                  last_match_end = m_end;
+                  search.active = false;
+                  alert = 0;
+                  need_redraw = true;
+                } else if r.code != std::regex::EXEC_NO_MATCH {
+                  // Runtime failure (timeout, invalid input, etc).
+                  search.active = false;
+                  alert = 3;
+                } else {
+                  // No match: advance to next chunk.
+                  var step: i64 = REGEX_CHUNK_BYTES - REGEX_CHUNK_OVERLAP;
+                  if step <= 0 { step = REGEX_CHUNK_BYTES; }
+                  var next_cur: i64 = search.cur + step;
+                  if next_cur <= search.cur { next_cur = search.cur + 1; }
+                  search.cur = next_cur;
+                  if search.cur >= search.end {
+                    if search.phase == SEARCH_PHASE_FWD && search.start_off > 0 {
+                      search.phase = SEARCH_PHASE_WRAP;
+                      search.cur = 0;
+                      search.end = search.start_off;
+                    } else {
+                      search.active = false;
+                      alert = 5;
+                    }
+                  }
+                }
+              }
+            }
+          }
+        } else {
+          // Literal substring search (chunked so it doesn't block the UI).
+          let q_len: i64 = qb.len;
+          let rem: i64 = search.end - search.cur;
+          if q_len <= 0 || rem <= 0 {
+            if search.phase == SEARCH_PHASE_FWD && search.start_off > 0 {
+              search.phase = SEARCH_PHASE_WRAP;
+              search.cur = 0;
+              search.end = search.start_off;
+            } else {
+              search.active = false;
+              alert = 5;
+            }
+          } else {
+            let take: i64 = if rem < LIT_CHUNK_BYTES { rem } else { LIT_CHUNK_BYTES };
+            let chunk_end: i64 = search.cur + take;
+
+            var found_off: i64? = None;
+            if cfg.ignore_case {
+              found_off = find_next_literal_nocase_phase(&file, qb.ptr, q_len, search.cur, chunk_end);
+            } else {
+              let p: u64 = memmem(file.ptr + (search.cur as u64), chunk_end - search.cur, qb.ptr, q_len);
+              if p != 0 {
+                found_off = Some((p - file.ptr) as i64);
+              }
+            }
+
+              if found_off != None {
+                let m_off: i64 = match (found_off) { Some(v) => v, None => 0 };
+                let view_cols2: int = if last_cols > 0 { last_cols } else { 80 };
+                top_off = visual_start_for_offset(file.ptr, file.len, m_off, view_cols2, cfg.unsafe_raw, allow_ansi);
+                last_match_off = m_off;
+                last_match_end = m_off + q_len;
+                search.active = false;
+                alert = 0;
+              need_redraw = true;
+            } else {
+              // Advance with overlap so matches spanning chunk boundaries aren't missed.
+              var next_cur: i64 = chunk_end;
+              if q_len > 1 {
+                next_cur = chunk_end - (q_len - 1);
+              }
+              if next_cur <= search.cur { next_cur = search.cur + 1; }
+              search.cur = next_cur;
+
+              if chunk_end >= search.end || search.cur >= search.end {
+                if search.phase == SEARCH_PHASE_FWD && search.start_off > 0 {
+                  search.phase = SEARCH_PHASE_WRAP;
+                  search.cur = 0;
+                  search.end = search.start_off;
+                } else {
+                  search.active = false;
+                  alert = 5;
+                }
+              }
+            }
+          }
+        }
+      }
+
+      let sz: Size = get_size(in_fd);
+      let rows: int = if sz.rows >= 2 { sz.rows } else { 2 };
+      let cols: int = if sz.cols >= 10 { sz.cols } else { 10 };
+      let content_rows: int = rows - 1;
+
+      top_off = clamp_i64(top_off, 0, file.len);
+
+      var top_line: i64 = -1;
+      if file.len > 0 && (idx.done || idx.scan_off >= top_off) {
+        top_line = line_number_for_offset(file.ptr, &offsets, top_off);
+      }
+      var name: string = path;
+      if path == "-" {
+        name = "(stdin)";
+      }
+
+      if rows != last_rows || cols != last_cols {
+        need_redraw = true;
+        last_rows = rows;
+        last_cols = cols;
+      }
+
+      if need_redraw {
+        // Full redraw (content + status).
+        w.clear();
+        ansi_home(mut w);
+
+        if show_help {
+          draw_help(mut w, content_rows, cols, cfg.regex, cfg.ignore_case, cfg.unsafe_raw);
+        } else {
+          var cur: i64 = top_off;
+          var r: int = 0;
+          while r < content_rows {
+            ansi_move(mut w, r + 1, 1);
+            if cur >= file.len {
+              ansi_fg_256(mut w, COLOR_STATUS_DIM);
+              ansi_dim_on(mut w);
+              let _ = w.push_str("~");
+              ansi_reset(mut w);
+              ansi_clear_eol(mut w);
+              r = r + 1;
+              continue;
+            }
+
+            // Render in "visual lines": wrap at the viewport width to stay fast
+            // even on huge single-line inputs (minified JSON, etc).
+            let tail_len: i64 = file.len - cur;
+            let mult: i64 = if allow_ansi && !cfg.unsafe_raw { ANSI_BYTES_PER_COL } else { 1 };
+            let scan_len: i64 = min_i64(tail_len, ((cols as i64) * mult) + 1);
+            let nl_ptr: u64 = if scan_len > 0 { memchr(file.ptr + (cur as u64), 10, scan_len) } else { 0 };
+
+            var has_nl: bool = false;
+            var nl_next: i64 = file.len;
+            var seg_len: i64 = 0;
+            if nl_ptr != 0 {
+              has_nl = true;
+              let nl_pos: i64 = (nl_ptr - file.ptr) as i64;
+              nl_next = nl_pos + 1;
+              seg_len = nl_pos - cur;
+
+              // Trim a CR in CRLF line endings so `--raw` doesn't erase lines.
+              if seg_len > 0 {
+                let last_b2: u8 = std::runtime::mem::load_u8(file.ptr, (cur + seg_len) - 1);
+                if last_b2 == 13 {
+                  seg_len = seg_len - 1;
+                }
+              }
+            } else {
+              seg_len = min_i64(tail_len, (cols as i64) * mult);
+            }
+
+            let line_ptr: u64 = file.ptr + (cur as u64);
+            let line_len: i64 = if seg_len > 0 { seg_len } else { 0 };
+            var hl_s: i64 = -1;
+            var hl_e: i64 = -1;
+            if !cfg.unsafe_raw && last_match_off >= 0 && last_match_end > last_match_off {
+              let seg_start: i64 = cur;
+              let seg_end: i64 = cur + line_len;
+              if last_match_end > seg_start && last_match_off < seg_end {
+                let a: i64 = max_i64(last_match_off, seg_start);
+                let b: i64 = min_i64(last_match_end, seg_end);
+                hl_s = a - seg_start;
+                hl_e = b - seg_start;
+              }
+            }
+            if hl_s < 0 || hl_s >= line_len {
+              hl_s = -1;
+              hl_e = -1;
+            } else {
+              if hl_e < hl_s { hl_e = hl_s; }
+              if hl_e > line_len { hl_e = line_len; }
+            }
+
+            let consumed: i64 = render_line(mut w, line_ptr, line_len, cols, cfg.unsafe_raw, allow_ansi, hl_s, hl_e);
+            ansi_clear_eol(mut w);
+
+            var next: i64 = cur;
+            if has_nl && consumed == line_len {
+              next = nl_next;
+            } else if consumed > 0 {
+              next = cur + consumed;
+            } else {
+              let n3: i64 = cur + 1;
+              next = if n3 <= file.len { n3 } else { file.len };
+            }
+
+            cur = next;
+            r = r + 1;
+          }
+        }
+
+        var st_line: i64 = top_line;
+        var st_off: i64 = top_off;
+        if show_help {
+          st_line = -1;
+          st_off = 0;
+        }
+        status_line(mut w, name, st_line, st_off, file.len, rows, cols, idx.done, idx.scan_off, idx.lines, alert, cfg.regex, cfg.ignore_case);
+        let _ = w.flush();
+        need_redraw = false;
+        last_status_scan_off = idx.scan_off;
+        last_status_lines = idx.lines;
+        last_status_alert = alert;
+      } else if idx.scan_off != last_status_scan_off || idx.lines != last_status_lines || alert != last_status_alert {
+        // Status-only update (keeps background indexing from feeling "stuck").
+        w.clear();
+        var st_line: i64 = top_line;
+        var st_off: i64 = top_off;
+        if show_help {
+          st_line = -1;
+          st_off = 0;
+        }
+        status_line(mut w, name, st_line, st_off, file.len, rows, cols, idx.done, idx.scan_off, idx.lines, alert, cfg.regex, cfg.ignore_case);
+        let _ = w.flush();
+        last_status_scan_off = idx.scan_off;
+        last_status_lines = idx.lines;
+        last_status_alert = alert;
+      }
+
+      // Read one key (while allowing background indexing + resize detection).
+      let timeout_ms: int = if search.active { 25 } else { if idx.done { 250 } else { 50 } };
+      let k: Key = read_key_timeout(mut inp, timeout_ms);
+      if k.kind == KEY_NONE {
+        continue;
+      }
+      if k.kind == KEY_EOF {
+        break;
+      }
+
+      // Clear transient alerts on user input (except "searching", which is live state).
+      if alert != 0 && alert != 4 {
+        alert = 0;
+      }
+
+      let is_byte: bool = k.kind == KEY_BYTE;
+      let b: u8 = k.byte;
+
+      // Help overlay (presentation + quick reference).
+      if show_help {
+        if is_byte && (b == 113 || b == 3) { // 'q' or Ctrl-C
+          break;
+        }
+        if k.kind == KEY_ESC || (is_byte && (b == 63 || b == 104)) { // Esc / '?' / 'h'
+          show_help = false;
+          need_redraw = true;
+        }
+        continue;
+      }
+      if is_byte && (b == 63 || b == 104) { // '?' or 'h'
+        show_help = true;
+        need_redraw = true;
+        continue;
+      }
+
+      // Cancel an in-flight incremental search.
+      if k.kind == KEY_ESC {
+        if search.active {
+          search.active = false;
+          alert = 0;
+          need_redraw = true;
+        }
+        continue;
+      }
+
+      if k.kind == KEY_DOWN || (is_byte && b == 106) { // 'j'
+        top_off = visual_next_off(file.ptr, file.len, top_off, cols, cfg.unsafe_raw, allow_ansi);
+        need_redraw = true;
+        continue;
+      }
+      if k.kind == KEY_UP || (is_byte && b == 107) { // 'k'
+        top_off = visual_prev_off(file.ptr, file.len, top_off, cols, cfg.unsafe_raw, allow_ansi);
+        need_redraw = true;
+        continue;
+      }
+      if k.kind == KEY_PAGE_DOWN || (is_byte && b == 32) { // Space
+        var cur2: i64 = top_off;
+        var i2: int = 0;
+        while i2 < content_rows {
+          let n2: i64 = visual_next_off(file.ptr, file.len, cur2, cols, cfg.unsafe_raw, allow_ansi);
+          if n2 == cur2 {
+            break;
+          }
+          cur2 = n2;
+          i2 = i2 + 1;
+        }
+        top_off = cur2;
+        need_redraw = true;
+        continue;
+      }
+      if k.kind == KEY_PAGE_UP || (is_byte && b == 98) { // 'b'
+        var cur3: i64 = top_off;
+        var i3: int = 0;
+        while i3 < content_rows {
+          let p3: i64 = visual_prev_off(file.ptr, file.len, cur3, cols, cfg.unsafe_raw, allow_ansi);
+          if p3 == cur3 {
+            break;
+          }
+          cur3 = p3;
+          i3 = i3 + 1;
+        }
+        top_off = cur3;
+        need_redraw = true;
+        continue;
+      }
+      if k.kind == KEY_RIGHT {
+        // Right arrow: forward one page (most-like).
+        var cur5: i64 = top_off;
+        var i5: int = 0;
+        while i5 < content_rows {
+          let n5: i64 = visual_next_off(file.ptr, file.len, cur5, cols, cfg.unsafe_raw, allow_ansi);
+          if n5 == cur5 {
+            break;
+          }
+          cur5 = n5;
+          i5 = i5 + 1;
+        }
+        top_off = cur5;
+        need_redraw = true;
+        continue;
+      }
+      if k.kind == KEY_LEFT {
+        // Left arrow: back one page.
+        var cur6: i64 = top_off;
+        var i6: int = 0;
+        while i6 < content_rows {
+          let p6: i64 = visual_prev_off(file.ptr, file.len, cur6, cols, cfg.unsafe_raw, allow_ansi);
+          if p6 == cur6 {
+            break;
+          }
+          cur6 = p6;
+          i6 = i6 + 1;
+        }
+        top_off = cur6;
+        need_redraw = true;
+        continue;
+      }
+      if k.kind == KEY_HOME || (is_byte && b == 103) { // 'g'
+        top_off = 0;
+        need_redraw = true;
+        continue;
+      }
+      if k.kind == KEY_END || (is_byte && b == 71) { // 'G'
+        var cur4: i64 = file.len;
+        if cur4 > 0 {
+          cur4 = visual_prev_off(file.ptr, file.len, cur4, cols, cfg.unsafe_raw, allow_ansi);
+        }
+        let steps: int = if content_rows > 1 { content_rows - 1 } else { 0 };
+        var i4: int = 0;
+        while i4 < steps {
+          let p4: i64 = visual_prev_off(file.ptr, file.len, cur4, cols, cfg.unsafe_raw, allow_ansi);
+          if p4 == cur4 {
+            break;
+          }
+          cur4 = p4;
+          i4 = i4 + 1;
+        }
+        top_off = cur4;
+        need_redraw = true;
+        continue;
+      }
+
+      // Quit.
+      if is_byte && (b == 113 || b == 3) { // 'q' or Ctrl-C
+        break;
+      }
+
+      // Search.
+      if is_byte && b == 47 { // '/'
+        if search.active {
+          search.active = false;
+        }
+
+        let ok: bool = prompt_search(mut w, mut inp, rows, cols, mut tmp_query, cfg.regex, cfg.ignore_case);
+        if ok {
+          alert = 0;
+          last_query.clear();
+          let bytes = tmp_query.as_bytes();
+          let _ = last_query.push_ptr_len(bytes.ptr, bytes.len);
+          last_match_off = -1;
+          last_match_end = -1;
+          regex_ready = false;
+          regex_re = std::regex::RegExp.empty();
+
+          // Compile regex once per query so incremental search doesn't recompile.
+          if cfg.regex && last_query.len > 0 {
+            let qb = last_query.as_bytes();
+            let pat: string = std::runtime::mem::string_from_ptr_len(qb.ptr, qb.len as int);
+            var flags: string = "";
+            if cfg.ignore_case { flags = "i"; }
+
+            let cr: ReCompileResult = std::regex::RegExp.compile(pat, flags);
+            if cr.is_err() {
+              alert = 2;
+              regex_ready = false;
+              regex_re = std::regex::RegExp.empty();
+            } else {
+              let re2: std::regex::RegExp = ReCompileResult.unwrap_or(cr, std::regex::RegExp.empty());
+              regex_re = move re2;
+              regex_ready = true;
+            }
+          }
+
+          if alert == 0 && last_query.len > 0 && file.len > 0 {
+            var start_off: i64 = top_off + 1;
+            if start_off < 0 { start_off = 0; }
+            if start_off >= file.len { start_off = 0; }
+
+            search.active = true;
+            search.phase = SEARCH_PHASE_FWD;
+            search.cur = start_off;
+            search.end = file.len;
+            search.start_off = start_off;
+            alert = 4;
+          }
+        }
+        need_redraw = true;
+        continue;
+      }
+
+      if is_byte && b == 110 { // 'n'
+        if search.active {
+          continue;
+        }
+        if last_query.len <= 0 || file.len <= 0 {
+          continue;
+        }
+
+        // Compile regex (if needed).
+        if cfg.regex && !regex_ready {
+          let qb = last_query.as_bytes();
+          if qb.ptr == 0 || qb.len <= 0 {
+            continue;
+          }
+          let pat: string = std::runtime::mem::string_from_ptr_len(qb.ptr, qb.len as int);
+          var flags: string = "";
+          if cfg.ignore_case { flags = "i"; }
+
+          let cr: ReCompileResult = std::regex::RegExp.compile(pat, flags);
+          if cr.is_err() {
+            alert = 2;
+            regex_ready = false;
+            regex_re = std::regex::RegExp.empty();
+            continue;
+          }
+          let re2: std::regex::RegExp = ReCompileResult.unwrap_or(cr, std::regex::RegExp.empty());
+          regex_re = move re2;
+          regex_ready = true;
+        }
+
+        var start_off: i64 = top_off + 1;
+        if last_match_off >= 0 {
+          if last_match_end > last_match_off {
+            start_off = last_match_end;
+          } else {
+            start_off = last_match_off + 1;
+          }
+        }
+        if start_off < 0 { start_off = 0; }
+        if start_off >= file.len { start_off = 0; }
+
+        search.active = true;
+        search.phase = SEARCH_PHASE_FWD;
+        search.cur = start_off;
+        search.end = file.len;
+        search.start_off = start_off;
+        alert = 4;
+        continue;
+      }
+
+      continue;
+    }
+
+    // Exit UI: cancel indexer, restore terminal, clean up.
+    tok.cancel();
+    ch.close();
+    let _ = index_pump_try(mut ch, mut offsets, mut idx);
+    let _ = yield idx_task;
+
+    // Leave alternate screen + show cursor.
+    w.clear();
+    ansi_show_cursor(mut w);
+    if use_alt { ansi_alt_off(mut w); }
+    let _ = w.flush();
+
+    raw_mode.restore();
+    if in_fd != std::runtime::posix::io::STDIN_FD { let _ = std::runtime::posix::fs::close(in_fd); }
+    return 0;
+  }
+}
