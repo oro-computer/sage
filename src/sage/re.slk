@@ -1,0 +1,131 @@
+module sage::re;
+
+import std::interfaces;
+import std::result;
+import std::runtime::mem;
+
+// ABI-safe wrappers around the bundled runtime regex helpers (`libsilk_rt`).
+//
+// The current native backend subset does not support extern calls that return
+// aggregate structs by value. The runtime regex surface returns 24-byte structs,
+// so we call it using an explicit sret (out-pointer) signature and decode the
+// results manually.
+
+export const EXEC_MATCH: int = 1;
+export const EXEC_NO_MATCH: int = 0;
+export const EXEC_ERR_MEMORY: int = -1;
+export const EXEC_ERR_TIMEOUT: int = -2;
+export const EXEC_ERR_INVALID_INPUT: int = -3;
+
+export let RT_EXEC_OUT_BYTES: i64 = 24;
+export let RT_COMPILE_OUT_BYTES: i64 = 24;
+
+export struct ExecResult {
+  // Use `sage::re::EXEC_*` constants.
+  code: int,
+  start: int,
+  end: int,
+}
+
+export error CompileFailed {
+  code: int,
+}
+
+type RegExpCompileResult = std::result::Result(RegExp, CompileFailed);
+
+export struct RegExp {
+  // Owned compiled bytecode (same layout as `SilkString`).
+  ptr: u64,
+  len: i64,
+}
+
+// sret variants of the runtime exports (see comment at top).
+ext silk_rt_regexp_exec = fn (u64, u64, i64, u64, i64) -> void;
+ext silk_rt_regexp_compile = fn (u64, u64, i64, u64, i64) -> void;
+ext silk_rt_regexp_free = fn (u64, i64) -> void;
+
+fn load_i64 (ptr: u64, off: i64) -> i64 {
+  return (std::runtime::mem::load_u64(ptr, off) as i64);
+}
+
+fn decode_exec (out_ptr: u64) -> ExecResult {
+  let code: i64 = load_i64(out_ptr, 0);
+  let start: i64 = load_i64(out_ptr, 8);
+  let end: i64 = load_i64(out_ptr, 16);
+  return ExecResult{
+    code: code as int,
+    start: start as int,
+    end: end as int,
+  };
+}
+
+impl RegExp {
+  public fn empty () -> RegExp {
+    return RegExp{ ptr: 0, len: 0 };
+  }
+
+  public fn compile (pattern: string, flags: string) -> RegExpCompileResult {
+    let out_ptr: u64 = std::runtime::mem::alloc(RT_COMPILE_OUT_BYTES);
+    if out_ptr == 0 {
+      return RegExpCompileResult.err(CompileFailed{ code: 4 }); // runtime: OOM
+    }
+
+    let pattern_ptr: u64 = std::runtime::mem::string_ptr(pattern);
+    let pattern_len: i64 = std::runtime::mem::string_len(pattern);
+    let flags_ptr: u64 = std::runtime::mem::string_ptr(flags);
+    let flags_len: i64 = std::runtime::mem::string_len(flags);
+
+    silk_rt_regexp_compile(out_ptr, pattern_ptr, pattern_len, flags_ptr, flags_len);
+
+    let code: i64 = load_i64(out_ptr, 0);
+    let re_ptr: u64 = std::runtime::mem::load_u64(out_ptr, 8);
+    let re_len: i64 = load_i64(out_ptr, 16);
+    std::runtime::mem::free(out_ptr);
+
+    if code != 0 {
+      return RegExpCompileResult.err(CompileFailed{ code: code as int });
+    }
+    return RegExpCompileResult.ok(RegExp{ ptr: re_ptr, len: re_len });
+  }
+}
+
+impl RegExp as std::interfaces::Drop {
+  public fn drop (mut self: &RegExp) -> void {
+    if self.ptr != 0 {
+      silk_rt_regexp_free(self.ptr, self.len);
+    }
+    self.ptr = 0;
+    self.len = 0;
+  }
+}
+
+export fn exec_scratch (re: &RegExp, input_ptr: u64, input_len: i64, out_ptr: u64) -> ExecResult {
+  if out_ptr == 0 {
+    return ExecResult{ code: EXEC_ERR_MEMORY, start: 0, end: 0 };
+  }
+  silk_rt_regexp_exec(out_ptr, re.ptr, re.len, input_ptr, input_len);
+  return decode_exec(out_ptr);
+}
+
+export fn search_scratch (re: &RegExp, input_ptr: u64, input_len: i64, start: int, out_ptr: u64) -> ExecResult {
+  if input_ptr == 0 || input_len < 0 {
+    return ExecResult{ code: EXEC_ERR_INVALID_INPUT, start: 0, end: 0 };
+  }
+  let start_i64: i64 = start as i64;
+  if start_i64 < 0 || start_i64 > input_len {
+    return ExecResult{ code: EXEC_ERR_INVALID_INPUT, start: 0, end: 0 };
+  }
+
+  let tail_ptr: u64 = input_ptr + (start_i64 as u64);
+  let tail_len: i64 = input_len - start_i64;
+  let r: ExecResult = exec_scratch(re, tail_ptr, tail_len, out_ptr);
+  if r.code != EXEC_MATCH {
+    return r;
+  }
+  return ExecResult{
+    code: EXEC_MATCH,
+    start: r.start + start,
+    end: r.end + start,
+  };
+}
+

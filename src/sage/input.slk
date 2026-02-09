@@ -7,6 +7,10 @@ import std::runtime::posix::io;
 // Poll bits.
 let POLLIN: int = 1;
 
+// After reading an `ESC` byte, wait briefly for the rest of a CSI/SS3 sequence.
+// Too small and arrow keys can get misread as a bare `Esc` on loaded/remote TTYs.
+let ESC_SEQ_TIMEOUT_MS: int = 25;
+
 // `struct pollfd` layout (linux/glibc baseline).
 let POLLFD_BYTES: i64 = 8;
 let OFF_POLLFD_FD: i64 = 0;
@@ -64,10 +68,17 @@ export let KEY_BACKSPACE: int = 10;
 export let KEY_ESC: int = 11;
 export let KEY_EOF: int = 12;
 export let KEY_NONE: int = 13;
+export let KEY_MOUSE_WHEEL_UP: int = 14;
+export let KEY_MOUSE_WHEEL_DOWN: int = 15;
+export let KEY_SHIFT_TAB: int = 16;
+export let KEY_MOUSE: int = 17;
 
 export struct Key {
   kind: int,
   byte: u8,
+  x: int,
+  y: int,
+  aux: int,
 }
 
 export struct Input {
@@ -123,78 +134,200 @@ fn maybe_next_byte_after_esc (mut inp: &Input, timeout_ms: int) -> u8? {
 export fn read_key (mut inp: &Input) -> Key {
   let b0_opt: u8? = take_next_byte(mut inp);
   if b0_opt == None {
-    return Key{ kind: KEY_EOF, byte: 0 };
+    return Key{ kind: KEY_EOF, byte: 0, x: 0, y: 0, aux: 0 };
   }
   let b0: u8 = match (b0_opt) { Some(v) => v, None => 0 };
 
   if b0 == 27 { // ESC
-    let b1_opt: u8? = maybe_next_byte_after_esc(mut inp, 8);
+    let b1_opt: u8? = maybe_next_byte_after_esc(mut inp, ESC_SEQ_TIMEOUT_MS);
     if b1_opt == None {
-      return Key{ kind: KEY_ESC, byte: 0 };
+      return Key{ kind: KEY_ESC, byte: 0, x: 0, y: 0, aux: 0 };
     }
     let b1: u8 = match (b1_opt) { Some(v) => v, None => 0 };
 
     if b1 == 91 { // '['
-      let b2_opt: u8? = maybe_next_byte_after_esc(mut inp, 8);
+      let b2_opt: u8? = maybe_next_byte_after_esc(mut inp, ESC_SEQ_TIMEOUT_MS);
       if b2_opt == None {
-        return Key{ kind: KEY_ESC, byte: 0 };
+        return Key{ kind: KEY_ESC, byte: 0, x: 0, y: 0, aux: 0 };
       }
       let b2: u8 = match (b2_opt) { Some(v) => v, None => 0 };
 
-      if b2 == 65 { return Key{ kind: KEY_UP, byte: 0 }; }
-      if b2 == 66 { return Key{ kind: KEY_DOWN, byte: 0 }; }
-      if b2 == 67 { return Key{ kind: KEY_RIGHT, byte: 0 }; }
-      if b2 == 68 { return Key{ kind: KEY_LEFT, byte: 0 }; }
-      if b2 == 72 { return Key{ kind: KEY_HOME, byte: 0 }; }
-      if b2 == 70 { return Key{ kind: KEY_END, byte: 0 }; }
+      if b2 == 65 { return Key{ kind: KEY_UP, byte: 0, x: 0, y: 0, aux: 0 }; }
+      if b2 == 66 { return Key{ kind: KEY_DOWN, byte: 0, x: 0, y: 0, aux: 0 }; }
+      if b2 == 67 { return Key{ kind: KEY_RIGHT, byte: 0, x: 0, y: 0, aux: 0 }; }
+      if b2 == 68 { return Key{ kind: KEY_LEFT, byte: 0, x: 0, y: 0, aux: 0 }; }
+      if b2 == 72 { return Key{ kind: KEY_HOME, byte: 0, x: 0, y: 0, aux: 0 }; }
+      if b2 == 70 { return Key{ kind: KEY_END, byte: 0, x: 0, y: 0, aux: 0 }; }
+      if b2 == 90 { return Key{ kind: KEY_SHIFT_TAB, byte: 0, x: 0, y: 0, aux: 0 }; } // 'Z' (backtab)
 
-      // Page/Home/End sequences: ESC [ <n> ~
-      if b2 == 53 { // '5'
-        let b3_opt: u8? = maybe_next_byte_after_esc(mut inp, 8);
-        if b3_opt != None {
-          let b3: u8 = match (b3_opt) { Some(v) => v, None => 0 };
-          if b3 == 126 { return Key{ kind: KEY_PAGE_UP, byte: 0 }; }
+      // Mouse reporting (xterm):
+      // - SGR 1006: ESC [ < Cb ; Cx ; Cy M/m
+      // - X10:      ESC [ M Cb Cx Cy  (each byte is 32 + value)
+      if b2 == 60 { // '<'
+        // Parse 3 integers separated by ';' and terminated by 'M' or 'm'.
+        var cb: int = -1;
+        var cx: int = -1;
+        var cy: int = -1;
+        var idx: int = 0;
+        var cur: int = 0;
+        var have: bool = false;
+
+        var steps_sgr: int = 0;
+        while steps_sgr < 32 {
+          let c_opt: u8? = maybe_next_byte_after_esc(mut inp, ESC_SEQ_TIMEOUT_MS);
+          if c_opt == None {
+            return Key{ kind: KEY_ESC, byte: 0, x: 0, y: 0, aux: 0 };
+          }
+          let c: u8 = match (c_opt) { Some(v) => v, None => 0 };
+
+          if c >= 48 && c <= 57 {
+            have = true;
+            cur = (cur * 10) + ((c - 48) as int);
+            steps_sgr = steps_sgr + 1;
+            continue;
+          }
+          if c == 59 { // ';'
+            if !have {
+              return Key{ kind: KEY_ESC, byte: 0, x: 0, y: 0, aux: 0 };
+            }
+            if idx == 0 { cb = cur; }
+            else if idx == 1 { cx = cur; }
+            else { return Key{ kind: KEY_ESC, byte: 0, x: 0, y: 0, aux: 0 }; }
+            idx = idx + 1;
+            cur = 0;
+            have = false;
+            steps_sgr = steps_sgr + 1;
+            continue;
+          }
+          if c == 77 || c == 109 { // 'M' or 'm'
+            if !have {
+              return Key{ kind: KEY_ESC, byte: 0, x: 0, y: 0, aux: 0 };
+            }
+            if idx == 0 { cb = cur; }
+            else if idx == 1 { cx = cur; }
+            else if idx == 2 { cy = cur; }
+            else { return Key{ kind: KEY_ESC, byte: 0, x: 0, y: 0, aux: 0 }; }
+
+            if cb >= 0 {
+              // Wheel: Cb has bit 6 set (64), low bits indicate direction.
+              if (cb & 64) != 0 {
+                if (cb & 1) == 0 {
+                  return Key{ kind: KEY_MOUSE_WHEEL_UP, byte: 0, x: cx, y: cy, aux: cb };
+                }
+                return Key{ kind: KEY_MOUSE_WHEEL_DOWN, byte: 0, x: cx, y: cy, aux: cb };
+              }
+            }
+            // Pass through other mouse events (clicks/motion) so callers can
+            // implement selection or ignore them explicitly.
+            return Key{ kind: KEY_MOUSE, byte: c, x: cx, y: cy, aux: cb };
+          }
+          return Key{ kind: KEY_ESC, byte: 0, x: 0, y: 0, aux: 0 };
         }
-        return Key{ kind: KEY_ESC, byte: 0 };
-      }
-      if b2 == 54 { // '6'
-        let b3_opt: u8? = maybe_next_byte_after_esc(mut inp, 8);
-        if b3_opt != None {
-          let b3: u8 = match (b3_opt) { Some(v) => v, None => 0 };
-          if b3 == 126 { return Key{ kind: KEY_PAGE_DOWN, byte: 0 }; }
-        }
-        return Key{ kind: KEY_ESC, byte: 0 };
+        return Key{ kind: KEY_ESC, byte: 0, x: 0, y: 0, aux: 0 };
       }
 
-      return Key{ kind: KEY_ESC, byte: 0 };
+      if b2 == 77 { // 'M' (X10 mouse)
+        let cb_opt: u8? = maybe_next_byte_after_esc(mut inp, ESC_SEQ_TIMEOUT_MS);
+        let cx_opt: u8? = maybe_next_byte_after_esc(mut inp, ESC_SEQ_TIMEOUT_MS);
+        let cy_opt: u8? = maybe_next_byte_after_esc(mut inp, ESC_SEQ_TIMEOUT_MS);
+        if cb_opt == None || cx_opt == None || cy_opt == None {
+          return Key{ kind: KEY_ESC, byte: 0, x: 0, y: 0, aux: 0 };
+        }
+        let cb_b: u8 = match (cb_opt) { Some(v) => v, None => 0 };
+        let cx_b: u8 = match (cx_opt) { Some(v) => v, None => 0 };
+        let cy_b: u8 = match (cy_opt) { Some(v) => v, None => 0 };
+        let cbv: int = if cb_b >= 32 { (cb_b - 32) as int } else { 0 };
+
+        if (cbv & 64) != 0 {
+          let _ = cx_b;
+          let _ = cy_b;
+          if (cbv & 1) == 0 {
+            return Key{ kind: KEY_MOUSE_WHEEL_UP, byte: 0, x: 0, y: 0, aux: cbv };
+          }
+          return Key{ kind: KEY_MOUSE_WHEEL_DOWN, byte: 0, x: 0, y: 0, aux: cbv };
+        }
+
+        let _ = cx_b;
+        let _ = cy_b;
+        return Key{ kind: KEY_NONE, byte: 0, x: 0, y: 0, aux: 0 };
+      }
+
+      // Extended CSI sequences (xterm + modifiers), examples:
+      // - ESC [ 1 ; 2 A  (Shift-Up)
+      // - ESC [ 5 ~      (PageUp)
+      // - ESC [ 1 ~      (Home)
+      if (b2 >= 48 && b2 <= 57) || b2 == 59 { // digit or ';'
+        var n: int = 0;
+        var have_n: bool = false;
+        var parsing_first: bool = true;
+        var c: u8 = b2;
+        var steps: int = 0;
+        while steps < 16 {
+          if c >= 48 && c <= 57 {
+            if parsing_first {
+              have_n = true;
+              n = (n * 10) + ((c - 48) as int);
+            }
+          } else if c == 59 { // ';'
+            parsing_first = false;
+          } else if c == 65 { return Key{ kind: KEY_UP, byte: 0, x: 0, y: 0, aux: 0 }; }
+          else if c == 66 { return Key{ kind: KEY_DOWN, byte: 0, x: 0, y: 0, aux: 0 }; }
+          else if c == 67 { return Key{ kind: KEY_RIGHT, byte: 0, x: 0, y: 0, aux: 0 }; }
+          else if c == 68 { return Key{ kind: KEY_LEFT, byte: 0, x: 0, y: 0, aux: 0 }; }
+          else if c == 72 { return Key{ kind: KEY_HOME, byte: 0, x: 0, y: 0, aux: 0 }; }
+          else if c == 70 { return Key{ kind: KEY_END, byte: 0, x: 0, y: 0, aux: 0 }; }
+          else if c == 90 { return Key{ kind: KEY_SHIFT_TAB, byte: 0, x: 0, y: 0, aux: 0 }; } // 'Z'
+          else if c == 126 { // '~'
+            if have_n {
+              if n == 5 { return Key{ kind: KEY_PAGE_UP, byte: 0, x: 0, y: 0, aux: 0 }; }
+              if n == 6 { return Key{ kind: KEY_PAGE_DOWN, byte: 0, x: 0, y: 0, aux: 0 }; }
+              if n == 1 || n == 7 { return Key{ kind: KEY_HOME, byte: 0, x: 0, y: 0, aux: 0 }; }
+              if n == 4 || n == 8 { return Key{ kind: KEY_END, byte: 0, x: 0, y: 0, aux: 0 }; }
+            }
+            return Key{ kind: KEY_ESC, byte: 0, x: 0, y: 0, aux: 0 };
+          } else {
+            return Key{ kind: KEY_ESC, byte: 0, x: 0, y: 0, aux: 0 };
+          }
+
+          let next_opt: u8? = maybe_next_byte_after_esc(mut inp, ESC_SEQ_TIMEOUT_MS);
+          if next_opt == None {
+            return Key{ kind: KEY_ESC, byte: 0, x: 0, y: 0, aux: 0 };
+          }
+          c = match (next_opt) { Some(v) => v, None => 0 };
+          steps = steps + 1;
+        }
+        return Key{ kind: KEY_ESC, byte: 0, x: 0, y: 0, aux: 0 };
+      }
+
+      return Key{ kind: KEY_ESC, byte: 0, x: 0, y: 0, aux: 0 };
     }
 
     if b1 == 79 { // 'O' (SS3)
-      let b2_opt: u8? = maybe_next_byte_after_esc(mut inp, 8);
+      let b2_opt: u8? = maybe_next_byte_after_esc(mut inp, ESC_SEQ_TIMEOUT_MS);
       if b2_opt == None {
-        return Key{ kind: KEY_ESC, byte: 0 };
+        return Key{ kind: KEY_ESC, byte: 0, x: 0, y: 0, aux: 0 };
       }
       let b2: u8 = match (b2_opt) { Some(v) => v, None => 0 };
-      if b2 == 65 { return Key{ kind: KEY_UP, byte: 0 }; }
-      if b2 == 66 { return Key{ kind: KEY_DOWN, byte: 0 }; }
-      if b2 == 67 { return Key{ kind: KEY_RIGHT, byte: 0 }; }
-      if b2 == 68 { return Key{ kind: KEY_LEFT, byte: 0 }; }
-      if b2 == 72 { return Key{ kind: KEY_HOME, byte: 0 }; }
-      if b2 == 70 { return Key{ kind: KEY_END, byte: 0 }; }
-      return Key{ kind: KEY_ESC, byte: 0 };
+      if b2 == 65 { return Key{ kind: KEY_UP, byte: 0, x: 0, y: 0, aux: 0 }; }
+      if b2 == 66 { return Key{ kind: KEY_DOWN, byte: 0, x: 0, y: 0, aux: 0 }; }
+      if b2 == 67 { return Key{ kind: KEY_RIGHT, byte: 0, x: 0, y: 0, aux: 0 }; }
+      if b2 == 68 { return Key{ kind: KEY_LEFT, byte: 0, x: 0, y: 0, aux: 0 }; }
+      if b2 == 72 { return Key{ kind: KEY_HOME, byte: 0, x: 0, y: 0, aux: 0 }; }
+      if b2 == 70 { return Key{ kind: KEY_END, byte: 0, x: 0, y: 0, aux: 0 }; }
+      return Key{ kind: KEY_ESC, byte: 0, x: 0, y: 0, aux: 0 };
     }
 
-    return Key{ kind: KEY_ESC, byte: 0 };
+    return Key{ kind: KEY_ESC, byte: 0, x: 0, y: 0, aux: 0 };
   }
 
   if b0 == 127 {
-    return Key{ kind: KEY_BACKSPACE, byte: 0 };
+    return Key{ kind: KEY_BACKSPACE, byte: 0, x: 0, y: 0, aux: 0 };
   }
   if b0 == 13 || b0 == 10 {
-    return Key{ kind: KEY_ENTER, byte: 0 };
+    return Key{ kind: KEY_ENTER, byte: 0, x: 0, y: 0, aux: 0 };
   }
 
-  return Key{ kind: KEY_BYTE, byte: b0 };
+  return Key{ kind: KEY_BYTE, byte: b0, x: 0, y: 0, aux: 0 };
 }
 
 /**
@@ -211,9 +344,165 @@ export fn read_key_timeout (mut inp: &Input, timeout_ms: int) -> Key {
     return read_key(mut inp);
   }
   if !poll_readable(inp.pollfd_ptr, inp.fd, timeout_ms) {
-    return Key{ kind: KEY_NONE, byte: 0 };
+    return Key{ kind: KEY_NONE, byte: 0, x: 0, y: 0, aux: 0 };
   }
   return read_key(mut inp);
+}
+
+test "read_key parses common CSI variants" {
+  // ESC [ A
+  let p1: u64 = std::runtime::mem::alloc(3);
+  assert(p1 != 0, "alloc");
+  std::runtime::mem::store_u8(p1, 0, 27);
+  std::runtime::mem::store_u8(p1, 1, 91);
+  std::runtime::mem::store_u8(p1, 2, 65);
+  let mut in1: Input = Input{ fd: -1, buf_ptr: p1, buf_len: 3, buf_off: 0, pollfd_ptr: 0 };
+  let k1: Key = read_key(mut in1);
+  assert(k1.kind == KEY_UP, "up");
+
+  // ESC O A (SS3)
+  let p2: u64 = std::runtime::mem::alloc(3);
+  assert(p2 != 0, "alloc");
+  std::runtime::mem::store_u8(p2, 0, 27);
+  std::runtime::mem::store_u8(p2, 1, 79);
+  std::runtime::mem::store_u8(p2, 2, 65);
+  let mut in2: Input = Input{ fd: -1, buf_ptr: p2, buf_len: 3, buf_off: 0, pollfd_ptr: 0 };
+  let k2: Key = read_key(mut in2);
+  assert(k2.kind == KEY_UP, "up ss3");
+
+  // ESC [ 1 ; 2 A (modified Up)
+  let p3: u64 = std::runtime::mem::alloc(6);
+  assert(p3 != 0, "alloc");
+  std::runtime::mem::store_u8(p3, 0, 27);
+  std::runtime::mem::store_u8(p3, 1, 91);
+  std::runtime::mem::store_u8(p3, 2, 49);
+  std::runtime::mem::store_u8(p3, 3, 59);
+  std::runtime::mem::store_u8(p3, 4, 50);
+  std::runtime::mem::store_u8(p3, 5, 65);
+  let mut in3: Input = Input{ fd: -1, buf_ptr: p3, buf_len: 6, buf_off: 0, pollfd_ptr: 0 };
+  let k3: Key = read_key(mut in3);
+  assert(k3.kind == KEY_UP, "up mod");
+
+  // ESC [ 5 ~ (PageUp)
+  let p4: u64 = std::runtime::mem::alloc(4);
+  assert(p4 != 0, "alloc");
+  std::runtime::mem::store_u8(p4, 0, 27);
+  std::runtime::mem::store_u8(p4, 1, 91);
+  std::runtime::mem::store_u8(p4, 2, 53);
+  std::runtime::mem::store_u8(p4, 3, 126);
+  let mut in4: Input = Input{ fd: -1, buf_ptr: p4, buf_len: 4, buf_off: 0, pollfd_ptr: 0 };
+  let k4: Key = read_key(mut in4);
+  assert(k4.kind == KEY_PAGE_UP, "page up");
+
+  // ESC [ 1 ~ (Home)
+  let p5: u64 = std::runtime::mem::alloc(4);
+  assert(p5 != 0, "alloc");
+  std::runtime::mem::store_u8(p5, 0, 27);
+  std::runtime::mem::store_u8(p5, 1, 91);
+  std::runtime::mem::store_u8(p5, 2, 49);
+  std::runtime::mem::store_u8(p5, 3, 126);
+  let mut in5: Input = Input{ fd: -1, buf_ptr: p5, buf_len: 4, buf_off: 0, pollfd_ptr: 0 };
+  let k5: Key = read_key(mut in5);
+  assert(k5.kind == KEY_HOME, "home");
+
+  // ESC [ 4 ~ (End)
+  let p6: u64 = std::runtime::mem::alloc(4);
+  assert(p6 != 0, "alloc");
+  std::runtime::mem::store_u8(p6, 0, 27);
+  std::runtime::mem::store_u8(p6, 1, 91);
+  std::runtime::mem::store_u8(p6, 2, 52);
+  std::runtime::mem::store_u8(p6, 3, 126);
+  let mut in6: Input = Input{ fd: -1, buf_ptr: p6, buf_len: 4, buf_off: 0, pollfd_ptr: 0 };
+  let k6: Key = read_key(mut in6);
+  assert(k6.kind == KEY_END, "end");
+}
+
+test "read_key parses shift-tab (backtab)" {
+  // ESC [ Z
+  let p: u64 = std::runtime::mem::alloc(3);
+  assert(p != 0, "alloc");
+  std::runtime::mem::store_u8(p, 0, 27);
+  std::runtime::mem::store_u8(p, 1, 91);
+  std::runtime::mem::store_u8(p, 2, 90);
+  let mut in1: Input = Input{ fd: -1, buf_ptr: p, buf_len: 3, buf_off: 0, pollfd_ptr: 0 };
+  let k: Key = read_key(mut in1);
+  assert(k.kind == KEY_SHIFT_TAB, "backtab");
+}
+
+test "read_key parses mouse press (SGR 1006)" {
+  // ESC [ < 4 ; 10 ; 3 M  (Shift+Left press at x=10,y=3)
+  let p: u64 = std::runtime::mem::alloc(10);
+  assert(p != 0, "alloc");
+  std::runtime::mem::store_u8(p, 0, 27);
+  std::runtime::mem::store_u8(p, 1, 91);
+  std::runtime::mem::store_u8(p, 2, 60);
+  std::runtime::mem::store_u8(p, 3, 52);
+  std::runtime::mem::store_u8(p, 4, 59);
+  std::runtime::mem::store_u8(p, 5, 49);
+  std::runtime::mem::store_u8(p, 6, 48);
+  std::runtime::mem::store_u8(p, 7, 59);
+  std::runtime::mem::store_u8(p, 8, 51);
+  std::runtime::mem::store_u8(p, 9, 77);
+  let mut in1: Input = Input{ fd: -1, buf_ptr: p, buf_len: 10, buf_off: 0, pollfd_ptr: 0 };
+  let k: Key = read_key(mut in1);
+  assert(k.kind == KEY_MOUSE, "mouse kind");
+  assert(k.byte == 77, "mouse press");
+  assert(k.x == 10, "x");
+  assert(k.y == 3, "y");
+  assert(k.aux == 4, "shift");
+}
+
+test "read_key parses mouse wheel (SGR 1006)" {
+  // ESC [ < 64 ; 1 ; 1 M  (wheel up)
+  let p: u64 = std::runtime::mem::alloc(11);
+  assert(p != 0, "alloc");
+  std::runtime::mem::store_u8(p, 0, 27);
+  std::runtime::mem::store_u8(p, 1, 91);
+  std::runtime::mem::store_u8(p, 2, 60);
+  std::runtime::mem::store_u8(p, 3, 54);
+  std::runtime::mem::store_u8(p, 4, 52);
+  std::runtime::mem::store_u8(p, 5, 59);
+  std::runtime::mem::store_u8(p, 6, 49);
+  std::runtime::mem::store_u8(p, 7, 59);
+  std::runtime::mem::store_u8(p, 8, 49);
+  std::runtime::mem::store_u8(p, 9, 77);
+  std::runtime::mem::store_u8(p, 10, 0);
+  let mut in1: Input = Input{ fd: -1, buf_ptr: p, buf_len: 10, buf_off: 0, pollfd_ptr: 0 };
+  let k: Key = read_key(mut in1);
+  assert(k.kind == KEY_MOUSE_WHEEL_UP, "wheel up");
+
+  // ESC [ < 65 ; 1 ; 1 M  (wheel down)
+  let p2: u64 = std::runtime::mem::alloc(11);
+  assert(p2 != 0, "alloc");
+  std::runtime::mem::store_u8(p2, 0, 27);
+  std::runtime::mem::store_u8(p2, 1, 91);
+  std::runtime::mem::store_u8(p2, 2, 60);
+  std::runtime::mem::store_u8(p2, 3, 54);
+  std::runtime::mem::store_u8(p2, 4, 53);
+  std::runtime::mem::store_u8(p2, 5, 59);
+  std::runtime::mem::store_u8(p2, 6, 49);
+  std::runtime::mem::store_u8(p2, 7, 59);
+  std::runtime::mem::store_u8(p2, 8, 49);
+  std::runtime::mem::store_u8(p2, 9, 77);
+  std::runtime::mem::store_u8(p2, 10, 0);
+  let mut in2: Input = Input{ fd: -1, buf_ptr: p2, buf_len: 10, buf_off: 0, pollfd_ptr: 0 };
+  let k2: Key = read_key(mut in2);
+  assert(k2.kind == KEY_MOUSE_WHEEL_DOWN, "wheel down");
+}
+
+test "read_key parses mouse wheel (X10)" {
+  // ESC [ M (32+65) (32+1) (32+1)  (wheel down at 1,1)
+  let p: u64 = std::runtime::mem::alloc(6);
+  assert(p != 0, "alloc");
+  std::runtime::mem::store_u8(p, 0, 27);
+  std::runtime::mem::store_u8(p, 1, 91);
+  std::runtime::mem::store_u8(p, 2, 77);
+  std::runtime::mem::store_u8(p, 3, 97);
+  std::runtime::mem::store_u8(p, 4, 33);
+  std::runtime::mem::store_u8(p, 5, 33);
+  let mut in1: Input = Input{ fd: -1, buf_ptr: p, buf_len: 6, buf_off: 0, pollfd_ptr: 0 };
+  let k: Key = read_key(mut in1);
+  assert(k.kind == KEY_MOUSE_WHEEL_DOWN, "wheel down");
 }
 
 impl Input as std::interfaces::Drop {

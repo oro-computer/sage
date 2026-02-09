@@ -8,11 +8,11 @@ import std::runtime::posix::io;
 import std::runtime::posix::time;
 import std::result;
 import std::sync;
-import std::regex;
 
 import { isatty, memchr, memmem, memrchr } from "./sage/os.slk";
 import { MappedFile, map_path, map_stdin_spool } from "./sage/file.slk";
-import { BufferU8, VecU64 } from "./sage/buf.slk";
+import { BufferU8, ByteSlice, VecU64 } from "./sage/buf.slk";
+import { CompileFailed, ExecResult, RegExp, EXEC_MATCH, EXEC_NO_MATCH, RT_EXEC_OUT_BYTES, exec_scratch, search_scratch } from "./sage/re.slk";
 import { Writer, write_str } from "./sage/out.slk";
 import {
   Input,
@@ -31,6 +31,10 @@ import {
   KEY_PAGE_DOWN,
   KEY_PAGE_UP,
   KEY_UP,
+  KEY_MOUSE_WHEEL_UP,
+  KEY_MOUSE_WHEEL_DOWN,
+  KEY_MOUSE,
+  KEY_SHIFT_TAB,
   input_init,
   read_key_timeout
 } from "./sage/input.slk";
@@ -43,9 +47,39 @@ import {
   build_line_index,
   consume_msg
 } from "./sage/index.slk";
+import {
+  Highlighter,
+  TOK_NONE,
+  TOK_COMMENT,
+  TOK_STRING,
+  TOK_NUMBER,
+  TOK_KEYWORD,
+  TOK_TYPE,
+  TOK_FUNCTION,
+  TOK_CONSTANT,
+  TOK_OPERATOR,
+  TOK_HEADING,
+  TOK_EMPHASIS,
+  TOK_PREPROC,
+  compile_cache,
+  list_compiled_syntax,
+  highlighter_empty,
+  HLState,
+  hl_state_advance,
+  hl_state_init,
+  hl_state_on_newline,
+  highlight_segment_stateful,
+  load_for_path,
+  has_syntax_for_path
+} from "./sage/syntax.slk";
 
 type ChanU64 = std::sync::Channel(u64);
-type ReCompileResult = std::result::Result(std::regex::RegExp, std::regex::CompileFailed);
+type ReCompileResult = std::result::Result(RegExp, CompileFailed);
+
+// libc
+ext signal = fn (int, u64) -> u64;
+let SIGTERM: int = 15;
+let SIG_IGN: u64 = 1; // POSIX: SIG_IGN == (void (*)(int))1
 
 struct IndexState {
   done: bool,
@@ -53,9 +87,46 @@ struct IndexState {
   lines: i64,
 }
 
+struct TabState {
+  path: string,
+  top_off: i64,
+  gutter_on: bool,
+}
+
+struct Theme {
+  status_bg: int,
+  status_fg: int,
+  status_dim: int,
+  brand: int,
+  accent: int,
+  warn: int,
+  err: int,
+  mode_regex: int,
+  match_bg: int,
+  match_fg: int,
+
+  syn_comment: int,
+  syn_string: int,
+  syn_number: int,
+  syn_keyword: int,
+  syn_type: int,
+  syn_function: int,
+  syn_constant: int,
+  syn_operator: int,
+  syn_heading: int,
+  syn_emphasis: int,
+  syn_preproc: int,
+}
+
 struct Config {
   help: bool,
   version: bool,
+  compile_cache: bool,
+  list_syntax: bool,
+  verbose: bool,
+  syntax: bool,
+  gutter: int,
+  mouse: bool,
   unsafe_raw: bool,
   allow_binary: bool,
   index_only: bool,
@@ -64,6 +135,7 @@ struct Config {
   no_alt_screen: bool,
   ansi: bool,
   color: int,
+  theme: Theme,
   path: string?,
 }
 
@@ -71,10 +143,148 @@ let COLOR_AUTO: int = 0;
 let COLOR_ALWAYS: int = 1;
 let COLOR_NEVER: int = 2;
 
+let GUTTER_AUTO: int = 0;
+let GUTTER_ALWAYS: int = 1;
+let GUTTER_NEVER: int = 2;
+
+let ALERT_TAB_RANGE: int = 9;
+let ALERT_OPEN_FAILED: int = 10;
+let ALERT_COPIED: int = 11;
+let ALERT_COPY_TOO_BIG: int = 12;
+let ALERT_COPY_FAILED: int = 13;
+
+let COPY_MAX_BYTES: i64 = 200000;
+let SYN_STATE_LOOKBACK_BYTES: i64 = 65536;
+
+fn theme_default () -> Theme {
+  return Theme{
+    status_bg: 236,
+    status_fg: 252,
+    status_dim: 244,
+    brand: 114,
+    accent: 81,
+    warn: 214,
+    err: 203,
+    mode_regex: 141,
+    match_bg: 24,
+    match_fg: 231,
+
+    syn_comment: 244,
+    syn_string: 114,
+    syn_number: 215,
+    syn_keyword: 81,
+    syn_type: 110,
+    syn_function: 221,
+    syn_constant: 141,
+    syn_operator: 245,
+    syn_heading: 110,
+    syn_emphasis: 214,
+    syn_preproc: 203,
+  };
+}
+
+fn theme_light () -> Theme {
+  return Theme{
+    status_bg: 254,
+    status_fg: 238,
+    status_dim: 245,
+    brand: 28,
+    accent: 25,
+    warn: 130,
+    err: 160,
+    mode_regex: 92,
+    match_bg: 153,
+    match_fg: 16,
+
+    syn_comment: 242,
+    syn_string: 28,
+    syn_number: 130,
+    syn_keyword: 25,
+    syn_type: 61,
+    syn_function: 88,
+    syn_constant: 92,
+    syn_operator: 240,
+    syn_heading: 25,
+    syn_emphasis: 130,
+    syn_preproc: 160,
+  };
+}
+
+fn theme_ocean () -> Theme {
+  return Theme{
+    status_bg: 234,
+    status_fg: 252,
+    status_dim: 244,
+    brand: 110,
+    accent: 81,
+    warn: 179,
+    err: 203,
+    mode_regex: 141,
+    match_bg: 31,
+    match_fg: 231,
+
+    syn_comment: 244,
+    syn_string: 114,
+    syn_number: 179,
+    syn_keyword: 81,
+    syn_type: 110,
+    syn_function: 221,
+    syn_constant: 141,
+    syn_operator: 245,
+    syn_heading: 110,
+    syn_emphasis: 179,
+    syn_preproc: 203,
+  };
+}
+
+fn eq_nocase (a_ptr: u64, a_len: i64, b: string) -> bool {
+  let b_ptr: u64 = std::runtime::mem::string_ptr(b);
+  let b_len: i64 = std::runtime::mem::string_len(b);
+  if a_len != b_len {
+    return false;
+  }
+  var i: i64 = 0;
+  while i < a_len {
+    let x: u8 = std::runtime::mem::load_u8(a_ptr, i);
+    let y: u8 = std::runtime::mem::load_u8(b_ptr, i);
+    if lower_ascii(x) != lower_ascii(y) {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+fn theme_apply_name (mut cfg: &Config, name_ptr: u64, name_len: i64) -> bool {
+  if name_ptr == 0 || name_len <= 0 {
+    return false;
+  }
+  if eq_nocase(name_ptr, name_len, "default") {
+    cfg.theme = theme_default();
+    return true;
+  }
+  if eq_nocase(name_ptr, name_len, "light") {
+    cfg.theme = theme_light();
+    return true;
+  }
+  if eq_nocase(name_ptr, name_len, "ocean") {
+    cfg.theme = theme_ocean();
+    return true;
+  }
+  return false;
+}
+
 fn cfg_default () -> Config {
+  let theme: Theme = theme_default();
   return Config{
     help: false,
     version: false,
+    compile_cache: false,
+    list_syntax: false,
+    verbose: false,
+    syntax: true,
+    gutter: GUTTER_AUTO,
+    mouse: true,
     unsafe_raw: false,
     allow_binary: false,
     index_only: false,
@@ -83,6 +293,7 @@ fn cfg_default () -> Config {
     no_alt_screen: false,
     ansi: true,
     color: COLOR_AUTO,
+    theme: theme,
     path: None
   };
 }
@@ -91,9 +302,29 @@ fn streq (a: string, b: string) -> bool {
   return a == b;
 }
 
-fn parse_cli (args: Args) -> Config? {
+fn is_flag_token (a: string) -> bool {
+  let n: i64 = std::runtime::mem::string_len(a);
+  if n <= 0 {
+    return false;
+  }
+  return std::runtime::mem::load_u8(std::runtime::mem::string_ptr(a), 0) == 45; // '-'
+}
+
+fn flag_takes_value (a: string) -> bool {
+  return streq(a, "--color") || streq(a, "--theme") || streq(a, "--rc");
+}
+
+fn ignore_sigterm () -> void {
+  // When `sage` is used as a `man` pager, the pager can be terminated by SIGTERM
+  // in some setups, which causes `man` to print a noisy "Terminated" message.
+  // Ignoring SIGTERM avoids that and keeps UX consistent (quit with `q`).
+  let _prev: u64 = signal(SIGTERM, SIG_IGN);
+  let _ = _prev;
+}
+
+fn parse_cli (args: Args, base: Config) -> Config? {
   let n: int = args.count();
-  let mut cfg: Config = cfg_default();
+  let mut cfg: Config = base;
 
   var i: int = 1;
   while i < n {
@@ -106,6 +337,51 @@ fn parse_cli (args: Args) -> Config? {
     }
     if streq(a, "--version") || streq(a, "-V") {
       cfg.version = true;
+      i = i + 1;
+      continue;
+    }
+    if streq(a, "--compile-cache") {
+      cfg.compile_cache = true;
+      i = i + 1;
+      continue;
+    }
+    if streq(a, "--list-syntax") {
+      cfg.list_syntax = true;
+      i = i + 1;
+      continue;
+    }
+    if streq(a, "--verbose") || streq(a, "-v") {
+      cfg.verbose = true;
+      i = i + 1;
+      continue;
+    }
+    if streq(a, "--syntax") {
+      cfg.syntax = true;
+      i = i + 1;
+      continue;
+    }
+    if streq(a, "--no-syntax") {
+      cfg.syntax = false;
+      i = i + 1;
+      continue;
+    }
+    if streq(a, "--gutter") || streq(a, "--line-numbers") {
+      cfg.gutter = GUTTER_ALWAYS;
+      i = i + 1;
+      continue;
+    }
+    if streq(a, "--no-gutter") || streq(a, "--no-line-numbers") {
+      cfg.gutter = GUTTER_NEVER;
+      i = i + 1;
+      continue;
+    }
+    if streq(a, "--mouse") {
+      cfg.mouse = true;
+      i = i + 1;
+      continue;
+    }
+    if streq(a, "--no-mouse") {
+      cfg.mouse = false;
       i = i + 1;
       continue;
     }
@@ -134,6 +410,30 @@ fn parse_cli (args: Args) -> Config? {
     if streq(a, "--no-alt-screen") {
       cfg.no_alt_screen = true;
       i = i + 1;
+      continue;
+    }
+    if streq(a, "--rc") {
+      // Handled in a pre-scan so CLI overrides still win.
+      if (i + 1) >= n {
+        return None;
+      }
+      i = i + 2;
+      continue;
+    }
+    if streq(a, "--no-rc") {
+      // Handled in a pre-scan so CLI overrides still win.
+      i = i + 1;
+      continue;
+    }
+    if streq(a, "--theme") {
+      if (i + 1) >= n {
+        return None;
+      }
+      let v: string = args.get(i + 1);
+      let v_ptr: u64 = std::runtime::mem::string_ptr(v);
+      let v_len: i64 = std::runtime::mem::string_len(v);
+      let _ = theme_apply_name(mut cfg, v_ptr, v_len);
+      i = i + 2;
       continue;
     }
     if streq(a, "--ansi") {
@@ -172,8 +472,13 @@ fn parse_cli (args: Args) -> Config? {
       continue;
     }
     if streq(a, "--") {
-      if (i + 1) < n {
-        cfg.path = Some(args.get(i + 1));
+      // Treat all remaining args as positional paths.
+      i = i + 1;
+      while i < n {
+        if cfg.path == None {
+          cfg.path = Some(args.get(i));
+        }
+        i = i + 1;
       }
       break;
     }
@@ -183,11 +488,516 @@ fn parse_cli (args: Args) -> Config? {
       return None;
     }
 
-    cfg.path = Some(a);
-    break;
+    // Positional path (support multiple; first one is stored for legacy paths).
+    if cfg.path == None {
+      cfg.path = Some(a);
+    }
+    i = i + 1;
+    continue;
   }
 
   return Some(cfg);
+}
+
+struct Tabs {
+  ptr: u64,
+  len: i64,
+  cap: i64,
+}
+
+fn tabs_collect (args: Args) -> Tabs? {
+  let n: int = args.count();
+  let tab_bytes: i64 = (sizeof (TabState)) as i64;
+  let cap: i64 = if n > 0 { n as i64 } else { 0 };
+  let bytes: i64 = cap * tab_bytes;
+  let ptr: u64 = if bytes > 0 { std::runtime::mem::alloc(bytes) } else { 0 };
+  if cap > 0 && ptr == 0 {
+    return None;
+  }
+
+  var tabs_len: i64 = 0;
+  var i: int = 1;
+  var after_dd: bool = false;
+  while i < n {
+    let a: string = args.get(i);
+
+    if !after_dd && streq(a, "--") {
+      after_dd = true;
+      i = i + 1;
+      continue;
+    }
+
+    if !after_dd && is_flag_token(a) {
+      if flag_takes_value(a) {
+        i = i + 2;
+      } else {
+        i = i + 1;
+      }
+      continue;
+    }
+
+    if tabs_len < cap {
+      (ptr as TabState[](cap as int))[tabs_len] = TabState{ path: a, top_off: 0, gutter_on: false };
+      tabs_len = tabs_len + 1;
+    }
+    i = i + 1;
+  }
+
+  return Some(Tabs{ ptr: ptr, len: tabs_len, cap: cap });
+}
+
+fn tabs_free (mut tabs: &Tabs) -> void {
+  if tabs.ptr != 0 {
+    std::runtime::mem::free(tabs.ptr);
+  }
+  tabs.ptr = 0;
+  tabs.len = 0;
+  tabs.cap = 0;
+}
+
+struct RcChoice {
+  no_rc: bool,
+  path: string?,
+}
+
+fn scan_rc_choice (args: Args) -> RcChoice {
+  let n: int = args.count();
+  var no_rc: bool = false;
+  var rc_path: string? = None;
+
+  var i: int = 1;
+  while i < n {
+    let a: string = args.get(i);
+    if streq(a, "--no-rc") {
+      no_rc = true;
+      rc_path = None;
+      i = i + 1;
+      continue;
+    }
+    if streq(a, "--rc") {
+      if (i + 1) >= n {
+        break;
+      }
+      no_rc = false;
+      rc_path = Some(args.get(i + 1));
+      i = i + 2;
+      continue;
+    }
+    i = i + 1;
+  }
+
+  return RcChoice{ no_rc: no_rc, path: rc_path };
+}
+
+fn cstr_len_max (cstr: u64, max: i64) -> i64 {
+  if cstr == 0 || max <= 0 {
+    return 0;
+  }
+  var i: i64 = 0;
+  while i < max {
+    if std::runtime::mem::load_u8(cstr, i) == 0 {
+      return i;
+    }
+    i = i + 1;
+  }
+  return max;
+}
+
+fn env_get_string (key: string) -> string? {
+  let p: u64 = std::runtime::env::getenv(key);
+  if p == 0 {
+    return None;
+  }
+  let n: i64 = cstr_len_max(p, 8192);
+  if n <= 0 {
+    return None;
+  }
+  return Some(std::runtime::mem::string_from_ptr_len(p, n as int));
+}
+
+fn is_ascii_ws (b: u8) -> bool {
+  if b == 32 { return true; }
+  if b == 9 { return true; }
+  if b == 10 { return true; }
+  if b == 13 { return true; }
+  return false;
+}
+
+fn parse_bool (ptr: u64, len: i64) -> bool? {
+  if ptr == 0 || len <= 0 {
+    return None;
+  }
+  if len == 1 {
+    let b: u8 = std::runtime::mem::load_u8(ptr, 0);
+    if b == 49 { return Some(true); }  // '1'
+    if b == 48 { return Some(false); } // '0'
+  }
+  if eq_nocase(ptr, len, "true") { return Some(true); }
+  if eq_nocase(ptr, len, "yes") { return Some(true); }
+  if eq_nocase(ptr, len, "on") { return Some(true); }
+  if eq_nocase(ptr, len, "false") { return Some(false); }
+  if eq_nocase(ptr, len, "no") { return Some(false); }
+  if eq_nocase(ptr, len, "off") { return Some(false); }
+  return None;
+}
+
+fn parse_i64_dec (ptr: u64, len: i64) -> i64? {
+  if ptr == 0 || len <= 0 {
+    return None;
+  }
+  var i: i64 = 0;
+  var sign: i64 = 1;
+  if std::runtime::mem::load_u8(ptr, 0) == 45 { // '-'
+    sign = -1;
+    i = 1;
+  } else if std::runtime::mem::load_u8(ptr, 0) == 43 { // '+'
+    i = 1;
+  }
+  if i >= len {
+    return None;
+  }
+
+  var v: i64 = 0;
+  while i < len {
+    let b: u8 = std::runtime::mem::load_u8(ptr, i);
+    if b < 48 || b > 57 {
+      return None;
+    }
+    v = (v * 10) + ((b - 48) as i64);
+    i = i + 1;
+  }
+  return Some(v * sign);
+}
+
+fn parse_u8_0_255 (ptr: u64, len: i64) -> int? {
+  let v_opt: i64? = parse_i64_dec(ptr, len);
+  if v_opt == None {
+    return None;
+  }
+  let v: i64 = match (v_opt) { Some(x) => x, None => 0 };
+  if v < 0 || v > 255 {
+    return None;
+  }
+  return Some(v as int);
+}
+
+fn apply_sagerc_kv (mut cfg: &Config, key_ptr: u64, key_len: i64, val_ptr: u64, val_len: i64) -> void {
+  if key_ptr == 0 || key_len <= 0 {
+    return;
+  }
+
+  // Behavior toggles.
+  if eq_nocase(key_ptr, key_len, "ansi") {
+    let b_opt: bool? = parse_bool(val_ptr, val_len);
+    if b_opt != None {
+      cfg.ansi = match (b_opt) { Some(v) => v, None => cfg.ansi };
+    }
+    return;
+  }
+  if eq_nocase(key_ptr, key_len, "syntax") {
+    let b_opt0: bool? = parse_bool(val_ptr, val_len);
+    if b_opt0 != None {
+      cfg.syntax = match (b_opt0) { Some(v) => v, None => cfg.syntax };
+    }
+    return;
+  }
+  if eq_nocase(key_ptr, key_len, "mouse") {
+    let b_optm: bool? = parse_bool(val_ptr, val_len);
+    if b_optm != None {
+      cfg.mouse = match (b_optm) { Some(v) => v, None => cfg.mouse };
+    }
+    return;
+  }
+  if eq_nocase(key_ptr, key_len, "gutter") || eq_nocase(key_ptr, key_len, "line_numbers") || eq_nocase(key_ptr, key_len, "line-numbers") {
+    if eq_nocase(val_ptr, val_len, "auto") {
+      cfg.gutter = GUTTER_AUTO;
+      return;
+    }
+    if eq_nocase(val_ptr, val_len, "always") {
+      cfg.gutter = GUTTER_ALWAYS;
+      return;
+    }
+    if eq_nocase(val_ptr, val_len, "never") {
+      cfg.gutter = GUTTER_NEVER;
+      return;
+    }
+    let b_opt_g: bool? = parse_bool(val_ptr, val_len);
+    if b_opt_g != None {
+      let v: bool = match (b_opt_g) { Some(x) => x, None => true };
+      cfg.gutter = if v { GUTTER_ALWAYS } else { GUTTER_NEVER };
+    }
+    return;
+  }
+  if eq_nocase(key_ptr, key_len, "raw") || eq_nocase(key_ptr, key_len, "unsafe_raw") {
+    let b_opt2: bool? = parse_bool(val_ptr, val_len);
+    if b_opt2 != None {
+      cfg.unsafe_raw = match (b_opt2) { Some(v) => v, None => cfg.unsafe_raw };
+    }
+    return;
+  }
+  if eq_nocase(key_ptr, key_len, "binary") || eq_nocase(key_ptr, key_len, "allow_binary") {
+    let b_opt3: bool? = parse_bool(val_ptr, val_len);
+    if b_opt3 != None {
+      cfg.allow_binary = match (b_opt3) { Some(v) => v, None => cfg.allow_binary };
+    }
+    return;
+  }
+  if eq_nocase(key_ptr, key_len, "regex") {
+    let b_opt4: bool? = parse_bool(val_ptr, val_len);
+    if b_opt4 != None {
+      cfg.regex = match (b_opt4) { Some(v) => v, None => cfg.regex };
+    }
+    return;
+  }
+  if eq_nocase(key_ptr, key_len, "ignore_case") || eq_nocase(key_ptr, key_len, "ignore-case") {
+    let b_opt5: bool? = parse_bool(val_ptr, val_len);
+    if b_opt5 != None {
+      cfg.ignore_case = match (b_opt5) { Some(v) => v, None => cfg.ignore_case };
+    }
+    return;
+  }
+  if eq_nocase(key_ptr, key_len, "alt_screen") || eq_nocase(key_ptr, key_len, "alt-screen") {
+    let b_opt6: bool? = parse_bool(val_ptr, val_len);
+    if b_opt6 != None {
+      let v: bool = match (b_opt6) { Some(x) => x, None => true };
+      cfg.no_alt_screen = !v;
+    }
+    return;
+  }
+  if eq_nocase(key_ptr, key_len, "no_alt_screen") || eq_nocase(key_ptr, key_len, "no-alt-screen") {
+    let b_opt7: bool? = parse_bool(val_ptr, val_len);
+    if b_opt7 != None {
+      cfg.no_alt_screen = match (b_opt7) { Some(v) => v, None => cfg.no_alt_screen };
+    }
+    return;
+  }
+
+  // UI color mode (separate from the theme palette).
+  if eq_nocase(key_ptr, key_len, "color") {
+    if eq_nocase(val_ptr, val_len, "auto") {
+      cfg.color = COLOR_AUTO;
+    } else if eq_nocase(val_ptr, val_len, "always") {
+      cfg.color = COLOR_ALWAYS;
+    } else if eq_nocase(val_ptr, val_len, "never") {
+      cfg.color = COLOR_NEVER;
+    }
+    return;
+  }
+
+  // Theme selection.
+  if eq_nocase(key_ptr, key_len, "theme") {
+    let _ = theme_apply_name(mut cfg, val_ptr, val_len);
+    return;
+  }
+
+  // Theme overrides (256-color palette indices).
+  let c_opt: int? = parse_u8_0_255(val_ptr, val_len);
+  if c_opt == None {
+    return;
+  }
+  let c: int = match (c_opt) { Some(v) => v, None => 0 };
+
+  let mut t: Theme = cfg.theme;
+  if eq_nocase(key_ptr, key_len, "status_bg") { t.status_bg = c; cfg.theme = t; return; }
+  if eq_nocase(key_ptr, key_len, "status_fg") { t.status_fg = c; cfg.theme = t; return; }
+  if eq_nocase(key_ptr, key_len, "status_dim") { t.status_dim = c; cfg.theme = t; return; }
+  if eq_nocase(key_ptr, key_len, "brand") { t.brand = c; cfg.theme = t; return; }
+  if eq_nocase(key_ptr, key_len, "accent") { t.accent = c; cfg.theme = t; return; }
+  if eq_nocase(key_ptr, key_len, "warn") { t.warn = c; cfg.theme = t; return; }
+  if eq_nocase(key_ptr, key_len, "err") || eq_nocase(key_ptr, key_len, "error") { t.err = c; cfg.theme = t; return; }
+  if eq_nocase(key_ptr, key_len, "mode_regex") || eq_nocase(key_ptr, key_len, "mode-regex") { t.mode_regex = c; cfg.theme = t; return; }
+  if eq_nocase(key_ptr, key_len, "match_bg") { t.match_bg = c; cfg.theme = t; return; }
+  if eq_nocase(key_ptr, key_len, "match_fg") { t.match_fg = c; cfg.theme = t; return; }
+  if eq_nocase(key_ptr, key_len, "syn_comment") { t.syn_comment = c; cfg.theme = t; return; }
+  if eq_nocase(key_ptr, key_len, "syn_string") { t.syn_string = c; cfg.theme = t; return; }
+  if eq_nocase(key_ptr, key_len, "syn_number") { t.syn_number = c; cfg.theme = t; return; }
+  if eq_nocase(key_ptr, key_len, "syn_keyword") { t.syn_keyword = c; cfg.theme = t; return; }
+  if eq_nocase(key_ptr, key_len, "syn_type") { t.syn_type = c; cfg.theme = t; return; }
+  if eq_nocase(key_ptr, key_len, "syn_function") { t.syn_function = c; cfg.theme = t; return; }
+  if eq_nocase(key_ptr, key_len, "syn_constant") { t.syn_constant = c; cfg.theme = t; return; }
+  if eq_nocase(key_ptr, key_len, "syn_operator") { t.syn_operator = c; cfg.theme = t; return; }
+  if eq_nocase(key_ptr, key_len, "syn_heading") { t.syn_heading = c; cfg.theme = t; return; }
+  if eq_nocase(key_ptr, key_len, "syn_emphasis") { t.syn_emphasis = c; cfg.theme = t; return; }
+  if eq_nocase(key_ptr, key_len, "syn_preproc") { t.syn_preproc = c; cfg.theme = t; return; }
+}
+
+fn parse_sagerc_bytes (mut cfg: &Config, buf: &BufferU8) -> void {
+  let bytes = buf.as_bytes();
+  if bytes.ptr == 0 || bytes.len <= 0 {
+    return;
+  }
+
+  var i: i64 = 0;
+  while i < bytes.len {
+    let line_start: i64 = i;
+    while i < bytes.len {
+      let b: u8 = std::runtime::mem::load_u8(bytes.ptr, i);
+      if b == 10 { break; } // '\n'
+      i = i + 1;
+    }
+    let line_end0: i64 = i;
+    if i < bytes.len && std::runtime::mem::load_u8(bytes.ptr, i) == 10 {
+      i = i + 1;
+    }
+
+    // Trim ASCII whitespace.
+    var s: i64 = line_start;
+    var e: i64 = line_end0;
+    while s < e && is_ascii_ws(std::runtime::mem::load_u8(bytes.ptr, s)) { s = s + 1; }
+    while e > s && is_ascii_ws(std::runtime::mem::load_u8(bytes.ptr, e - 1)) { e = e - 1; }
+    if e <= s {
+      continue;
+    }
+
+    let first: u8 = std::runtime::mem::load_u8(bytes.ptr, s);
+    if first == 35 || first == 59 { // '#' or ';'
+      continue;
+    }
+
+    // Find '='.
+    var eq: i64 = s;
+    while eq < e {
+      if std::runtime::mem::load_u8(bytes.ptr, eq) == 61 { break; }
+      eq = eq + 1;
+    }
+    if eq >= e {
+      continue;
+    }
+
+    // Key bounds (trim end).
+    var k_end: i64 = eq;
+    while k_end > s && is_ascii_ws(std::runtime::mem::load_u8(bytes.ptr, k_end - 1)) { k_end = k_end - 1; }
+    let k_ptr: u64 = bytes.ptr + (s as u64);
+    let k_len: i64 = k_end - s;
+    if k_len <= 0 {
+      continue;
+    }
+
+    // Value bounds (trim start/end).
+    var v_s: i64 = eq + 1;
+    while v_s < e && is_ascii_ws(std::runtime::mem::load_u8(bytes.ptr, v_s)) { v_s = v_s + 1; }
+    var v_e: i64 = e;
+    while v_e > v_s && is_ascii_ws(std::runtime::mem::load_u8(bytes.ptr, v_e - 1)) { v_e = v_e - 1; }
+
+    let v_ptr: u64 = bytes.ptr + (v_s as u64);
+    let v_len: i64 = v_e - v_s;
+    apply_sagerc_kv(mut cfg, k_ptr, k_len, v_ptr, v_len);
+  }
+}
+
+fn read_file_all (path: string, mut out: &BufferU8) -> bool {
+  out.clear();
+  let fd: int = std::runtime::posix::fs::open(path, std::runtime::posix::fs::O_RDONLY, 0) as int;
+  if fd < 0 {
+    return false;
+  }
+
+  let tmp: u64 = std::runtime::mem::alloc(4096);
+  if tmp == 0 {
+    let _ = std::runtime::posix::fs::close(fd);
+    return false;
+  }
+
+  while true {
+    let n: int = std::runtime::posix::fs::read(fd, tmp, 4096);
+    if n < 0 {
+      std::runtime::mem::free(tmp);
+      let _ = std::runtime::posix::fs::close(fd);
+      return false;
+    }
+    if n == 0 {
+      break;
+    }
+    let err = out.push_ptr_len(tmp, n as i64);
+    if err != None {
+      std::runtime::mem::free(tmp);
+      let _ = std::runtime::posix::fs::close(fd);
+      return false;
+    }
+  }
+
+  std::runtime::mem::free(tmp);
+  let _ = std::runtime::posix::fs::close(fd);
+  return true;
+}
+
+fn try_load_sagerc_path (mut cfg: &Config, path: string) -> bool {
+  let buf_opt: BufferU8? = BufferU8.init(8192);
+  if buf_opt == None {
+    return false;
+  }
+  let mut buf: BufferU8 = match (buf_opt) { Some(v) => v, None => BufferU8.empty() };
+  let ok: bool = read_file_all(path, mut buf);
+  if ok {
+    parse_sagerc_bytes(mut cfg, &buf);
+  }
+  // Buffer drops automatically.
+  return ok;
+}
+
+fn try_load_sagerc_home (mut cfg: &Config) -> bool {
+  let home_opt: string? = env_get_string("HOME");
+  if home_opt == None {
+    return false;
+  }
+  let home: string = match (home_opt) { Some(v) => v, None => "" };
+  let home_len: i64 = std::runtime::mem::string_len(home);
+  if home_len <= 0 {
+    return false;
+  }
+
+  let suffix: string = "/.sagerc";
+  let s_len: i64 = std::runtime::mem::string_len(suffix);
+  let total: i64 = home_len + s_len;
+  if total <= 0 {
+    return false;
+  }
+
+  // Allocate an extra byte for a trailing NUL for POSIX `open(2)` callers.
+  let p: u64 = std::runtime::mem::alloc(total + 1);
+  if p == 0 {
+    return false;
+  }
+
+  let h_ptr: u64 = std::runtime::mem::string_ptr(home);
+  let s_ptr: u64 = std::runtime::mem::string_ptr(suffix);
+  var i: i64 = 0;
+  while i < home_len {
+    std::runtime::mem::store_u8(p, i, std::runtime::mem::load_u8(h_ptr, i));
+    i = i + 1;
+  }
+  var j: i64 = 0;
+  while j < s_len {
+    std::runtime::mem::store_u8(p, home_len + j, std::runtime::mem::load_u8(s_ptr, j));
+    j = j + 1;
+  }
+  std::runtime::mem::store_u8(p, total, 0);
+
+  let path: string = std::runtime::mem::string_from_ptr_len(p, total as int);
+  let ok: bool = try_load_sagerc_path(mut cfg, path);
+  std::runtime::mem::free(p);
+  return ok;
+}
+
+fn load_sagerc (mut cfg: &Config, path_opt: string?) -> void {
+  if path_opt != None {
+    let path: string = match (path_opt) { Some(v) => v, None => "" };
+    let _ = try_load_sagerc_path(mut cfg, path);
+    return;
+  }
+
+  let envp: string? = env_get_string("SAGERC");
+  if envp != None {
+    let p: string = match (envp) { Some(v) => v, None => "" };
+    if try_load_sagerc_path(mut cfg, p) {
+      return;
+    }
+  }
+
+  if try_load_sagerc_path(mut cfg, ".sagerc") {
+    return;
+  }
+  let _ = try_load_sagerc_home(mut cfg);
 }
 
 fn print_help () -> void {
@@ -198,29 +1008,45 @@ fn print_help () -> void {
   let _ = w.push_str("sage — a fast, ergonomic terminal pager (WIP)\n");
   let _ = w.push_str("\n");
   let _ = w.push_str("Usage:\n");
-  let _ = w.push_str("  sage <path>\n");
+  let _ = w.push_str("  sage <path> [path ...]\n");
   let _ = w.push_str("  cat <path> | sage\n");
   let _ = w.push_str("\n");
   let _ = w.push_str("Options:\n");
   let _ = w.push_str("  -h, --help        Show help\n");
   let _ = w.push_str("  -V, --version     Show version\n");
+  let _ = w.push_str("      --compile-cache Compile syntax files in XDG_CONFIG_HOME/sage/syntax\n");
+  let _ = w.push_str("      --list-syntax  List compiled syntax keys\n");
+  let _ = w.push_str("  -v, --verbose     Verbose logging to stderr\n");
   let _ = w.push_str("      --color <mode> Colorize UI (auto|always|never)\n");
   let _ = w.push_str("      --no-color     Disable colors (same as --color never)\n");
+  let _ = w.push_str("      --theme <name> UI theme (default|ocean|light)\n");
+  let _ = w.push_str("      --[no-]syntax  Enable syntax highlighting for files (default: on)\n");
+  let _ = w.push_str("      --[no-]gutter  Show line number gutter (default: auto)\n");
+  let _ = w.push_str("      --[no-]mouse   Enable mouse wheel scrolling (default: on)\n");
+  let _ = w.push_str("      --rc <path>    Read config from <path> (default: ./.sagerc, $HOME/.sagerc)\n");
+  let _ = w.push_str("      --no-rc        Do not read any config file\n");
   let _ = w.push_str("      --no-alt-screen Do not use the terminal alternate screen\n");
   let _ = w.push_str("      --[no-]ansi    Allow ANSI SGR in content (default: on)\n");
   let _ = w.push_str("      --raw         Render bytes as-is (unsafe)\n");
   let _ = w.push_str("      --binary      Allow NUL bytes\n");
-  let _ = w.push_str("  -R, --regex       Search uses regex (via std::regex)\n");
+  let _ = w.push_str("  -R, --regex       Search uses regex\n");
   let _ = w.push_str("  -i, --ignore-case Case-insensitive search\n");
   let _ = w.push_str("      --index-only  Build line index, print stats, exit\n");
   let _ = w.push_str("\n");
-  let _ = w.push_str("Keys: q/Ctrl-C quit, j/k/Up/Down scroll, Left/Right page, Space/b page, g/G top/bottom, / search, n next, Esc cancel search, ? help\n");
+  let _ = w.push_str("Keys: q quit, Ctrl-C quit/copy, j/k/u/d/Up/Down scroll, MouseWheel scroll, Space/PgDn/Ctrl-D page down, b/PgUp/Ctrl-U page up, Left/Right page, g/G top/bottom, Tab/Shift-Tab tabs, MouseDrag select, / search, n next, p prev, : cmd, L gutter, Esc cancel, ? help\n");
 
   let _ = w.flush();
 }
 
 fn print_version () -> void {
   let _ = write_str(std::runtime::posix::io::STDOUT_FD, "sage 0.1.0\n");
+}
+
+fn vlog_line (mut w: &Writer, msg: string) -> void {
+  let _ = w.push_str("sage[v] ");
+  let _ = w.push_str(msg);
+  let _ = w.push_u8(10);
+  let _ = w.flush();
 }
 
 fn stream_fd_to_stdout (fd: int) -> int {
@@ -269,6 +1095,98 @@ fn stream_stdin_to_stdout () -> int {
   return stream_fd_to_stdout(std::runtime::posix::io::STDIN_FD);
 }
 
+fn stream_bytes_to_stdout (ptr: u64, len: i64) -> int {
+  if ptr == 0 || len <= 0 {
+    return 0;
+  }
+
+  var off: i64 = 0;
+  while off < len {
+    let rem: i64 = len - off;
+    let chunk: i64 = if rem < 65536 { rem } else { 65536 };
+    let w: int = std::runtime::posix::fs::write(std::runtime::posix::io::STDOUT_FD, ptr + (off as u64), chunk);
+    if w <= 0 {
+      return 2;
+    }
+    off = off + (w as i64);
+  }
+  return 0;
+}
+
+fn stream_safe_to_stdout (ptr: u64, len: i64, unsafe_raw: bool, allow_ansi: bool) -> int {
+  if unsafe_raw {
+    return stream_bytes_to_stdout(ptr, len);
+  }
+  if ptr == 0 || len <= 0 {
+    return 0;
+  }
+
+  let out_opt: BufferU8? = BufferU8.init(65536);
+  if out_opt == None {
+    return 2;
+  }
+  let mut out: BufferU8 = match (out_opt) { Some(v) => v, None => BufferU8.empty() };
+
+  var i: i64 = 0;
+  while i < len {
+    if out.len > 60000 {
+      let rc0: int = stream_bytes_to_stdout(out.ptr, out.len);
+      if rc0 != 0 {
+        return rc0;
+      }
+      out.clear();
+    }
+
+    let b: u8 = std::runtime::mem::load_u8(ptr, i);
+
+    if b == 27 { // ESC
+      if allow_ansi {
+        let rem: i64 = len - i;
+        let seq_len: i64 = csi_sgr_len(ptr + (i as u64), rem);
+        if seq_len > 0 {
+          let _ = out.push_ptr_len(ptr + (i as u64), seq_len);
+          i = i + seq_len;
+          continue;
+        }
+      }
+      let _ = out.push_u8(94); // '^'
+      let _ = out.push_u8(91); // '['
+      i = i + 1;
+      continue;
+    }
+
+    if b == 10 { // '\n'
+      let _ = out.push_u8(10);
+      i = i + 1;
+      continue;
+    }
+    if b == 9 { // '\t'
+      let _ = out.push_u8(9);
+      i = i + 1;
+      continue;
+    }
+
+    if b < 32 {
+      let _ = out.push_u8(94); // '^'
+      let _ = out.push_u8(b + 64);
+      i = i + 1;
+      continue;
+    }
+    if b == 127 {
+      let _ = out.push_u8(94); // '^'
+      let _ = out.push_u8(63); // '?'
+      i = i + 1;
+      continue;
+    }
+
+    let _ = out.push_u8(b);
+    i = i + 1;
+  }
+
+  let rc: int = stream_bytes_to_stdout(out.ptr, out.len);
+  return rc;
+}
+
 fn ansi_csi (mut w: &Writer) -> void {
   let _ = w.push_u8(27);
   let _ = w.push_u8(91); // '['
@@ -298,6 +1216,25 @@ fn ansi_show_cursor (mut w: &Writer) -> void {
   let _ = w.push_u8(50); // '2'
   let _ = w.push_u8(53); // '5'
   let _ = w.push_u8(104); // 'h'
+}
+
+fn ansi_mouse_on (mut w: &Writer) -> void {
+  // Enable xterm mouse reporting + SGR 1006 coordinates.
+  ansi_csi(mut w);
+  let _ = w.push_str("?1000h");
+  ansi_csi(mut w);
+  let _ = w.push_str("?1002h");
+  ansi_csi(mut w);
+  let _ = w.push_str("?1006h");
+}
+
+fn ansi_mouse_off (mut w: &Writer) -> void {
+  ansi_csi(mut w);
+  let _ = w.push_str("?1000l");
+  ansi_csi(mut w);
+  let _ = w.push_str("?1002l");
+  ansi_csi(mut w);
+  let _ = w.push_str("?1006l");
 }
 
 fn ansi_alt_on (mut w: &Writer) -> void {
@@ -347,6 +1284,74 @@ fn ansi_dim_on (mut w: &Writer) -> void {
   ansi_sgr(mut w, 2);
 }
 
+fn ansi_fg_default (mut w: &Writer) -> void {
+  // SGR 39: default foreground color.
+  ansi_sgr(mut w, 39);
+}
+
+fn ansi_tok_apply (mut w: &Writer, theme: &Theme, tok: u8) -> void {
+  if !w.color { return; }
+
+  // Clear bold/dim without clobbering inverse-video (used for match highlight).
+  ansi_intensity_normal(mut w);
+
+  if tok == TOK_NONE {
+    ansi_fg_default(mut w);
+    return;
+  }
+  if tok == TOK_COMMENT {
+    ansi_fg_256(mut w, theme.syn_comment);
+    ansi_dim_on(mut w);
+    return;
+  }
+  if tok == TOK_STRING {
+    ansi_fg_256(mut w, theme.syn_string);
+    return;
+  }
+  if tok == TOK_PREPROC {
+    ansi_fg_256(mut w, theme.syn_preproc);
+    ansi_bold_on(mut w);
+    return;
+  }
+  if tok == TOK_NUMBER {
+    ansi_fg_256(mut w, theme.syn_number);
+    return;
+  }
+  if tok == TOK_KEYWORD {
+    ansi_fg_256(mut w, theme.syn_keyword);
+    ansi_bold_on(mut w);
+    return;
+  }
+  if tok == TOK_TYPE {
+    ansi_fg_256(mut w, theme.syn_type);
+    return;
+  }
+  if tok == TOK_FUNCTION {
+    ansi_fg_256(mut w, theme.syn_function);
+    return;
+  }
+  if tok == TOK_CONSTANT {
+    ansi_fg_256(mut w, theme.syn_constant);
+    return;
+  }
+  if tok == TOK_OPERATOR {
+    ansi_fg_256(mut w, theme.syn_operator);
+    return;
+  }
+  if tok == TOK_HEADING {
+    ansi_fg_256(mut w, theme.syn_heading);
+    ansi_bold_on(mut w);
+    return;
+  }
+  if tok == TOK_EMPHASIS {
+    ansi_fg_256(mut w, theme.syn_emphasis);
+    ansi_bold_on(mut w);
+    return;
+  }
+
+  ansi_fg_default(mut w);
+}
+
 fn ansi_fg_256 (mut w: &Writer, color: int) -> void {
   if !w.color { return; }
   // ESC [ 38 ; 5 ; <n> m
@@ -374,7 +1379,6 @@ fn ansi_bg_256 (mut w: &Writer, color: int) -> void {
 }
 
 fn ansi_reset (mut w: &Writer) -> void {
-  if !w.color { return; }
   ansi_csi(mut w);
   let _ = w.push_u8(48); // '0'
   let _ = w.push_u8(109); // 'm'
@@ -395,6 +1399,27 @@ fn clamp_i64 (v: i64, lo: i64, hi: i64) -> i64 {
   return v;
 }
 
+fn tab_next (cur: i64, tabs_len: i64) -> i64 {
+  if tabs_len <= 0 {
+    return 0;
+  }
+  let n: i64 = cur + 1;
+  if n >= tabs_len {
+    return 0;
+  }
+  return n;
+}
+
+fn tab_prev (cur: i64, tabs_len: i64) -> i64 {
+  if tabs_len <= 0 {
+    return 0;
+  }
+  if cur <= 0 {
+    return tabs_len - 1;
+  }
+  return cur - 1;
+}
+
 fn min_i64 (a: i64, b: i64) -> i64 {
   if a < b { return a; }
   return b;
@@ -410,7 +1435,7 @@ fn max_i64 (a: i64, b: i64) -> i64 {
 //   still sanitizing other control bytes.
 // - `--raw`: bytes as-is (unsafe).
 let ANSI_BYTES_PER_COL: i64 = 32;
-let ANSI_SGR_MAX_BYTES: i64 = 64;
+let ANSI_SGR_MAX_BYTES: i64 = 128;
 
 fn csi_sgr_len (ptr: u64, rem: i64) -> i64 {
   // Recognize a bounded CSI SGR sequence:
@@ -438,11 +1463,7 @@ fn csi_sgr_len (ptr: u64, rem: i64) -> i64 {
   return 0;
 }
 
-// Match highlighting (content area).
-let COLOR_MATCH_BG: int = 24;
-let COLOR_MATCH_FG: int = 231;
-
-fn render_line (mut w: &Writer, ptr: u64, len: i64, width: int, unsafe_raw: bool, allow_ansi: bool, hl_start: i64, hl_end: i64) -> i64 {
+fn render_line (mut w: &Writer, theme: &Theme, ptr: u64, len: i64, width: int, unsafe_raw: bool, allow_ansi: bool, hl_start: i64, hl_end: i64, styles: u64) -> i64 {
   if width <= 0 {
     return 0;
   }
@@ -455,6 +1476,16 @@ fn render_line (mut w: &Writer, ptr: u64, len: i64, width: int, unsafe_raw: bool
     return take;
   }
 
+  let use_syntax: bool = styles != 0;
+  let hl_use_inverse: bool = allow_ansi || use_syntax;
+  var cur_tok: u8 = TOK_NONE;
+
+  if use_syntax {
+    // Make each visual segment self-contained (don't leak styles across wraps).
+    ansi_reset(mut w);
+    ansi_tok_apply(mut w, theme, TOK_NONE);
+  }
+
   let use_hl: bool = hl_start >= 0 && hl_end > hl_start && hl_start < len;
   var hl_on: bool = false;
 
@@ -464,23 +1495,31 @@ fn render_line (mut w: &Writer, ptr: u64, len: i64, width: int, unsafe_raw: bool
     if use_hl && !hl_on && i == hl_start {
       // When ANSI is enabled for content, use inverse-video highlighting so we
       // don't clobber the underlying SGR state.
-      if allow_ansi {
+      if hl_use_inverse {
         ansi_inverse_on(mut w);
       } else {
-        ansi_bg_256(mut w, COLOR_MATCH_BG);
-        ansi_fg_256(mut w, COLOR_MATCH_FG);
+        ansi_bg_256(mut w, theme.match_bg);
+        ansi_fg_256(mut w, theme.match_fg);
         ansi_bold_on(mut w);
       }
       hl_on = true;
     }
     if use_hl && hl_on && i == hl_end {
-      if allow_ansi {
+      if hl_use_inverse {
         // SGR 27: positive image (inverse off).
         ansi_sgr(mut w, 27);
       } else {
         ansi_reset(mut w);
       }
       hl_on = false;
+    }
+
+    if use_syntax {
+      let tok: u8 = std::runtime::mem::load_u8(styles, i);
+      if tok != cur_tok {
+        ansi_tok_apply(mut w, theme, tok);
+        cur_tok = tok;
+      }
     }
 
     let b: u8 = std::runtime::mem::load_u8(ptr, i);
@@ -540,11 +1579,14 @@ fn render_line (mut w: &Writer, ptr: u64, len: i64, width: int, unsafe_raw: bool
   }
 
   if use_hl && hl_on {
-    if allow_ansi {
+    if hl_use_inverse {
       ansi_sgr(mut w, 27);
     } else {
       ansi_reset(mut w);
     }
+  }
+  if use_syntax && cur_tok != TOK_NONE {
+    ansi_tok_apply(mut w, theme, TOK_NONE);
   }
   return i;
 }
@@ -609,6 +1651,236 @@ fn measure_line_consumed (ptr: u64, len: i64, width: int, unsafe_raw: bool, allo
   return i;
 }
 
+fn byte_index_for_visual_col (ptr: u64, len: i64, col_target: int, unsafe_raw: bool, allow_ansi: bool) -> i64 {
+  if ptr == 0 || len <= 0 {
+    return 0;
+  }
+  if col_target <= 0 {
+    return 0;
+  }
+
+  if unsafe_raw {
+    let v: i64 = col_target as i64;
+    return if v <= len { v } else { len };
+  }
+
+  var col: int = 0;
+  var i: i64 = 0;
+  while i < len {
+    if col >= col_target {
+      return i;
+    }
+
+    let b: u8 = std::runtime::mem::load_u8(ptr, i);
+
+    if b == 9 { // tab
+      let tabw: int = 8 - (col & 7);
+      if (col + tabw) > col_target {
+        return i;
+      }
+      col = col + tabw;
+      i = i + 1;
+      continue;
+    }
+
+    if b == 27 { // ESC
+      if allow_ansi {
+        let rem: i64 = len - i;
+        let seq_len: i64 = csi_sgr_len(ptr + (i as u64), rem);
+        if seq_len > 0 {
+          i = i + seq_len;
+          continue;
+        }
+      }
+      if (col + 2) > col_target {
+        return i;
+      }
+      col = col + 2;
+      i = i + 1;
+      continue;
+    }
+
+    if b < 32 || b == 127 {
+      if (col + 2) > col_target {
+        return i;
+      }
+      col = col + 2;
+      i = i + 1;
+      continue;
+    }
+
+    if (col + 1) > col_target {
+      return i;
+    }
+    col = col + 1;
+    i = i + 1;
+  }
+
+  return len;
+}
+
+fn offset_for_view_row_col (file_ptr: u64, file_len: i64, top_off: i64, row0: int, col0: int, width: int, unsafe_raw: bool, allow_ansi: bool) -> i64 {
+  if file_ptr == 0 || file_len <= 0 {
+    return 0;
+  }
+  var cur: i64 = clamp_i64(top_off, 0, file_len);
+
+  var r: int = 0;
+  while r < row0 {
+    if cur >= file_len {
+      return file_len;
+    }
+
+    let tail_len: i64 = file_len - cur;
+    let mult: i64 = if allow_ansi && !unsafe_raw { ANSI_BYTES_PER_COL } else { 1 };
+    let scan_len: i64 = min_i64(tail_len, ((width as i64) * mult) + 1);
+    let nl_ptr: u64 = if scan_len > 0 { memchr(file_ptr + (cur as u64), 10, scan_len) } else { 0 };
+
+    var has_nl: bool = false;
+    var nl_next: i64 = file_len;
+    var seg_len: i64 = 0;
+    if nl_ptr != 0 {
+      has_nl = true;
+      let nl_pos: i64 = (nl_ptr - file_ptr) as i64;
+      nl_next = nl_pos + 1;
+      seg_len = nl_pos - cur;
+      if seg_len > 0 {
+        let last_b: u8 = std::runtime::mem::load_u8(file_ptr, (cur + seg_len) - 1);
+        if last_b == 13 {
+          seg_len = seg_len - 1;
+        }
+      }
+    } else {
+      seg_len = min_i64(tail_len, (width as i64) * mult);
+    }
+    let line_len: i64 = if seg_len > 0 { seg_len } else { 0 };
+
+    let consumed: i64 = measure_line_consumed(file_ptr + (cur as u64), line_len, width, unsafe_raw, allow_ansi);
+    var next: i64 = cur;
+    if has_nl && consumed == line_len {
+      next = nl_next;
+    } else if consumed > 0 {
+      next = cur + consumed;
+    } else {
+      let n2: i64 = cur + 1;
+      next = if n2 <= file_len { n2 } else { file_len };
+    }
+
+    cur = next;
+    r = r + 1;
+  }
+
+  if cur >= file_len {
+    return file_len;
+  }
+
+  let tail_len2: i64 = file_len - cur;
+  let mult2: i64 = if allow_ansi && !unsafe_raw { ANSI_BYTES_PER_COL } else { 1 };
+  let scan_len2: i64 = min_i64(tail_len2, ((width as i64) * mult2) + 1);
+  let nl_ptr2: u64 = if scan_len2 > 0 { memchr(file_ptr + (cur as u64), 10, scan_len2) } else { 0 };
+
+  var seg_len2: i64 = 0;
+  if nl_ptr2 != 0 {
+    let nl_pos2: i64 = (nl_ptr2 - file_ptr) as i64;
+    seg_len2 = nl_pos2 - cur;
+    if seg_len2 > 0 {
+      let last_b2: u8 = std::runtime::mem::load_u8(file_ptr, (cur + seg_len2) - 1);
+      if last_b2 == 13 {
+        seg_len2 = seg_len2 - 1;
+      }
+    }
+  } else {
+    seg_len2 = min_i64(tail_len2, (width as i64) * mult2);
+  }
+
+  let line_len2: i64 = if seg_len2 > 0 { seg_len2 } else { 0 };
+  var col_t: int = col0;
+  if col_t < 0 { col_t = 0; }
+  let d: i64 = byte_index_for_visual_col(file_ptr + (cur as u64), line_len2, col_t, unsafe_raw, allow_ansi);
+  let out: i64 = cur + d;
+  return if out <= file_len { out } else { file_len };
+}
+
+fn b64_char (v: int) -> u8 {
+  if v < 26 { return (65 + v) as u8; }        // A-Z
+  if v < 52 { return (97 + (v - 26)) as u8; } // a-z
+  if v < 62 { return (48 + (v - 52)) as u8; } // 0-9
+  if v == 62 { return 43; } // '+'
+  return 47;                // '/'
+}
+
+fn osc52_copy (mut w: &Writer, ptr: u64, len: i64) -> bool {
+  if ptr == 0 || len <= 0 {
+    return false;
+  }
+
+  // In many terminals, OSC 52 can be blocked/limited; keep it bounded.
+  if len > COPY_MAX_BYTES {
+    return false;
+  }
+
+  // If we're under tmux, wrap OSC sequences in a DCS passthrough.
+  let tmux: bool = std::runtime::env::getenv("TMUX") != 0;
+  if tmux {
+    if w.push_u8(27) != None { return false; } // ESC
+    if w.push_u8(80) != None { return false; } // 'P'
+    if w.push_str("tmux;") != None { return false; }
+    if w.push_u8(27) != None { return false; }
+    if w.push_u8(27) != None { return false; }
+  }
+
+  // OSC 52: ESC ] 52 ; c ; <base64> BEL
+  if w.push_u8(27) != None { return false; }
+  if w.push_u8(93) != None { return false; } // ']'
+  if w.push_str("52;c;") != None { return false; }
+
+  var i: i64 = 0;
+  var out_since_flush: int = 0;
+  while i < len {
+    let rem: i64 = len - i;
+    let b0: int = std::runtime::mem::load_u8(ptr, i) as int;
+    let b1: int = if rem > 1 { std::runtime::mem::load_u8(ptr, i + 1) as int } else { 0 };
+    let b2: int = if rem > 2 { std::runtime::mem::load_u8(ptr, i + 2) as int } else { 0 };
+    let triple: int = (b0 << 16) | (b1 << 8) | b2;
+
+    let c0: int = (triple >> 18) & 63;
+    let c1: int = (triple >> 12) & 63;
+    let c2: int = (triple >> 6) & 63;
+    let c3: int = triple & 63;
+
+    if w.push_u8(b64_char(c0)) != None { return false; }
+    if w.push_u8(b64_char(c1)) != None { return false; }
+    if rem > 1 {
+      if w.push_u8(b64_char(c2)) != None { return false; }
+    } else {
+      if w.push_u8(61) != None { return false; } // '='
+    }
+    if rem > 2 {
+      if w.push_u8(b64_char(c3)) != None { return false; }
+    } else {
+      if w.push_u8(61) != None { return false; }
+    }
+
+    out_since_flush = out_since_flush + 4;
+    if out_since_flush >= 60000 {
+      if !w.flush() { return false; }
+      out_since_flush = 0;
+    }
+
+    i = i + 3;
+  }
+
+  if w.push_u8(7) != None { return false; } // BEL
+
+  if tmux {
+    // DCS terminator: ESC \
+    if w.push_u8(27) != None { return false; }
+    if w.push_u8(92) != None { return false; }
+  }
+
+  return w.flush();
+}
+
 fn visual_next_off (file_ptr: u64, file_len: i64, off: i64, width: int, unsafe_raw: bool, allow_ansi: bool) -> i64 {
   if file_ptr == 0 || file_len <= 0 {
     return 0;
@@ -668,6 +1940,11 @@ fn visual_prev_off (file_ptr: u64, file_len: i64, off: i64, width: int, unsafe_r
   if off <= 0 {
     return 0;
   }
+  if off >= file_len {
+    // EOF: return the start of the last visual segment.
+    if file_len <= 0 { return 0; }
+    return visual_start_for_offset(file_ptr, file_len, file_len - 1, width, unsafe_raw, allow_ansi);
+  }
   if width <= 0 {
     let p0: i64 = off - 1;
     return if p0 > 0 { p0 } else { 0 };
@@ -689,15 +1966,6 @@ fn visual_prev_off (file_ptr: u64, file_len: i64, off: i64, width: int, unsafe_r
         if target < 0 { return 0; }
       }
       return visual_start_for_offset(file_ptr, file_len, target, width, unsafe_raw, allow_ansi);
-    }
-  }
-
-  // If we're not aligned to a visual line boundary (e.g. after a resize),
-  // step back to the start of the current visual line first.
-  if off < file_len {
-    let aligned: i64 = visual_start_for_offset(file_ptr, file_len, off, width, unsafe_raw, allow_ansi);
-    if aligned < off {
-      return aligned;
     }
   }
 
@@ -723,7 +1991,12 @@ fn visual_prev_off (file_ptr: u64, file_len: i64, off: i64, width: int, unsafe_r
     s = s - 1;
   }
 
-  return min_start;
+  // Fallback: if the quick inversion scan fails (common with very dense ANSI),
+  // compute the previous segment start via a bounded forward walk.
+  if off > 0 {
+    return visual_start_for_offset(file_ptr, file_len, off - 1, width, unsafe_raw, allow_ansi);
+  }
+  return 0;
 }
 
 let VISUAL_START_MAX_BACK: i64 = 65536;
@@ -755,9 +2028,24 @@ fn visual_start_for_offset (file_ptr: u64, file_len: i64, off: i64, width: int, 
   let search_len: i64 = off - start0;
   let p: u64 = if search_len > 0 { memrchr(file_ptr + (start0 as u64), 10, search_len) } else { 0 };
   if p == 0 {
-    // No newline in the window (very long line): approximate wrap alignment.
-    let modv: i64 = off % w;
-    return off - modv;
+    // No newline in the window (very long line).
+    // Avoid `off % width` (wrong for tabs/control/ANSI). Instead, do a short
+    // forward scan from a nearby base so `off` falls within the first segment.
+    var base: i64 = off - (w_bytes * 2);
+    if base < 0 { base = 0; }
+
+    var cur2: i64 = base;
+    while cur2 < off {
+      let n2: i64 = visual_next_off(file_ptr, file_len, cur2, width, unsafe_raw, allow_ansi);
+      if n2 <= cur2 {
+        break;
+      }
+      if n2 > off {
+        break;
+      }
+      cur2 = n2;
+    }
+    return cur2;
   }
 
   let line_start: i64 = ((p - file_ptr) as i64) + 1;
@@ -775,22 +2063,134 @@ fn visual_start_for_offset (file_ptr: u64, file_len: i64, off: i64, width: int, 
   return cur;
 }
 
+test "visual_start_for_offset (no newline) contains off" {
+  // ESC[1mHELLOESC[0m\tWORLD\tESC[31mREDESC[0mEND
+  let len: i64 = 35;
+  let p: u64 = std::runtime::mem::alloc(len);
+  assert(p != 0, "alloc");
+  var i: i64 = 0;
+  // ESC [ 1 m
+  std::runtime::mem::store_u8(p, i, 27); i = i + 1;
+  std::runtime::mem::store_u8(p, i, 91); i = i + 1;
+  std::runtime::mem::store_u8(p, i, 49); i = i + 1;
+  std::runtime::mem::store_u8(p, i, 109); i = i + 1;
+  // HELLO
+  std::runtime::mem::store_u8(p, i, 72); i = i + 1;
+  std::runtime::mem::store_u8(p, i, 69); i = i + 1;
+  std::runtime::mem::store_u8(p, i, 76); i = i + 1;
+  std::runtime::mem::store_u8(p, i, 76); i = i + 1;
+  std::runtime::mem::store_u8(p, i, 79); i = i + 1;
+  // ESC [ 0 m
+  std::runtime::mem::store_u8(p, i, 27); i = i + 1;
+  std::runtime::mem::store_u8(p, i, 91); i = i + 1;
+  std::runtime::mem::store_u8(p, i, 48); i = i + 1;
+  std::runtime::mem::store_u8(p, i, 109); i = i + 1;
+  // \t WORLD \t
+  std::runtime::mem::store_u8(p, i, 9); i = i + 1;
+  std::runtime::mem::store_u8(p, i, 87); i = i + 1;
+  std::runtime::mem::store_u8(p, i, 79); i = i + 1;
+  std::runtime::mem::store_u8(p, i, 82); i = i + 1;
+  std::runtime::mem::store_u8(p, i, 76); i = i + 1;
+  std::runtime::mem::store_u8(p, i, 68); i = i + 1;
+  std::runtime::mem::store_u8(p, i, 9); i = i + 1;
+  // ESC [ 3 1 m
+  std::runtime::mem::store_u8(p, i, 27); i = i + 1;
+  std::runtime::mem::store_u8(p, i, 91); i = i + 1;
+  std::runtime::mem::store_u8(p, i, 51); i = i + 1;
+  std::runtime::mem::store_u8(p, i, 49); i = i + 1;
+  std::runtime::mem::store_u8(p, i, 109); i = i + 1;
+  // RED
+  std::runtime::mem::store_u8(p, i, 82); i = i + 1;
+  std::runtime::mem::store_u8(p, i, 69); i = i + 1;
+  std::runtime::mem::store_u8(p, i, 68); i = i + 1;
+  // ESC [ 0 m
+  std::runtime::mem::store_u8(p, i, 27); i = i + 1;
+  std::runtime::mem::store_u8(p, i, 91); i = i + 1;
+  std::runtime::mem::store_u8(p, i, 48); i = i + 1;
+  std::runtime::mem::store_u8(p, i, 109); i = i + 1;
+  // END
+  std::runtime::mem::store_u8(p, i, 69); i = i + 1;
+  std::runtime::mem::store_u8(p, i, 78); i = i + 1;
+  std::runtime::mem::store_u8(p, i, 68); i = i + 1;
+  assert(i == len, "len mismatch");
+
+  let width: int = 10;
+  let unsafe_raw: bool = false;
+
+  var off: i64 = 0;
+  while off < len {
+    let start: i64 = visual_start_for_offset(p, len, off, width, unsafe_raw, true);
+    let next: i64 = visual_next_off(p, len, start, width, unsafe_raw, true);
+    assert(start <= off, "start <= off");
+    assert(next > off, "next > off");
+    off = off + 1;
+  }
+
+  std::runtime::mem::free(p);
+}
+
+test "visual_prev_off inverts visual_next_off (ansi off)" {
+  // Many ESC bytes render as 2 cols ("^[") in safe mode (ansi off), so segment
+  // boundaries are not `width`-byte aligned.
+  let len: i64 = 21;
+  let p: u64 = std::runtime::mem::alloc(len);
+  assert(p != 0, "alloc");
+  var i: i64 = 0;
+  // ESC x5
+  std::runtime::mem::store_u8(p, i, 27); i = i + 1;
+  std::runtime::mem::store_u8(p, i, 27); i = i + 1;
+  std::runtime::mem::store_u8(p, i, 27); i = i + 1;
+  std::runtime::mem::store_u8(p, i, 27); i = i + 1;
+  std::runtime::mem::store_u8(p, i, 27); i = i + 1;
+  // HELLO
+  std::runtime::mem::store_u8(p, i, 72); i = i + 1;
+  std::runtime::mem::store_u8(p, i, 69); i = i + 1;
+  std::runtime::mem::store_u8(p, i, 76); i = i + 1;
+  std::runtime::mem::store_u8(p, i, 76); i = i + 1;
+  std::runtime::mem::store_u8(p, i, 79); i = i + 1;
+  // ESC x2
+  std::runtime::mem::store_u8(p, i, 27); i = i + 1;
+  std::runtime::mem::store_u8(p, i, 27); i = i + 1;
+  // WORLD
+  std::runtime::mem::store_u8(p, i, 87); i = i + 1;
+  std::runtime::mem::store_u8(p, i, 79); i = i + 1;
+  std::runtime::mem::store_u8(p, i, 82); i = i + 1;
+  std::runtime::mem::store_u8(p, i, 76); i = i + 1;
+  std::runtime::mem::store_u8(p, i, 68); i = i + 1;
+  // ESC
+  std::runtime::mem::store_u8(p, i, 27); i = i + 1;
+  // END
+  std::runtime::mem::store_u8(p, i, 69); i = i + 1;
+  std::runtime::mem::store_u8(p, i, 78); i = i + 1;
+  std::runtime::mem::store_u8(p, i, 68); i = i + 1;
+  assert(i == len, "len mismatch");
+
+  let width: int = 10;
+  let unsafe_raw: bool = false;
+  let allow_ansi: bool = false;
+
+  var prev: i64 = 0;
+  var cur: i64 = visual_next_off(p, len, prev, width, unsafe_raw, allow_ansi);
+  var steps: int = 0;
+  while cur > prev && cur <= len && steps < 50 {
+    let back: i64 = visual_prev_off(p, len, cur, width, unsafe_raw, allow_ansi);
+    assert(back == prev, "prev mismatch");
+    if cur == len { break; }
+    prev = cur;
+    cur = visual_next_off(p, len, cur, width, unsafe_raw, allow_ansi);
+    steps = steps + 1;
+  }
+
+  std::runtime::mem::free(p);
+}
+
 // ---------------------------------------------------------------------------
 // Theme (256-color palette).
 
-let COLOR_STATUS_BG: int = 236;
-let COLOR_STATUS_FG: int = 252;
-let COLOR_STATUS_DIM: int = 244;
-let COLOR_BRAND: int = 114;
-let COLOR_ACCENT: int = 81;
-let COLOR_WARN: int = 214;
-let COLOR_ERROR: int = 203;
-let COLOR_MODE_REGEX: int = 141;
-
-fn ansi_status_on (mut w: &Writer) -> void {
+fn ansi_status_on (mut w: &Writer, theme: &Theme) -> void {
   ansi_reset(mut w);
-  ansi_bg_256(mut w, COLOR_STATUS_BG);
-  ansi_fg_256(mut w, COLOR_STATUS_FG);
+  ansi_bg_256(mut w, theme.status_bg);
+  ansi_fg_256(mut w, theme.status_fg);
 }
 
 fn digits_u64 (v: u64) -> int {
@@ -811,22 +2211,83 @@ fn digits_i64 (v: i64) -> int {
   return digits_u64(v as u64);
 }
 
+fn push_spaces (mut w: &Writer, n: int) -> void {
+  if n <= 0 {
+    return;
+  }
+  var i: int = 0;
+  while i < n {
+    let _ = w.push_u8(32);
+    i = i + 1;
+  }
+}
+
+fn push_gutter (
+  mut w: &Writer,
+  theme: &Theme,
+  line0: i64,     // 0-based, or <0 if unknown
+  width: int,     // digits width
+  use_color: bool,
+  allow_ansi: bool
+) -> void {
+  if width <= 0 {
+    return;
+  }
+
+  // Avoid clobbering content SGR state when we are passing ANSI through.
+  let color_gutter: bool = use_color && !allow_ansi;
+  if color_gutter {
+    ansi_fg_256(mut w, theme.status_dim);
+    ansi_dim_on(mut w);
+  }
+
+  if line0 >= 0 {
+    let v: i64 = line0 + 1;
+    let d: int = digits_i64(v);
+    push_spaces(mut w, width - d);
+    let _ = w.push_i64(v);
+  } else {
+    push_spaces(mut w, width - 1);
+    let _ = w.push_str("?");
+  }
+
+  if color_gutter {
+    ansi_intensity_normal(mut w);
+    ansi_fg_256(mut w, theme.status_dim);
+  }
+  let _ = w.push_u8(32);
+  let _ = w.push_str("│");
+  let _ = w.push_u8(32);
+
+  if color_gutter {
+    ansi_reset(mut w);
+  }
+}
+
 fn status_alert_len (alert: int) -> int {
   if alert == 1 { return 9; }  // "regex>2GB"
   if alert == 2 { return 13; } // "regex compile"
   if alert == 3 { return 13; } // "regex runtime"
   if alert == 4 { return 9; }  // "searching"
   if alert == 5 { return 9; }  // "not found"
+  if alert == 6 { return 7; }  // "bad cmd"
+  if alert == 7 { return 7; }  // "goto idx"
+  if alert == 8 { return 10; } // "line range"
+  if alert == ALERT_TAB_RANGE { return 9; }   // "tab range"
+  if alert == ALERT_OPEN_FAILED { return 11; } // "open failed"
+  if alert == ALERT_COPIED { return 6; }        // "copied"
+  if alert == ALERT_COPY_TOO_BIG { return 12; } // "copy too big"
+  if alert == ALERT_COPY_FAILED { return 11; }  // "copy failed"
   return 5;                    // "error"
 }
 
-fn status_sep (mut w: &Writer) -> void {
-  ansi_fg_256(mut w, COLOR_STATUS_DIM);
+fn status_sep (mut w: &Writer, theme: &Theme) -> void {
+  ansi_fg_256(mut w, theme.status_dim);
   let _ = w.push_str(" │ ");
-  ansi_fg_256(mut w, COLOR_STATUS_FG);
+  ansi_fg_256(mut w, theme.status_fg);
 }
 
-fn push_path_slice_pretty (mut w: &Writer, ptr: u64, len: i64) -> int {
+fn push_path_slice_pretty (mut w: &Writer, theme: &Theme, ptr: u64, len: i64) -> int {
   if ptr == 0 || len <= 0 {
     return 0;
   }
@@ -834,29 +2295,29 @@ fn push_path_slice_pretty (mut w: &Writer, ptr: u64, len: i64) -> int {
   let slash: u64 = memrchr(ptr, 47, len); // '/'
   if slash != 0 {
     let dir_len: i64 = ((slash - ptr) as i64) + 1;
-    ansi_fg_256(mut w, COLOR_STATUS_DIM);
+    ansi_fg_256(mut w, theme.status_dim);
     ansi_dim_on(mut w);
     let _ = w.push_ptr_len(ptr, dir_len);
     ansi_intensity_normal(mut w);
 
-    ansi_fg_256(mut w, COLOR_ACCENT);
+    ansi_fg_256(mut w, theme.accent);
     ansi_bold_on(mut w);
     let _ = w.push_ptr_len(ptr + (dir_len as u64), len - dir_len);
     ansi_intensity_normal(mut w);
 
-    ansi_fg_256(mut w, COLOR_STATUS_FG);
+    ansi_fg_256(mut w, theme.status_fg);
     return len as int;
   }
 
-  ansi_fg_256(mut w, COLOR_ACCENT);
+  ansi_fg_256(mut w, theme.accent);
   ansi_bold_on(mut w);
   let _ = w.push_ptr_len(ptr, len);
   ansi_intensity_normal(mut w);
-  ansi_fg_256(mut w, COLOR_STATUS_FG);
+  ansi_fg_256(mut w, theme.status_fg);
   return len as int;
 }
 
-fn push_path_pretty (mut w: &Writer, path: string, max: int) -> int {
+fn push_path_pretty (mut w: &Writer, theme: &Theme, path: string, max: int) -> int {
   if max <= 0 {
     return 0;
   }
@@ -868,25 +2329,25 @@ fn push_path_pretty (mut w: &Writer, path: string, max: int) -> int {
   }
 
   if len <= (max as i64) {
-    return push_path_slice_pretty(mut w, ptr, len);
+    return push_path_slice_pretty(mut w, theme, ptr, len);
   }
 
   if max <= 3 {
     let take: i64 = max as i64;
     let tail_ptr: u64 = ptr + ((len - take) as u64);
-    return push_path_slice_pretty(mut w, tail_ptr, take);
+    return push_path_slice_pretty(mut w, theme, tail_ptr, take);
   }
 
   let tail_len: i64 = (max - 3) as i64;
   let tail_ptr: u64 = ptr + ((len - tail_len) as u64);
 
-  ansi_fg_256(mut w, COLOR_STATUS_DIM);
+  ansi_fg_256(mut w, theme.status_dim);
   ansi_dim_on(mut w);
   let _ = w.push_str("...");
   ansi_intensity_normal(mut w);
-  ansi_fg_256(mut w, COLOR_STATUS_FG);
+  ansi_fg_256(mut w, theme.status_fg);
 
-  let tail_n: int = push_path_slice_pretty(mut w, tail_ptr, tail_len);
+  let tail_n: int = push_path_slice_pretty(mut w, theme, tail_ptr, tail_len);
   return 3 + tail_n;
 }
 
@@ -949,6 +2410,7 @@ fn status_right_len (
 
 fn push_status_right (
   mut w: &Writer,
+  theme: &Theme,
   top_line: i64,
   top_off: i64,
   file_len: i64,
@@ -965,9 +2427,9 @@ fn push_status_right (
   show_pct: bool
 ) -> void {
   // Ln
-  ansi_fg_256(mut w, COLOR_STATUS_DIM);
+  ansi_fg_256(mut w, theme.status_dim);
   let _ = w.push_str("Ln ");
-  ansi_fg_256(mut w, COLOR_STATUS_FG);
+  ansi_fg_256(mut w, theme.status_fg);
   if top_line >= 0 {
     let _ = w.push_i64(top_line + 1);
   } else {
@@ -975,33 +2437,33 @@ fn push_status_right (
   }
 
   if show_off {
-    status_sep(mut w);
-    ansi_fg_256(mut w, COLOR_STATUS_DIM);
+    status_sep(mut w, theme);
+    ansi_fg_256(mut w, theme.status_dim);
     let _ = w.push_str("Off ");
-    ansi_fg_256(mut w, COLOR_STATUS_FG);
+    ansi_fg_256(mut w, theme.status_fg);
     let _ = w.push_i64(top_off);
   }
 
   if show_pct && file_len > 0 {
-    status_sep(mut w);
+    status_sep(mut w, theme);
     let pct: i64 = (top_off * 100) / file_len;
-    ansi_fg_256(mut w, COLOR_BRAND);
+    ansi_fg_256(mut w, theme.brand);
     let _ = w.push_i64(pct);
     let _ = w.push_str("%");
-    ansi_fg_256(mut w, COLOR_STATUS_FG);
+    ansi_fg_256(mut w, theme.status_fg);
   }
 
   if show_lines && lines > 0 {
-    status_sep(mut w);
-    ansi_fg_256(mut w, COLOR_STATUS_DIM);
+    status_sep(mut w, theme);
+    ansi_fg_256(mut w, theme.status_dim);
     let _ = w.push_str("L ");
-    ansi_fg_256(mut w, COLOR_STATUS_FG);
+    ansi_fg_256(mut w, theme.status_fg);
     let _ = w.push_i64(lines);
   }
 
   if show_index && !indexed_done {
-    status_sep(mut w);
-    ansi_fg_256(mut w, COLOR_WARN);
+    status_sep(mut w, theme);
+    ansi_fg_256(mut w, theme.warn);
     let _ = w.push_str("idx ");
     if file_len > 0 && scan_off > 0 {
       let ipct: i64 = (scan_off * 100) / file_len;
@@ -1010,31 +2472,33 @@ fn push_status_right (
     } else {
       let _ = w.push_str("...");
     }
-    ansi_fg_256(mut w, COLOR_STATUS_FG);
+    ansi_fg_256(mut w, theme.status_fg);
   }
 
   if show_mode {
-    status_sep(mut w);
+    status_sep(mut w, theme);
     if use_regex {
-      ansi_fg_256(mut w, COLOR_MODE_REGEX);
+      ansi_fg_256(mut w, theme.mode_regex);
       let _ = w.push_str("re");
     } else {
-      ansi_fg_256(mut w, COLOR_BRAND);
+      ansi_fg_256(mut w, theme.brand);
       let _ = w.push_str("str");
     }
     if ignore_case {
-      ansi_fg_256(mut w, COLOR_ACCENT);
+      ansi_fg_256(mut w, theme.accent);
       let _ = w.push_str(" i");
     }
-    ansi_fg_256(mut w, COLOR_STATUS_FG);
+    ansi_fg_256(mut w, theme.status_fg);
   }
 
   if alert != 0 {
-    status_sep(mut w);
-    if alert == 4 {
-      ansi_fg_256(mut w, COLOR_WARN);
+    status_sep(mut w, theme);
+    if alert == ALERT_COPIED {
+      ansi_fg_256(mut w, theme.brand);
+    } else if alert == 4 || alert == 7 {
+      ansi_fg_256(mut w, theme.warn);
     } else {
-      ansi_fg_256(mut w, COLOR_ERROR);
+      ansi_fg_256(mut w, theme.err);
     }
     let _ = w.push_str("[");
     if alert == 1 {
@@ -1047,16 +2511,34 @@ fn push_status_right (
       let _ = w.push_str("searching");
     } else if alert == 5 {
       let _ = w.push_str("not found");
+    } else if alert == 6 {
+      let _ = w.push_str("bad cmd");
+    } else if alert == 7 {
+      let _ = w.push_str("goto idx");
+    } else if alert == 8 {
+      let _ = w.push_str("line range");
+    } else if alert == ALERT_TAB_RANGE {
+      let _ = w.push_str("tab range");
+    } else if alert == ALERT_OPEN_FAILED {
+      let _ = w.push_str("open failed");
+    } else if alert == ALERT_COPIED {
+      let _ = w.push_str("copied");
+    } else if alert == ALERT_COPY_TOO_BIG {
+      let _ = w.push_str("copy too big");
+    } else if alert == ALERT_COPY_FAILED {
+      let _ = w.push_str("copy failed");
     } else {
       let _ = w.push_str("error");
     }
     let _ = w.push_str("]");
-    ansi_fg_256(mut w, COLOR_STATUS_FG);
+    ansi_fg_256(mut w, theme.status_fg);
   }
 }
 
 fn draw_help (
   mut w: &Writer,
+  theme: &Theme,
+  start_row: int,
   content_rows: int,
   cols: int,
   use_regex: bool,
@@ -1071,12 +2553,12 @@ fn draw_help (
 
   // Header.
   if r < content_rows {
-    ansi_move(mut w, r + 1, 1);
-    ansi_fg_256(mut w, COLOR_BRAND);
+    ansi_move(mut w, start_row + r, 1);
+    ansi_fg_256(mut w, theme.brand);
     ansi_bold_on(mut w);
     let _ = w.push_str("sage");
     ansi_intensity_normal(mut w);
-    ansi_fg_256(mut w, COLOR_STATUS_DIM);
+    ansi_fg_256(mut w, theme.status_dim);
     let _ = w.push_str(" — a fast, ergonomic terminal pager");
     ansi_reset(mut w);
     ansi_clear_eol(mut w);
@@ -1085,22 +2567,22 @@ fn draw_help (
 
   // Mode line.
   if r < content_rows {
-    ansi_move(mut w, r + 1, 1);
-    ansi_fg_256(mut w, COLOR_STATUS_DIM);
+    ansi_move(mut w, start_row + r, 1);
+    ansi_fg_256(mut w, theme.status_dim);
     let _ = w.push_str("Mode: ");
     if use_regex {
-      ansi_fg_256(mut w, COLOR_MODE_REGEX);
+      ansi_fg_256(mut w, theme.mode_regex);
       let _ = w.push_str("re");
     } else {
-      ansi_fg_256(mut w, COLOR_BRAND);
+      ansi_fg_256(mut w, theme.brand);
       let _ = w.push_str("str");
     }
     if ignore_case {
-      ansi_fg_256(mut w, COLOR_ACCENT);
+      ansi_fg_256(mut w, theme.accent);
       let _ = w.push_str(" i");
     }
     if unsafe_raw {
-      ansi_fg_256(mut w, COLOR_ERROR);
+      ansi_fg_256(mut w, theme.err);
       let _ = w.push_str(" raw");
     }
     ansi_reset(mut w);
@@ -1110,217 +2592,125 @@ fn draw_help (
 
   // Blank.
   if r < content_rows {
-    ansi_move(mut w, r + 1, 1);
+    ansi_move(mut w, start_row + r, 1);
     ansi_clear_eol(mut w);
     r = r + 1;
   }
 
   // Navigation.
   if r < content_rows {
-    ansi_move(mut w, r + 1, 1);
-    ansi_fg_256(mut w, COLOR_ACCENT);
+    ansi_move(mut w, start_row + r, 1);
+    ansi_fg_256(mut w, theme.accent);
     ansi_bold_on(mut w);
     let _ = w.push_str("Navigation");
     ansi_reset(mut w);
     ansi_clear_eol(mut w);
     r = r + 1;
   }
-  if r < content_rows {
-    ansi_move(mut w, r + 1, 1);
-    let _ = w.push_str("  ");
-    ansi_fg_256(mut w, COLOR_ACCENT);
-    ansi_bold_on(mut w);
-    let _ = w.push_str("j / Down");
-    ansi_reset(mut w);
-    let _ = w.push_str("      down one visual line");
-    ansi_clear_eol(mut w);
-    r = r + 1;
-  }
-  if r < content_rows {
-    ansi_move(mut w, r + 1, 1);
-    let _ = w.push_str("  ");
-    ansi_fg_256(mut w, COLOR_ACCENT);
-    ansi_bold_on(mut w);
-    let _ = w.push_str("k / Up");
-    ansi_reset(mut w);
-    let _ = w.push_str("        up one visual line");
-    ansi_clear_eol(mut w);
-    r = r + 1;
-  }
-  if r < content_rows {
-    ansi_move(mut w, r + 1, 1);
-    let _ = w.push_str("  ");
-    ansi_fg_256(mut w, COLOR_ACCENT);
-    ansi_bold_on(mut w);
-    let _ = w.push_str("Space / PgDn");
-    ansi_reset(mut w);
-    let _ = w.push_str(" down one page");
-    ansi_clear_eol(mut w);
-    r = r + 1;
-  }
-  if r < content_rows {
-    ansi_move(mut w, r + 1, 1);
-    let _ = w.push_str("  ");
-    ansi_fg_256(mut w, COLOR_ACCENT);
-    ansi_bold_on(mut w);
-    let _ = w.push_str("b / PgUp");
-    ansi_reset(mut w);
-    let _ = w.push_str("     up one page");
-    ansi_clear_eol(mut w);
-    r = r + 1;
-  }
-  if r < content_rows {
-    ansi_move(mut w, r + 1, 1);
-    let _ = w.push_str("  ");
-    ansi_fg_256(mut w, COLOR_ACCENT);
-    ansi_bold_on(mut w);
-    let _ = w.push_str("Right / Left");
-    ansi_reset(mut w);
-    let _ = w.push_str(" forward/back a page");
-    ansi_clear_eol(mut w);
-    r = r + 1;
-  }
-  if r < content_rows {
-    ansi_move(mut w, r + 1, 1);
-    let _ = w.push_str("  ");
-    ansi_fg_256(mut w, COLOR_ACCENT);
-    ansi_bold_on(mut w);
-    let _ = w.push_str("g / Home");
-    ansi_reset(mut w);
-    let _ = w.push_str("    top");
-    ansi_clear_eol(mut w);
-    r = r + 1;
-  }
-  if r < content_rows {
-    ansi_move(mut w, r + 1, 1);
-    let _ = w.push_str("  ");
-    ansi_fg_256(mut w, COLOR_ACCENT);
-    ansi_bold_on(mut w);
-    let _ = w.push_str("G / End");
-    ansi_reset(mut w);
-    let _ = w.push_str("     bottom");
-    ansi_clear_eol(mut w);
-    r = r + 1;
-  }
+  let help_desc_col: int = 28;
+  if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.accent, "j / d / Down", help_desc_col, "down one visual line"); r = r + 1; }
+  if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.accent, "k / u / Up", help_desc_col, "up one visual line"); r = r + 1; }
+  if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.accent, "MouseWheel", help_desc_col, "scroll (if enabled)"); r = r + 1; }
+  if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.accent, "Space / PgDn / Ctrl-D", help_desc_col, "down one page"); r = r + 1; }
+  if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.accent, "b / PgUp / Ctrl-U", help_desc_col, "up one page"); r = r + 1; }
+  if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.accent, "Right / Left", help_desc_col, "forward/back a page"); r = r + 1; }
+  if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.accent, "Tab / Shift-Tab", help_desc_col, "next/prev file tab"); r = r + 1; }
+  if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.accent, "MouseClickTab", help_desc_col, "switch to clicked tab"); r = r + 1; }
+  if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.accent, "0-9", help_desc_col, "jump to tab N"); r = r + 1; }
+  if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.accent, "g / Home", help_desc_col, "top"); r = r + 1; }
+  if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.accent, "G / End", help_desc_col, "bottom"); r = r + 1; }
 
   // Blank.
   if r < content_rows {
-    ansi_move(mut w, r + 1, 1);
+    ansi_move(mut w, start_row + r, 1);
     ansi_clear_eol(mut w);
     r = r + 1;
   }
 
   // Search.
   if r < content_rows {
-    ansi_move(mut w, r + 1, 1);
-    ansi_fg_256(mut w, COLOR_ACCENT);
+    ansi_move(mut w, start_row + r, 1);
+    ansi_fg_256(mut w, theme.accent);
     ansi_bold_on(mut w);
     let _ = w.push_str("Search");
     ansi_reset(mut w);
     ansi_clear_eol(mut w);
     r = r + 1;
   }
+  if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.accent, "/", help_desc_col, "enter a query (jumps to first match)"); r = r + 1; }
+  if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.accent, "n", help_desc_col, "next match"); r = r + 1; }
+  if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.accent, "p", help_desc_col, "previous match"); r = r + 1; }
+
+  // Blank.
   if r < content_rows {
-    ansi_move(mut w, r + 1, 1);
-    let _ = w.push_str("  ");
-    ansi_fg_256(mut w, COLOR_ACCENT);
-    ansi_bold_on(mut w);
-    let _ = w.push_str("/");
-    ansi_reset(mut w);
-    let _ = w.push_str("            enter a query (jumps to first match)");
-    ansi_clear_eol(mut w);
-    r = r + 1;
-  }
-  if r < content_rows {
-    ansi_move(mut w, r + 1, 1);
-    let _ = w.push_str("  ");
-    ansi_fg_256(mut w, COLOR_ACCENT);
-    ansi_bold_on(mut w);
-    let _ = w.push_str("n");
-    ansi_reset(mut w);
-    let _ = w.push_str("            next match");
+    ansi_move(mut w, start_row + r, 1);
     ansi_clear_eol(mut w);
     r = r + 1;
   }
 
+  // Commands.
+  if r < content_rows {
+    ansi_move(mut w, start_row + r, 1);
+    ansi_fg_256(mut w, theme.accent);
+    ansi_bold_on(mut w);
+    let _ = w.push_str("Commands");
+    ansi_reset(mut w);
+    ansi_clear_eol(mut w);
+    r = r + 1;
+  }
+  if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.accent, ":", help_desc_col, "goto line (:<n>), :tab <n>/:t<n>, :bn/:bp, :q quit"); r = r + 1; }
+  if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.accent, "L", help_desc_col, "toggle line-number gutter"); r = r + 1; }
+  if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.accent, "MouseDrag", help_desc_col, "select text (gutter excluded)"); r = r + 1; }
+  if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.accent, "Ctrl-C", help_desc_col, "copy selection (OSC 52)"); r = r + 1; }
+
   // Blank.
   if r < content_rows {
-    ansi_move(mut w, r + 1, 1);
+    ansi_move(mut w, start_row + r, 1);
     ansi_clear_eol(mut w);
     r = r + 1;
   }
 
   // Options.
   if r < content_rows {
-    ansi_move(mut w, r + 1, 1);
-    ansi_fg_256(mut w, COLOR_ACCENT);
+    ansi_move(mut w, start_row + r, 1);
+    ansi_fg_256(mut w, theme.accent);
     ansi_bold_on(mut w);
     let _ = w.push_str("Options");
     ansi_reset(mut w);
     ansi_clear_eol(mut w);
     r = r + 1;
   }
-  if r < content_rows {
-    ansi_move(mut w, r + 1, 1);
-    let _ = w.push_str("  ");
-    ansi_fg_256(mut w, COLOR_BRAND);
-    ansi_bold_on(mut w);
-    let _ = w.push_str("-R");
-    ansi_reset(mut w);
-    let _ = w.push_str("           regex search");
-    ansi_clear_eol(mut w);
-    r = r + 1;
-  }
-  if r < content_rows {
-    ansi_move(mut w, r + 1, 1);
-    let _ = w.push_str("  ");
-    ansi_fg_256(mut w, COLOR_BRAND);
-    ansi_bold_on(mut w);
-    let _ = w.push_str("-i");
-    ansi_reset(mut w);
-    let _ = w.push_str("           ignore case (ASCII for literal search)");
-    ansi_clear_eol(mut w);
-    r = r + 1;
-  }
-  if r < content_rows {
-    ansi_move(mut w, r + 1, 1);
-    let _ = w.push_str("  ");
-    ansi_fg_256(mut w, COLOR_ERROR);
-    ansi_bold_on(mut w);
-    let _ = w.push_str("--raw");
-    ansi_reset(mut w);
-    let _ = w.push_str("        render bytes as-is (unsafe)");
-    ansi_clear_eol(mut w);
-    r = r + 1;
-  }
+  if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.brand, "-R", help_desc_col, "regex search"); r = r + 1; }
+  if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.brand, "-i", help_desc_col, "ignore case (ASCII for literal search)"); r = r + 1; }
+  if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.err, "--raw", help_desc_col, "render bytes as-is (unsafe)"); r = r + 1; }
 
   // Footer.
   if r < content_rows {
-    ansi_move(mut w, r + 1, 1);
+    ansi_move(mut w, start_row + r, 1);
     ansi_clear_eol(mut w);
     r = r + 1;
   }
   if r < content_rows {
-    ansi_move(mut w, r + 1, 1);
-    ansi_fg_256(mut w, COLOR_STATUS_DIM);
+    ansi_move(mut w, start_row + r, 1);
+    ansi_fg_256(mut w, theme.status_dim);
     let _ = w.push_str("Press ");
-    ansi_fg_256(mut w, COLOR_ACCENT);
+    ansi_fg_256(mut w, theme.accent);
     ansi_bold_on(mut w);
     let _ = w.push_str("?");
     ansi_reset(mut w);
-    ansi_fg_256(mut w, COLOR_STATUS_DIM);
+    ansi_fg_256(mut w, theme.status_dim);
     let _ = w.push_str(" or ");
-    ansi_fg_256(mut w, COLOR_ACCENT);
+    ansi_fg_256(mut w, theme.accent);
     ansi_bold_on(mut w);
     let _ = w.push_str("h");
     ansi_reset(mut w);
-    ansi_fg_256(mut w, COLOR_STATUS_DIM);
+    ansi_fg_256(mut w, theme.status_dim);
     let _ = w.push_str(" to close help, ");
-    ansi_fg_256(mut w, COLOR_ACCENT);
+    ansi_fg_256(mut w, theme.accent);
     ansi_bold_on(mut w);
     let _ = w.push_str("q");
     ansi_reset(mut w);
-    ansi_fg_256(mut w, COLOR_STATUS_DIM);
+    ansi_fg_256(mut w, theme.status_dim);
     let _ = w.push_str(" to quit.");
     ansi_reset(mut w);
     ansi_clear_eol(mut w);
@@ -1329,14 +2719,427 @@ fn draw_help (
 
   // Fill remaining rows so stale content never shows through.
   while r < content_rows {
-    ansi_move(mut w, r + 1, 1);
+    ansi_move(mut w, start_row + r, 1);
     ansi_clear_eol(mut w);
     r = r + 1;
   }
 }
 
+fn draw_help_row (mut w: &Writer, _theme: &Theme, row: int, key_color: int, key: string, desc_col: int, desc: string) -> void {
+  ansi_move(mut w, row, 1);
+
+  // Two-space indent like many CLIs.
+  push_spaces(mut w, 2);
+  ansi_fg_256(mut w, key_color);
+  ansi_bold_on(mut w);
+  let _ = w.push_str(key);
+  ansi_reset(mut w);
+
+  // Pad so descriptions align in a column.
+  let klen: i64 = std::runtime::mem::string_len(key);
+  var cols_used: int = 2 + (klen as int);
+  var pad: int = (desc_col - 1) - cols_used;
+  if pad < 1 { pad = 1; }
+  push_spaces(mut w, pad);
+
+  let _ = w.push_str(desc);
+  ansi_clear_eol(mut w);
+}
+
+fn tab_label_est_len (path: string, idx: i64, name_max: int) -> int {
+  let name_ptr: u64 = std::runtime::mem::string_ptr(path);
+  let name_len: i64 = std::runtime::mem::string_len(path);
+  if name_ptr == 0 || name_len <= 0 {
+    return 2 + digits_i64(idx) + 1 + 1; // " <idx>:? "
+  }
+
+  let slash: u64 = memrchr(name_ptr, 47, name_len); // '/'
+  var base_len: i64 = name_len;
+  if slash != 0 {
+    let dir_len: i64 = ((slash - name_ptr) as i64) + 1;
+    base_len = name_len - dir_len;
+  }
+
+  let shown: int = if (base_len as int) > name_max { name_max } else { base_len as int };
+  return 2 + digits_i64(idx) + 1 + shown; // " <idx>:<name> "
+}
+
+fn draw_tabs (
+  mut w: &Writer,
+  theme: &Theme,
+  cols: int,
+  tabs_ptr: u64,
+  tabs_cap: i64,
+  tabs_len: i64,
+  active_tab: i64
+) -> void {
+  if cols <= 0 {
+    return;
+  }
+  if tabs_ptr == 0 || tabs_len <= 1 {
+    return;
+  }
+
+  // Keep it ASCII-only so "columns" == "bytes" in our renderer.
+  let TAB_NAME_MAX: int = 24;
+
+  ansi_move(mut w, 1, 1);
+  ansi_status_on(mut w, theme);
+  ansi_clear_eol(mut w);
+  ansi_move(mut w, 1, 1);
+
+  var used: int = 0;
+
+  // Leading space.
+  let _ = w.push_u8(32);
+  used = used + 1;
+
+  var a: i64 = active_tab;
+  if a < 0 || a >= tabs_len {
+    a = 0;
+  }
+
+  let sep_len: int = 1; // "│" (spaces come from segments)
+  var start: i64 = a;
+  var end: i64 = a + 1;
+  var total: int = tab_label_est_len((tabs_ptr as TabState[](tabs_cap as int))[a].path, a, TAB_NAME_MAX);
+
+  while true {
+    var did: bool = false;
+
+    if start > 0 {
+      let i0: i64 = start - 1;
+      let add: int = sep_len + tab_label_est_len((tabs_ptr as TabState[](tabs_cap as int))[i0].path, i0, TAB_NAME_MAX);
+      if (used + total + add) <= cols {
+        start = i0;
+        total = total + add;
+        did = true;
+      }
+    }
+
+    if end < tabs_len {
+      let i1: i64 = end;
+      let add2: int = sep_len + tab_label_est_len((tabs_ptr as TabState[](tabs_cap as int))[i1].path, i1, TAB_NAME_MAX);
+      if (used + total + add2) <= cols {
+        end = i1 + 1;
+        total = total + add2;
+        did = true;
+      }
+    }
+
+    if !did { break; }
+  }
+
+  var i: i64 = start;
+  var first: bool = true;
+  while i < end && used < cols {
+    if !first {
+      if used >= cols { break; }
+      ansi_fg_256(mut w, theme.status_dim);
+      let _ = w.push_str("│");
+      ansi_fg_256(mut w, theme.status_fg);
+      used = used + 1;
+    }
+
+    let tab: TabState = (tabs_ptr as TabState[](tabs_cap as int))[i];
+    let path: string = tab.path;
+    let path_ptr: u64 = std::runtime::mem::string_ptr(path);
+    let path_len: i64 = std::runtime::mem::string_len(path);
+
+    // Segment styling.
+    if i == a {
+      if w.color {
+        ansi_bg_256(mut w, theme.accent);
+        ansi_fg_256(mut w, theme.match_fg);
+        ansi_bold_on(mut w);
+      } else {
+        // Mark active tab in no-color mode.
+        if (used + 1) < cols {
+          let _ = w.push_str("[");
+          used = used + 1;
+        }
+      }
+    } else {
+      if w.color {
+        ansi_bg_256(mut w, theme.status_bg);
+        ansi_fg_256(mut w, theme.status_dim);
+      }
+    }
+
+    // Compute basename.
+    var base_ptr2: u64 = path_ptr;
+    var base_len2: i64 = path_len;
+    if path_ptr != 0 && path_len > 0 {
+      let slash2: u64 = memrchr(path_ptr, 47, path_len);
+      if slash2 != 0 {
+        let dir_len2: i64 = ((slash2 - path_ptr) as i64) + 1;
+        base_ptr2 = path_ptr + (dir_len2 as u64);
+        base_len2 = path_len - dir_len2;
+      }
+    }
+
+    // Remaining space; ensure the segment never wraps.
+    let remaining: int = cols - used;
+    let idx_digits: int = digits_i64(i);
+    let fixed: int = 2 + idx_digits + 1; // " " + <idx> + ":" + (name...) + " "
+    var name_max: int = remaining - fixed;
+    if name_max > TAB_NAME_MAX { name_max = TAB_NAME_MAX; }
+    if name_max < 0 { name_max = 0; }
+
+    // " "
+    if used < cols {
+      let _ = w.push_u8(32);
+      used = used + 1;
+    }
+
+    // "<idx>:"
+    if (used + idx_digits + 1) <= cols {
+      let _ = w.push_i64(i);
+      let _ = w.push_u8(58); // ':'
+      used = used + idx_digits + 1;
+    } else {
+      break;
+    }
+
+    // "<name>" (tail-truncated).
+    if name_max > 0 && base_ptr2 != 0 && base_len2 > 0 && used < cols {
+      if (base_len2 as int) <= name_max {
+        let _ = w.push_ptr_len(base_ptr2, base_len2);
+        used = used + (base_len2 as int);
+      } else if name_max <= 3 {
+        let take: int = name_max;
+        let start_off: i64 = base_len2 - (take as i64);
+        let _ = w.push_ptr_len(base_ptr2 + (start_off as u64), take as i64);
+        used = used + take;
+      } else {
+        // "..." + tail
+        let tail: int = name_max - 3;
+        let start_off2: i64 = base_len2 - (tail as i64);
+        let _ = w.push_str("...");
+        let _ = w.push_ptr_len(base_ptr2 + (start_off2 as u64), tail as i64);
+        used = used + name_max;
+      }
+    }
+
+    // trailing " "
+    if used < cols {
+      let _ = w.push_u8(32);
+      used = used + 1;
+    }
+
+    // Reset segment styling back to the bar.
+    if i == a {
+      if w.color {
+        ansi_intensity_normal(mut w);
+        ansi_status_on(mut w, theme);
+      } else {
+        if used < cols {
+          let _ = w.push_str("]");
+          used = used + 1;
+        }
+      }
+    } else {
+      if w.color {
+        ansi_status_on(mut w, theme);
+      }
+    }
+
+    first = false;
+    i = i + 1;
+  }
+
+  ansi_reset(mut w);
+}
+
+fn tab_hit_test (
+  cols: int,
+  tabs_ptr: u64,
+  tabs_cap: i64,
+  tabs_len: i64,
+  active_tab: i64,
+  use_color: bool,
+  x: int
+) -> i64 {
+  if cols <= 0 {
+    return -1;
+  }
+  if tabs_ptr == 0 || tabs_len <= 1 {
+    return -1;
+  }
+  if x < 1 || x > cols {
+    return -1;
+  }
+
+  // Must match `draw_tabs` so clicks map to visible labels.
+  let TAB_NAME_MAX: int = 24;
+  let sep_len: int = 1; // "│"
+
+  var a: i64 = active_tab;
+  if a < 0 || a >= tabs_len {
+    a = 0;
+  }
+
+  // Visible window selection (same heuristic as `draw_tabs`).
+  var used0: int = 1; // leading space in the bar
+  var start: i64 = a;
+  var end: i64 = a + 1;
+  var total: int = tab_label_est_len((tabs_ptr as TabState[](tabs_cap as int))[a].path, a, TAB_NAME_MAX);
+
+  while true {
+    var did: bool = false;
+
+    if start > 0 {
+      let i0: i64 = start - 1;
+      let add: int = sep_len + tab_label_est_len((tabs_ptr as TabState[](tabs_cap as int))[i0].path, i0, TAB_NAME_MAX);
+      if (used0 + total + add) <= cols {
+        start = i0;
+        total = total + add;
+        did = true;
+      }
+    }
+
+    if end < tabs_len {
+      let i1: i64 = end;
+      let add2: int = sep_len + tab_label_est_len((tabs_ptr as TabState[](tabs_cap as int))[i1].path, i1, TAB_NAME_MAX);
+      if (used0 + total + add2) <= cols {
+        end = i1 + 1;
+        total = total + add2;
+        did = true;
+      }
+    }
+
+    if !did { break; }
+  }
+
+  // Simulate the same output widths to map a click `x` to a tab index.
+  var used: int = 0;
+  var pos: int = 1;
+
+  // Leading space (not part of any tab).
+  if pos > cols { return -1; }
+  pos = pos + 1;
+  used = used + 1;
+
+  var i: i64 = start;
+  var first: bool = true;
+  while i < end && used < cols {
+    if !first {
+      if used >= cols { break; }
+      // Separator.
+      if pos == x {
+        return -1;
+      }
+      pos = pos + 1;
+      used = used + 1;
+    }
+
+    let tab: TabState = (tabs_ptr as TabState[](tabs_cap as int))[i];
+    let path: string = tab.path;
+    let path_ptr: u64 = std::runtime::mem::string_ptr(path);
+    let path_len: i64 = std::runtime::mem::string_len(path);
+
+    // Active marker in no-color mode: optional '[' ... ']'.
+    if i == a && !use_color {
+      // `draw_tabs` uses: if (used + 1) < cols { "[" }
+      if (used + 1) < cols {
+        if pos == x {
+          return i;
+        }
+        pos = pos + 1;
+        used = used + 1;
+      }
+    }
+
+    // Compute basename length (for truncation).
+    var base_len2: i64 = path_len;
+    if path_ptr != 0 && path_len > 0 {
+      let slash2: u64 = memrchr(path_ptr, 47, path_len);
+      if slash2 != 0 {
+        let dir_len2: i64 = ((slash2 - path_ptr) as i64) + 1;
+        base_len2 = path_len - dir_len2;
+      }
+    }
+
+    let remaining: int = cols - used;
+    let idx_digits: int = digits_i64(i);
+    let fixed: int = 2 + idx_digits + 1; // " " + <idx> + ":" + (name...) + " "
+    var name_max: int = remaining - fixed;
+    if name_max > TAB_NAME_MAX { name_max = TAB_NAME_MAX; }
+    if name_max < 0 { name_max = 0; }
+
+    // Segment leading space.
+    if used < cols {
+      if pos == x {
+        return i;
+      }
+      pos = pos + 1;
+      used = used + 1;
+    } else {
+      break;
+    }
+
+    // "<idx>:"
+    if (used + idx_digits + 1) <= cols {
+      // digits + ':' occupy idx_digits+1 columns starting at `pos`.
+      let end_pos: int = pos + idx_digits; // inclusive (colon)
+      if x >= pos && x <= end_pos {
+        return i;
+      }
+      pos = pos + idx_digits + 1;
+      used = used + idx_digits + 1;
+    } else {
+      break;
+    }
+
+    // "<name>" (tail-truncated).
+    var name_out: int = 0;
+    if name_max > 0 && base_len2 > 0 && used < cols {
+      if (base_len2 as int) <= name_max {
+        name_out = base_len2 as int;
+      } else {
+        // Either: take last N chars (when name_max <= 3), or "..."+tail.
+        // In both cases we output exactly `name_max` columns.
+        name_out = name_max;
+      }
+    }
+    if name_out > 0 {
+      if x >= pos && x <= (pos + name_out - 1) {
+        return i;
+      }
+      pos = pos + name_out;
+      used = used + name_out;
+    }
+
+    // trailing space
+    if used < cols {
+      if pos == x {
+        return i;
+      }
+      pos = pos + 1;
+      used = used + 1;
+    }
+
+    if i == a && !use_color {
+      // `draw_tabs` uses: if used < cols { "]" }
+      if used < cols {
+        if pos == x {
+          return i;
+        }
+        pos = pos + 1;
+        used = used + 1;
+      }
+    }
+
+    first = false;
+    i = i + 1;
+  }
+
+  return -1;
+}
+
 fn status_line (
   mut w: &Writer,
+  theme: &Theme,
   path: string,
   top_line: i64,
   top_off: i64,
@@ -1353,7 +3156,7 @@ fn status_line (
   ansi_move(mut w, rows, 1);
 
   // Fill the entire status row with a consistent background.
-  ansi_status_on(mut w);
+  ansi_status_on(mut w, theme);
   ansi_clear_eol(mut w);
   ansi_move(mut w, rows, 1);
 
@@ -1398,16 +3201,16 @@ fn status_line (
 
   // Left: " sage │ <path>"
   let _ = w.push_str(" ");
-  ansi_fg_256(mut w, COLOR_BRAND);
+  ansi_fg_256(mut w, theme.brand);
   ansi_bold_on(mut w);
   let _ = w.push_str("sage");
   ansi_intensity_normal(mut w);
-  ansi_fg_256(mut w, COLOR_STATUS_FG);
-  ansi_fg_256(mut w, COLOR_STATUS_DIM);
+  ansi_fg_256(mut w, theme.status_fg);
+  ansi_fg_256(mut w, theme.status_dim);
   let _ = w.push_str(" │ ");
-  ansi_fg_256(mut w, COLOR_STATUS_FG);
+  ansi_fg_256(mut w, theme.status_fg);
 
-  let path_len: int = push_path_pretty(mut w, path, path_avail);
+  let path_len: int = push_path_pretty(mut w, theme, path, path_avail);
 
   // Padding to right-aligned fields.
   var used_left: int = left_fixed + path_len;
@@ -1422,6 +3225,7 @@ fn status_line (
   // Right.
   push_status_right(
     mut w,
+    theme,
     top_line, top_off, file_len, indexed_done, scan_off, lines, alert,
     use_regex, ignore_case,
     show_off, show_lines, show_index, show_mode, show_pct
@@ -1637,7 +3441,44 @@ fn line_number_for_offset (file_ptr: u64, checkpoints: &VecU64, off: i64) -> i64
   return line;
 }
 
-fn push_tail_trunc (mut w: &Writer, ptr: u64, len: i64, max: int) -> int {
+fn offset_for_line (file_ptr: u64, file_len: i64, checkpoints: &VecU64, line0: i64) -> i64? {
+  // Returns the byte offset for the start of `line0` (0-based), if the
+  // checkpoint table contains the needed base entry.
+  if file_ptr == 0 || file_len < 0 {
+    return None;
+  }
+  if line0 <= 0 {
+    return Some(0);
+  }
+  if checkpoints.len <= 0 {
+    return None;
+  }
+
+  let ck: i64 = line0 / INDEX_STRIDE;
+  if ck < 0 || ck >= checkpoints.len {
+    return None;
+  }
+  let base_line: i64 = ck * INDEX_STRIDE;
+  var cur: i64 = checkpoints.get(ck) as i64;
+  if cur < 0 { cur = 0; }
+  if cur > file_len { cur = file_len; }
+
+  var line: i64 = base_line;
+  while line < line0 {
+    if cur >= file_len {
+      return None;
+    }
+    let p: u64 = memchr(file_ptr + (cur as u64), 10, file_len - cur);
+    if p == 0 {
+      return None;
+    }
+    cur = ((p - file_ptr) as i64) + 1;
+    line = line + 1;
+  }
+  return Some(cur);
+}
+
+fn push_tail_trunc (mut w: &Writer, theme: &Theme, ptr: u64, len: i64, max: int) -> int {
   if ptr == 0 || len <= 0 || max <= 0 {
     return 0;
   }
@@ -1656,32 +3497,176 @@ fn push_tail_trunc (mut w: &Writer, ptr: u64, len: i64, max: int) -> int {
   let tail_len: i64 = (max - 3) as i64;
   let tail_ptr: u64 = ptr + ((len - tail_len) as u64);
 
-  ansi_fg_256(mut w, COLOR_STATUS_DIM);
+  ansi_fg_256(mut w, theme.status_dim);
   ansi_dim_on(mut w);
   let _ = w.push_str("...");
   ansi_intensity_normal(mut w);
-  ansi_fg_256(mut w, COLOR_STATUS_FG);
+  ansi_fg_256(mut w, theme.status_fg);
 
   let _ = w.push_ptr_len(tail_ptr, tail_len);
   return max;
 }
 
+let SEARCH_HIST_MAX: i64 = 64;
+
+fn search_hist_count (idx: &VecU64) -> i64 {
+  if idx.len <= 0 {
+    return 0;
+  }
+  return idx.len / 2;
+}
+
+fn search_hist_entry (data: &BufferU8, idx: &VecU64, i: i64) -> ByteSlice {
+  let n: i64 = search_hist_count(idx);
+  if i < 0 || i >= n || data.ptr == 0 {
+    return ByteSlice{ ptr: 0, len: 0 };
+  }
+  let start: i64 = idx.get(i * 2) as i64;
+  let len: i64 = idx.get((i * 2) + 1) as i64;
+  if start < 0 || len <= 0 || (start + len) > data.len {
+    return ByteSlice{ ptr: 0, len: 0 };
+  }
+  return ByteSlice{ ptr: data.ptr + (start as u64), len: len };
+}
+
+fn search_hist_copy_to (data: &BufferU8, idx: &VecU64, i: i64, mut out: &BufferU8) -> void {
+  out.clear();
+  let e = search_hist_entry(data, idx, i);
+  if e.ptr == 0 || e.len <= 0 {
+    return;
+  }
+  let _ = out.push_ptr_len(e.ptr, e.len);
+}
+
+fn search_hist_equals_entry (data: &BufferU8, idx: &VecU64, i: i64, q_ptr: u64, q_len: i64) -> bool {
+  if q_ptr == 0 || q_len <= 0 {
+    return false;
+  }
+  let e = search_hist_entry(data, idx, i);
+  if e.ptr == 0 || e.len != q_len {
+    return false;
+  }
+  return bytes_match_exact(e.ptr, q_ptr, q_len);
+}
+
+fn search_hist_drop_oldest (mut data: &BufferU8, mut idx: &VecU64) -> void {
+  let n: i64 = search_hist_count(idx);
+  if n <= 0 {
+    return;
+  }
+  if n == 1 {
+    data.clear();
+    idx.len = 0;
+    return;
+  }
+
+  let new_data_opt: BufferU8? = BufferU8.init(data.len);
+  if new_data_opt == None {
+    data.clear();
+    idx.len = 0;
+    return;
+  }
+  let mut new_data: BufferU8 = match (new_data_opt) { Some(v) => v, None => BufferU8.empty() };
+
+  let new_idx_opt: VecU64? = VecU64.init(idx.len);
+  if new_idx_opt == None {
+    data.clear();
+    idx.len = 0;
+    return;
+  }
+  let mut new_idx: VecU64 = match (new_idx_opt) { Some(v) => v, None => VecU64.empty() };
+
+  var i: i64 = 1;
+  while i < n {
+    let e = search_hist_entry(data, idx, i);
+    if e.ptr == 0 || e.len <= 0 {
+      i = i + 1;
+      continue;
+    }
+    let start2: i64 = new_data.len;
+    let err1 = new_data.push_ptr_len(e.ptr, e.len);
+    if err1 != None {
+      break;
+    }
+    let _ = new_idx.push(start2 as u64);
+    let _ = new_idx.push(e.len as u64);
+    i = i + 1;
+  }
+
+  // Move new buffers into place (transfer ownership without double-free).
+  std::runtime::mem::free(data.ptr);
+  data.ptr = new_data.ptr;
+  data.len = new_data.len;
+  data.cap = new_data.cap;
+  new_data.ptr = 0;
+  new_data.len = 0;
+  new_data.cap = 0;
+
+  std::runtime::mem::free(idx.ptr);
+  idx.ptr = new_idx.ptr;
+  idx.len = new_idx.len;
+  idx.cap = new_idx.cap;
+  new_idx.ptr = 0;
+  new_idx.len = 0;
+  new_idx.cap = 0;
+}
+
+fn search_hist_push (mut data: &BufferU8, mut idx: &VecU64, q_ptr: u64, q_len: i64) -> void {
+  if q_ptr == 0 || q_len <= 0 {
+    return;
+  }
+
+  // Dedupe adjacent duplicates.
+  let n: i64 = search_hist_count(idx);
+  if n > 0 {
+    if search_hist_equals_entry(data, idx, n - 1, q_ptr, q_len) {
+      return;
+    }
+  }
+
+  if n >= SEARCH_HIST_MAX {
+    search_hist_drop_oldest(mut data, mut idx);
+  }
+
+  let start: i64 = data.len;
+  let err1 = data.push_ptr_len(q_ptr, q_len);
+  if err1 != None {
+    return;
+  }
+  let err2 = idx.push(start as u64);
+  if err2 != None {
+    return;
+  }
+  let err3 = idx.push(q_len as u64);
+  if err3 != None {
+    return;
+  }
+}
+
 fn prompt_search (
   mut w: &Writer,
+  theme: &Theme,
   mut inp: &Input,
   rows: int,
   cols: int,
+  hist_data: &BufferU8,
+  hist_idx: &VecU64,
   mut out_query: &BufferU8,
   use_regex: bool,
   ignore_case: bool
 ) -> bool {
   out_query.clear();
 
+  let scratch_opt: BufferU8? = BufferU8.init(256);
+  let mut scratch: BufferU8 = match (scratch_opt) { Some(v) => v, None => BufferU8.empty() };
+  var scratch_valid: bool = false;
+  var hist_pos: i64 = -1;
+
   while true {
     // Draw only the status line prompt.
     w.clear();
     ansi_move(mut w, rows, 1);
-    ansi_status_on(mut w);
+    ansi_status_on(mut w, theme);
     ansi_clear_eol(mut w);
     ansi_move(mut w, rows, 1);
 
@@ -1716,14 +3701,14 @@ fn prompt_search (
 
     // Left: " /<query>"
     let _ = w.push_u8(32);
-    ansi_fg_256(mut w, COLOR_ACCENT);
+    ansi_fg_256(mut w, theme.accent);
     ansi_bold_on(mut w);
     let _ = w.push_str("/");
     ansi_intensity_normal(mut w);
-    ansi_fg_256(mut w, COLOR_STATUS_FG);
+    ansi_fg_256(mut w, theme.status_fg);
 
     let bytes = out_query.as_bytes();
-    let q_len: int = push_tail_trunc(mut w, bytes.ptr, bytes.len, q_avail);
+    let q_len: int = push_tail_trunc(mut w, theme, bytes.ptr, bytes.len, q_avail);
 
     // Pad.
     var used_left: int = left_fixed + q_len;
@@ -1736,20 +3721,20 @@ fn prompt_search (
     }
 
     // Right hint.
-    ansi_fg_256(mut w, COLOR_STATUS_DIM);
+    ansi_fg_256(mut w, theme.status_dim);
     if hint_kind >= 1 {
       if use_regex {
-        ansi_fg_256(mut w, COLOR_MODE_REGEX);
+        ansi_fg_256(mut w, theme.mode_regex);
         let _ = w.push_str("re");
       } else {
-        ansi_fg_256(mut w, COLOR_BRAND);
+        ansi_fg_256(mut w, theme.brand);
         let _ = w.push_str("str");
       }
       if ignore_case {
-        ansi_fg_256(mut w, COLOR_ACCENT);
+        ansi_fg_256(mut w, theme.accent);
         let _ = w.push_str(" i");
       }
-      ansi_fg_256(mut w, COLOR_STATUS_DIM);
+      ansi_fg_256(mut w, theme.status_dim);
       let _ = w.push_str("  ");
     }
     if hint_kind == 2 {
@@ -1771,7 +3756,48 @@ fn prompt_search (
     if k.kind == KEY_ENTER {
       return out_query.len > 0;
     }
+    if k.kind == KEY_UP || k.kind == KEY_DOWN {
+      let n: i64 = search_hist_count(hist_idx);
+      if n <= 0 {
+        continue;
+      }
+
+      if k.kind == KEY_UP {
+        if hist_pos == -1 {
+          // Enter history browsing: capture the current input as scratch.
+          scratch.clear();
+          let _ = scratch.push_ptr_len(out_query.ptr, out_query.len);
+          scratch_valid = true;
+          hist_pos = n - 1;
+        } else if hist_pos > 0 {
+          hist_pos = hist_pos - 1;
+        }
+        search_hist_copy_to(hist_data, hist_idx, hist_pos, mut out_query);
+        continue;
+      }
+
+      // KEY_DOWN
+      if hist_pos == -1 {
+        continue;
+      }
+      if hist_pos < (n - 1) {
+        hist_pos = hist_pos + 1;
+        search_hist_copy_to(hist_data, hist_idx, hist_pos, mut out_query);
+      } else {
+        // Past newest: restore scratch.
+        if scratch_valid {
+          out_query.clear();
+          let _ = out_query.push_ptr_len(scratch.ptr, scratch.len);
+        }
+        hist_pos = -1;
+      }
+      continue;
+    }
     if k.kind == KEY_BACKSPACE {
+      if hist_pos != -1 {
+        hist_pos = -1;
+        scratch_valid = false;
+      }
       let _ = out_query.pop_u8();
       continue;
     }
@@ -1779,7 +3805,106 @@ fn prompt_search (
     if k.kind == KEY_BYTE {
       let b: u8 = k.byte;
       if b >= 32 && b != 127 {
+        if hist_pos != -1 {
+          hist_pos = -1;
+          scratch_valid = false;
+        }
         let _ = out_query.push_u8(b);
+      }
+    }
+  }
+  return false;
+}
+
+fn prompt_cmd (
+  mut w: &Writer,
+  theme: &Theme,
+  mut inp: &Input,
+  rows: int,
+  cols: int,
+  mut out_cmd: &BufferU8
+) -> bool {
+  out_cmd.clear();
+
+  while true {
+    // Draw only the status line prompt.
+    w.clear();
+    ansi_move(mut w, rows, 1);
+    ansi_status_on(mut w, theme);
+    ansi_clear_eol(mut w);
+    ansi_move(mut w, rows, 1);
+
+    // Right-side hint (depends on available width).
+    var hint_kind: int = 0;
+    // 0: "ESC cancel"
+    // 1: "Enter cmd  ESC cancel"
+    if cols >= 55 {
+      hint_kind = 1;
+    } else {
+      hint_kind = 0;
+    }
+
+    var right_len: int = 10; // "ESC cancel"
+    if hint_kind == 1 {
+      right_len = 9 + 2 + 10; // "Enter cmd" + "  " + "ESC cancel"
+    }
+
+    let min_space: int = 1;
+    let left_fixed: int = 2; // " " + ":"
+    var cmd_avail: int = cols - right_len - left_fixed - min_space;
+    if cmd_avail < 0 { cmd_avail = 0; }
+
+    // Left: " :<cmd>"
+    let _ = w.push_u8(32);
+    ansi_fg_256(mut w, theme.accent);
+    ansi_bold_on(mut w);
+    let _ = w.push_str(":");
+    ansi_intensity_normal(mut w);
+    ansi_fg_256(mut w, theme.status_fg);
+
+    let bytes = out_cmd.as_bytes();
+    let cmd_len: int = push_tail_trunc(mut w, theme, bytes.ptr, bytes.len, cmd_avail);
+
+    // Pad.
+    var used_left: int = left_fixed + cmd_len;
+    var spaces: int = cols - right_len - used_left;
+    if spaces < min_space { spaces = min_space; }
+    var s: int = 0;
+    while s < spaces {
+      let _ = w.push_u8(32);
+      s = s + 1;
+    }
+
+    // Right hint.
+    ansi_fg_256(mut w, theme.status_dim);
+    if hint_kind == 1 {
+      let _ = w.push_str("Enter cmd  ");
+    }
+    let _ = w.push_str("ESC cancel");
+
+    ansi_clear_eol(mut w);
+    ansi_reset(mut w);
+    let _ = w.flush();
+
+    let k: Key = read_key_timeout(mut inp, -1);
+    if k.kind == KEY_EOF {
+      return false;
+    }
+    if k.kind == KEY_ESC {
+      return false;
+    }
+    if k.kind == KEY_ENTER {
+      return out_cmd.len > 0;
+    }
+    if k.kind == KEY_BACKSPACE {
+      let _ = out_cmd.pop_u8();
+      continue;
+    }
+
+    if k.kind == KEY_BYTE {
+      let b: u8 = k.byte;
+      if b >= 32 && b != 127 {
+        let _ = out_cmd.push_u8(b);
       }
     }
   }
@@ -1915,7 +4040,7 @@ fn find_next_literal_nocase (file: &MappedFile, q_ptr: u64, q_len: i64, start_of
   return find_next_literal_nocase_phase(file, q_ptr, q_len, 0, start_off);
 }
 
-fn find_next_regex_with_re (file: &MappedFile, re: &std::regex::RegExp, start_off: i64) -> FindNextResult {
+fn find_next_regex_with_re (file: &MappedFile, re: &RegExp, start_off: i64) -> FindNextResult {
   if start_off < 0 || start_off >= file.len {
     return FindNextResult{ kind: FIND_NOT_FOUND, off: 0, end: 0 };
   }
@@ -1923,28 +4048,36 @@ fn find_next_regex_with_re (file: &MappedFile, re: &std::regex::RegExp, start_of
     return FindNextResult{ kind: FIND_REGEX_TOO_LARGE, off: 0, end: 0 };
   }
 
-  let input: string = std::runtime::mem::string_from_ptr_len(file.ptr, file.len as int);
+  let out_ptr: u64 = std::runtime::mem::alloc(RT_EXEC_OUT_BYTES);
+  if out_ptr == 0 {
+    return FindNextResult{ kind: FIND_REGEX_RUNTIME_FAILED, off: 0, end: 0 };
+  }
 
-  let r1: std::regex::ExecResult = std::regex::search(re.as_regexp(), input, start_off as int);
-  if r1.code == std::regex::EXEC_MATCH {
+  let r1: ExecResult = search_scratch(re, file.ptr, file.len, start_off as int, out_ptr);
+  if r1.code == EXEC_MATCH {
+    std::runtime::mem::free(out_ptr);
     return FindNextResult{ kind: FIND_FOUND, off: r1.start as i64, end: r1.end as i64 };
   }
-  if r1.code != std::regex::EXEC_NO_MATCH {
+  if r1.code != EXEC_NO_MATCH {
+    std::runtime::mem::free(out_ptr);
     return FindNextResult{ kind: FIND_REGEX_RUNTIME_FAILED, off: 0, end: 0 };
   }
 
-  let r2: std::regex::ExecResult = std::regex::search(re.as_regexp(), input, 0);
-  if r2.code == std::regex::EXEC_MATCH {
+  let r2: ExecResult = search_scratch(re, file.ptr, file.len, 0, out_ptr);
+  if r2.code == EXEC_MATCH {
+    std::runtime::mem::free(out_ptr);
     return FindNextResult{ kind: FIND_FOUND, off: r2.start as i64, end: r2.end as i64 };
   }
-  if r2.code != std::regex::EXEC_NO_MATCH {
+  if r2.code != EXEC_NO_MATCH {
+    std::runtime::mem::free(out_ptr);
     return FindNextResult{ kind: FIND_REGEX_RUNTIME_FAILED, off: 0, end: 0 };
   }
 
+  std::runtime::mem::free(out_ptr);
   return FindNextResult{ kind: FIND_NOT_FOUND, off: 0, end: 0 };
 }
 
-fn find_next_regex_range_chunked (file: &MappedFile, re: &std::regex::RegExp, start: i64, end: i64) -> FindNextResult {
+fn find_next_regex_range_chunked (file: &MappedFile, re: &RegExp, start: i64, end: i64) -> FindNextResult {
   if file.ptr == 0 || file.len <= 0 {
     return FindNextResult{ kind: FIND_NOT_FOUND, off: 0, end: 0 };
   }
@@ -1955,6 +4088,11 @@ fn find_next_regex_range_chunked (file: &MappedFile, re: &std::regex::RegExp, st
   if e > file.len { e = file.len; }
   if s >= e {
     return FindNextResult{ kind: FIND_NOT_FOUND, off: 0, end: 0 };
+  }
+
+  let out_ptr: u64 = std::runtime::mem::alloc(RT_EXEC_OUT_BYTES);
+  if out_ptr == 0 {
+    return FindNextResult{ kind: FIND_REGEX_RUNTIME_FAILED, off: 0, end: 0 };
   }
 
   var step: i64 = REGEX_CHUNK_BYTES - REGEX_CHUNK_OVERLAP;
@@ -1971,14 +4109,15 @@ fn find_next_regex_range_chunked (file: &MappedFile, re: &std::regex::RegExp, st
       break;
     }
 
-    let input: string = std::runtime::mem::string_from_ptr_len(file.ptr + (base as u64), take as int);
-    let r: std::regex::ExecResult = std::regex::search(re.as_regexp(), input, 0);
-    if r.code == std::regex::EXEC_MATCH {
+    let r: ExecResult = exec_scratch(re, file.ptr + (base as u64), take, out_ptr);
+    if r.code == EXEC_MATCH {
       let mo: i64 = base + (r.start as i64);
       let me: i64 = base + (r.end as i64);
+      std::runtime::mem::free(out_ptr);
       return FindNextResult{ kind: FIND_FOUND, off: mo, end: me };
     }
-    if r.code != std::regex::EXEC_NO_MATCH {
+    if r.code != EXEC_NO_MATCH {
+      std::runtime::mem::free(out_ptr);
       return FindNextResult{ kind: FIND_REGEX_RUNTIME_FAILED, off: 0, end: 0 };
     }
 
@@ -1988,10 +4127,11 @@ fn find_next_regex_range_chunked (file: &MappedFile, re: &std::regex::RegExp, st
     base = base + step;
   }
 
+  std::runtime::mem::free(out_ptr);
   return FindNextResult{ kind: FIND_NOT_FOUND, off: 0, end: 0 };
 }
 
-fn find_next_regex_any (file: &MappedFile, re: &std::regex::RegExp, start_off: i64) -> FindNextResult {
+fn find_next_regex_any (file: &MappedFile, re: &RegExp, start_off: i64) -> FindNextResult {
   if file.ptr == 0 || file.len <= 0 {
     return FindNextResult{ kind: FIND_NOT_FOUND, off: 0, end: 0 };
   }
@@ -2034,9 +4174,258 @@ fn find_next_literal_any (file: &MappedFile, query: &BufferU8, start_off: i64, i
   return FindNextResult{ kind: FIND_NOT_FOUND, off: 0, end: 0 };
 }
 
+fn bytes_match_exact (hay_ptr: u64, needle_ptr: u64, needle_len: i64) -> bool {
+  if needle_ptr == 0 || needle_len <= 0 {
+    return false;
+  }
+  var i: i64 = 0;
+  while i < needle_len {
+    if std::runtime::mem::load_u8(hay_ptr, i) != std::runtime::mem::load_u8(needle_ptr, i) {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+fn find_prev_literal_phase (file: &MappedFile, q_ptr: u64, q_len: i64, start: i64, end: i64) -> i64? {
+  if q_len <= 0 || q_ptr == 0 {
+    return None;
+  }
+  if file.ptr == 0 || file.len <= 0 {
+    return None;
+  }
+  if start < 0 || end > file.len || start >= end {
+    return None;
+  }
+  if (end - start) < q_len {
+    return None;
+  }
+
+  let q0: u8 = std::runtime::mem::load_u8(q_ptr, 0);
+  let limit: i64 = end - q_len;
+
+  var cur_end: i64 = limit;
+  while cur_end >= start {
+    let search_len: i64 = (cur_end - start) + 1;
+    let p: u64 = memrchr(file.ptr + (start as u64), q0 as int, search_len);
+    if p == 0 {
+      return None;
+    }
+    let pos: i64 = (p - file.ptr) as i64;
+    if bytes_match_exact(file.ptr + (pos as u64), q_ptr, q_len) {
+      return Some(pos);
+    }
+    if pos <= start {
+      break;
+    }
+    cur_end = pos - 1;
+  }
+  return None;
+}
+
+fn find_prev_literal_nocase_phase (file: &MappedFile, q_ptr: u64, q_len: i64, start: i64, end: i64) -> i64? {
+  if q_len <= 0 || q_ptr == 0 {
+    return None;
+  }
+  if file.ptr == 0 || file.len <= 0 {
+    return None;
+  }
+  if start < 0 || end > file.len || start >= end {
+    return None;
+  }
+  if (end - start) < q_len {
+    return None;
+  }
+
+  let q0: u8 = std::runtime::mem::load_u8(q_ptr, 0);
+  let q0_l: u8 = lower_ascii(q0);
+  var q0_u: u8 = q0_l;
+  if q0_l >= 97 && q0_l <= 122 {
+    q0_u = q0_l - 32;
+  }
+
+  let limit: i64 = end - q_len;
+  var cur_end: i64 = limit;
+  while cur_end >= start {
+    let search_len: i64 = (cur_end - start) + 1;
+    var p: u64 = memrchr(file.ptr + (start as u64), q0_l as int, search_len);
+    if q0_u != q0_l {
+      let p2: u64 = memrchr(file.ptr + (start as u64), q0_u as int, search_len);
+      if p == 0 {
+        p = p2;
+      } else if p2 != 0 && p2 > p {
+        p = p2;
+      }
+    }
+    if p == 0 {
+      return None;
+    }
+    let pos: i64 = (p - file.ptr) as i64;
+    if bytes_match_nocase(file.ptr + (pos as u64), q_ptr, q_len) {
+      return Some(pos);
+    }
+    if pos <= start {
+      break;
+    }
+    cur_end = pos - 1;
+  }
+  return None;
+}
+
+fn find_prev_literal_any (file: &MappedFile, query: &BufferU8, end_off: i64, ignore_case: bool) -> FindNextResult {
+  if file.ptr == 0 || file.len <= 0 {
+    return FindNextResult{ kind: FIND_NOT_FOUND, off: 0, end: 0 };
+  }
+  let q = query.as_bytes();
+  if q.ptr == 0 || q.len <= 0 {
+    return FindNextResult{ kind: FIND_INVALID_QUERY, off: 0, end: 0 };
+  }
+
+  var end0: i64 = end_off;
+  if end0 < 0 { end0 = 0; }
+  if end0 > file.len { end0 = file.len; }
+
+  var m_opt: i64? = None;
+  if end0 > 0 {
+    if ignore_case {
+      m_opt = find_prev_literal_nocase_phase(file, q.ptr, q.len, 0, end0);
+    } else {
+      m_opt = find_prev_literal_phase(file, q.ptr, q.len, 0, end0);
+    }
+  }
+  if m_opt == None && end0 < file.len {
+    if ignore_case {
+      m_opt = find_prev_literal_nocase_phase(file, q.ptr, q.len, end0, file.len);
+    } else {
+      m_opt = find_prev_literal_phase(file, q.ptr, q.len, end0, file.len);
+    }
+  }
+
+  if m_opt != None {
+    let m: i64 = match (m_opt) { Some(v) => v, None => 0 };
+    return FindNextResult{ kind: FIND_FOUND, off: m, end: m + q.len };
+  }
+  return FindNextResult{ kind: FIND_NOT_FOUND, off: 0, end: 0 };
+}
+
+fn find_prev_regex_range_chunked (file: &MappedFile, re: &RegExp, start: i64, end: i64) -> FindNextResult {
+  if file.ptr == 0 || file.len <= 0 {
+    return FindNextResult{ kind: FIND_NOT_FOUND, off: 0, end: 0 };
+  }
+
+  var s: i64 = start;
+  var e: i64 = end;
+  if s < 0 { s = 0; }
+  if e > file.len { e = file.len; }
+  if s >= e {
+    return FindNextResult{ kind: FIND_NOT_FOUND, off: 0, end: 0 };
+  }
+
+  let out_ptr: u64 = std::runtime::mem::alloc(RT_EXEC_OUT_BYTES);
+  if out_ptr == 0 {
+    return FindNextResult{ kind: FIND_REGEX_RUNTIME_FAILED, off: 0, end: 0 };
+  }
+
+  var step: i64 = REGEX_CHUNK_BYTES - REGEX_CHUNK_OVERLAP;
+  if step <= 0 {
+    step = REGEX_CHUNK_BYTES;
+  }
+
+  var base_end: i64 = e;
+  while base_end > s {
+    var chunk_start: i64 = base_end - REGEX_CHUNK_BYTES;
+    if chunk_start < s { chunk_start = s; }
+    let take0: i64 = base_end - chunk_start;
+    let take: i64 = if take0 > MAX_I32 { MAX_I32 } else { take0 };
+    if take <= 0 {
+      break;
+    }
+
+    var last_s: i64 = -1;
+    var last_e: i64 = -1;
+    var pos: int = 0;
+    var iters: int = 0;
+    while iters < 100000 {
+      let r: ExecResult = search_scratch(re, file.ptr + (chunk_start as u64), take, pos, out_ptr);
+      if r.code == EXEC_MATCH {
+        last_s = r.start as i64;
+        last_e = r.end as i64;
+        if r.end == r.start {
+          pos = r.end + 1;
+        } else {
+          pos = r.end;
+        }
+        if (pos as i64) >= take {
+          break;
+        }
+        iters = iters + 1;
+        continue;
+      }
+      if r.code == EXEC_NO_MATCH {
+        break;
+      }
+      std::runtime::mem::free(out_ptr);
+      return FindNextResult{ kind: FIND_REGEX_RUNTIME_FAILED, off: 0, end: 0 };
+    }
+    if iters >= 100000 {
+      std::runtime::mem::free(out_ptr);
+      return FindNextResult{ kind: FIND_REGEX_RUNTIME_FAILED, off: 0, end: 0 };
+    }
+
+    if last_s >= 0 && last_e > last_s {
+      let mo: i64 = chunk_start + last_s;
+      let me: i64 = chunk_start + last_e;
+      std::runtime::mem::free(out_ptr);
+      return FindNextResult{ kind: FIND_FOUND, off: mo, end: me };
+    }
+
+    if chunk_start == s {
+      break;
+    }
+    base_end = chunk_start + REGEX_CHUNK_OVERLAP;
+    if base_end >= e {
+      base_end = chunk_start;
+    }
+    if base_end >= (base_end + step) {
+      base_end = chunk_start;
+    }
+  }
+
+  std::runtime::mem::free(out_ptr);
+  return FindNextResult{ kind: FIND_NOT_FOUND, off: 0, end: 0 };
+}
+
+fn find_prev_regex_any (file: &MappedFile, re: &RegExp, end_off: i64) -> FindNextResult {
+  if file.ptr == 0 || file.len <= 0 {
+    return FindNextResult{ kind: FIND_NOT_FOUND, off: 0, end: 0 };
+  }
+
+  var end0: i64 = end_off;
+  if end0 < 0 { end0 = 0; }
+  if end0 > file.len { end0 = file.len; }
+
+  let r1: FindNextResult = find_prev_regex_range_chunked(file, re, 0, end0);
+  if r1.kind != FIND_NOT_FOUND {
+    return r1;
+  }
+  if end0 < file.len {
+    return find_prev_regex_range_chunked(file, re, end0, file.len);
+  }
+  return FindNextResult{ kind: FIND_NOT_FOUND, off: 0, end: 0 };
+}
+
 export async fn main (argc: int, argv: u64) -> int {
   let args: Args = Args.init(argc, argv);
-  let cfg_opt: Config? = parse_cli(args);
+
+  // Load config file (`.sagerc`) first, then let CLI flags override.
+  let rc: RcChoice = scan_rc_choice(args);
+  let mut base: Config = cfg_default();
+  if !rc.no_rc {
+    load_sagerc(mut base, rc.path);
+  }
+
+  let cfg_opt: Config? = parse_cli(args, base);
   if cfg_opt == None {
     print_help();
     return 2;
@@ -2051,10 +4440,27 @@ export async fn main (argc: int, argv: u64) -> int {
     print_version();
     return 0;
   }
+  if cfg.compile_cache {
+    return compile_cache(cfg.verbose);
+  }
+  if cfg.list_syntax {
+    return list_compiled_syntax(cfg.verbose);
+  }
 
   let stdout_is_tty: bool = isatty(std::runtime::posix::io::STDOUT_FD) == 1;
 
   task {
+    let vw_opt: Writer? = if cfg.verbose { Writer.stderr(false, 8192) } else { None };
+    let v_on: bool = vw_opt != None;
+    let mut vw: Writer = match (vw_opt) {
+      Some(v) => v,
+      None => Writer{ fd: -1, color: false, buf: BufferU8.empty() }
+    };
+
+    if v_on {
+      vlog_line(mut vw, "verbose=on");
+    }
+
     if cfg.index_only {
       let stdin_is_tty: bool = isatty(std::runtime::posix::io::STDIN_FD) == 1;
       let path: string = match (cfg.path) { Some(v) => v, None => "-" };
@@ -2075,6 +4481,15 @@ export async fn main (argc: int, argv: u64) -> int {
         return 2;
       }
       let mut file: MappedFile = match (m_opt) { Some(v) => v, None => MappedFile{ ptr: 0, len: 0 } };
+
+      if v_on {
+        let _ = vw.push_str("sage[v] index-only path=");
+        let _ = vw.push_str(path);
+        let _ = vw.push_str(" bytes=");
+        let _ = vw.push_i64(file.len);
+        let _ = vw.push_u8(10);
+        let _ = vw.flush();
+      }
 
       let start_ns_opt: i64? = std::runtime::posix::time::monotonic_now_ns();
       let start_ns: i64 = match (start_ns_opt) { Some(v) => v, None => 0 };
@@ -2149,11 +4564,23 @@ export async fn main (argc: int, argv: u64) -> int {
         let _ = w.flush();
       }
 
+      if v_on {
+        let _ = vw.push_str("sage[v] index-only done lines=");
+        let _ = vw.push_i64(idx.lines);
+        let _ = vw.push_str(" time_ms=");
+        let _ = vw.push_i64(ms);
+        let _ = vw.push_u8(10);
+        let _ = vw.flush();
+      }
+
       return 0;
     }
 
     // If stdout isn't a TTY, behave like a pass-through filter.
     if !stdout_is_tty {
+      if v_on {
+        vlog_line(mut vw, "stdout_tty=false (pass-through mode)");
+      }
       let p: string = match (cfg.path) { Some(v) => v, None => "-" };
       if p == "-" {
         return stream_stdin_to_stdout();
@@ -2163,13 +4590,94 @@ export async fn main (argc: int, argv: u64) -> int {
 
     // Determine input source.
     let stdin_is_tty: bool = isatty(std::runtime::posix::io::STDIN_FD) == 1;
-    let path: string = match (cfg.path) { Some(v) => v, None => "-" };
-    if path == "-" && stdin_is_tty {
-      print_help();
-      return 0;
+    if v_on {
+      if stdin_is_tty { vlog_line(mut vw, "stdin_tty=true"); }
+      else { vlog_line(mut vw, "stdin_tty=false (pager mode: keys via /dev/tty)"); }
+    }
+    let tabs_opt: Tabs? = tabs_collect(args);
+    if tabs_opt == None {
+      let _ = write_str(std::runtime::posix::io::STDERR_FD, "sage: out of memory\n");
+      return 2;
+    }
+    let mut tabs: Tabs = match (tabs_opt) { Some(v) => v, None => Tabs{ ptr: 0, len: 0, cap: 0 } };
+
+    if v_on {
+      let _ = vw.push_str("sage[v] tabs=");
+      let _ = vw.push_i64(tabs.len);
+      let _ = vw.push_u8(10);
+      let _ = vw.flush();
     }
 
-    // Map file contents.
+    // No explicit paths: read stdin (if piped) or show help (if interactive).
+    if tabs.len <= 0 {
+      if stdin_is_tty {
+        tabs_free(mut tabs);
+        print_help();
+        return 0;
+      }
+      if tabs.ptr == 0 || tabs.cap <= 0 {
+        tabs_free(mut tabs);
+        let _ = write_str(std::runtime::posix::io::STDERR_FD, "sage: out of memory\n");
+        return 2;
+      }
+      (tabs.ptr as TabState[](tabs.cap as int))[0] = TabState{ path: "-", top_off: 0, gutter_on: false };
+      tabs.len = 1;
+    }
+
+    // Preserve legacy behavior: `sage -` with an interactive stdin prints help
+    // rather than blocking on input until EOF.
+    if tabs.len == 1 && stdin_is_tty {
+      let t0: TabState = (tabs.ptr as TabState[](tabs.cap as int))[0];
+      if t0.path == "-" {
+        tabs_free(mut tabs);
+        print_help();
+        return 0;
+      }
+    }
+
+    // Disallow mixing stdin ("-") with multiple files (stdin is single-use).
+    if tabs.len > 1 {
+      var t_i: i64 = 0;
+      while t_i < tabs.len {
+        let t: TabState = (tabs.ptr as TabState[](tabs.cap as int))[t_i];
+        if t.path == "-" {
+          tabs_free(mut tabs);
+          let _ = write_str(std::runtime::posix::io::STDERR_FD, "sage: cannot combine '-' with multiple files\n");
+          return 2;
+        }
+        t_i = t_i + 1;
+      }
+    }
+
+    // Initialize per-tab defaults.
+    var k_i: i64 = 0;
+    while k_i < tabs.len {
+      let mut t: TabState = (tabs.ptr as TabState[](tabs.cap as int))[k_i];
+      if cfg.gutter == GUTTER_ALWAYS {
+        t.gutter_on = true;
+      } else if cfg.gutter == GUTTER_NEVER {
+        t.gutter_on = false;
+      } else {
+        t.gutter_on = if t.path != "-" { has_syntax_for_path(t.path) } else { false };
+      }
+      (tabs.ptr as TabState[](tabs.cap as int))[k_i] = t;
+      k_i = k_i + 1;
+    }
+
+    var active_tab: i64 = 0;
+    var path: string = (tabs.ptr as TabState[](tabs.cap as int))[0].path;
+    var gutter_on: bool = (tabs.ptr as TabState[](tabs.cap as int))[0].gutter_on;
+
+    if v_on {
+      let _ = vw.push_str("sage[v] open path=");
+      let _ = vw.push_str(path);
+      let _ = vw.push_str(" gutter=");
+      if gutter_on { let _ = vw.push_str("on"); } else { let _ = vw.push_str("off"); }
+      let _ = vw.push_u8(10);
+      let _ = vw.flush();
+    }
+
+    // Map file contents for the active tab.
     var m_opt: MappedFile? = None;
     if path == "-" {
       m_opt = map_stdin_spool(cfg.allow_binary);
@@ -2177,25 +4685,48 @@ export async fn main (argc: int, argv: u64) -> int {
       m_opt = map_path(path, cfg.allow_binary);
     }
     if m_opt == None {
+      tabs_free(mut tabs);
       let _ = write_str(std::runtime::posix::io::STDERR_FD, "sage: failed to open input\n");
       return 2;
     }
     let mut file: MappedFile = match (m_opt) { Some(v) => v, None => MappedFile{ ptr: 0, len: 0 } };
 
+    if v_on {
+      let _ = vw.push_str("sage[v] mapped bytes=");
+      let _ = vw.push_i64(file.len);
+      let _ = vw.push_u8(10);
+      let _ = vw.flush();
+    }
+
     // Keyboard input fd: stdin if TTY, otherwise /dev/tty.
     var in_fd: int = std::runtime::posix::io::STDIN_FD;
     if !stdin_is_tty {
-      let fd2: int = std::runtime::posix::fs::open("/dev/tty", std::runtime::posix::fs::O_RDONLY, 0) as int;
+      // As a pager, stdin is a pipe. Some `man` setups deliver SIGTERM to the
+      // pager's process group on exit; ignore it to avoid noisy "Terminated".
+      ignore_sigterm();
+
+      // As a pager, stdin is a pipe; take input from the controlling TTY.
+      // Open read+write so termios/ioctl work reliably across platforms.
+      let fd2: int = std::runtime::posix::fs::open("/dev/tty", std::runtime::posix::fs::O_RDWR, 0) as int;
       if fd2 >= 0 {
         in_fd = fd2;
+      }
+      if v_on {
+        if in_fd == fd2 { vlog_line(mut vw, "input_fd=/dev/tty"); }
+        else { vlog_line(mut vw, "input_fd=stdin (failed to open /dev/tty)"); }
       }
     }
 
     let raw_opt: RawMode? = raw_mode_enable(in_fd);
     if raw_opt == None {
-      let _ = write_str(std::runtime::posix::io::STDERR_FD, "sage: failed to enable raw mode\n");
+      // If we can't enter raw mode (common in restricted exec contexts),
+      // fall back to a non-interactive "cat" mode so `man` still works.
+      if v_on {
+        vlog_line(mut vw, "raw_mode_enable failed; falling back to safe stream mode");
+      }
+      tabs_free(mut tabs);
       if in_fd != std::runtime::posix::io::STDIN_FD { let _ = std::runtime::posix::fs::close(in_fd); }
-      return 2;
+      return stream_safe_to_stdout(file.ptr, file.len, cfg.unsafe_raw, cfg.ansi);
     }
     let mut raw_mode: RawMode = match (raw_opt) { Some(v) => v, None => RawMode{ fd: -1, orig: 0, raw_ptr: 0, enabled: false } };
 
@@ -2212,10 +4743,28 @@ export async fn main (argc: int, argv: u64) -> int {
     // Pass through ANSI SGR sequences from content (for `man`, `git diff`, etc).
     // This is separate from UI coloring so `NO_COLOR` can disable the chrome
     // while still allowing formatted content.
-    let allow_ansi: bool = cfg.ansi;
+    var allow_ansi: bool = cfg.ansi;
+
+    // Syntax highlighting (optional, file-based).
+    var syn_active: bool = false;
+    let mut syn: Highlighter = highlighter_empty();
+    if cfg.syntax && use_color && !cfg.unsafe_raw && path != "-" {
+      let syn_opt: Highlighter? = load_for_path(path);
+      if syn_opt != None {
+        syn = match (syn_opt) { Some(v) => v, None => syn };
+        syn_active = true;
+        // Avoid mixing two independent SGR streams.
+        allow_ansi = false;
+      }
+    }
+    var style_ptr: u64 = 0;
+    var style_cap: i64 = 0;
+    var syn_state_top: HLState = hl_state_init();
+    var syn_state_off: i64 = 0;
 
     let w_opt: Writer? = Writer.stdout(use_color, 65536);
     if w_opt == None {
+      tabs_free(mut tabs);
       raw_mode.restore();
       if in_fd != std::runtime::posix::io::STDIN_FD { let _ = std::runtime::posix::fs::close(in_fd); }
       return 2;
@@ -2226,6 +4775,7 @@ export async fn main (argc: int, argv: u64) -> int {
     w.clear();
     let use_alt: bool = !cfg.no_alt_screen;
     if use_alt { ansi_alt_on(mut w); }
+    if cfg.mouse { ansi_mouse_on(mut w); }
     ansi_hide_cursor(mut w);
     ansi_home(mut w);
     ansi_csi(mut w);
@@ -2235,6 +4785,8 @@ export async fn main (argc: int, argv: u64) -> int {
 
     let inp_opt: Input? = input_init(in_fd);
     if inp_opt == None {
+      tabs_free(mut tabs);
+      ansi_mouse_off(mut w);
       ansi_show_cursor(mut w);
       if use_alt { ansi_alt_off(mut w); }
       let _ = w.flush();
@@ -2247,6 +4799,8 @@ export async fn main (argc: int, argv: u64) -> int {
     // Index channel + cancellation token.
     let ch_r = ChanU64.init(256);
     if ch_r.is_err() {
+      tabs_free(mut tabs);
+      ansi_mouse_off(mut w);
       ansi_show_cursor(mut w);
       if use_alt { ansi_alt_off(mut w); }
       let _ = w.flush();
@@ -2264,14 +4818,16 @@ export async fn main (argc: int, argv: u64) -> int {
     };
 
     // Spawn background indexer (line checkpoints + progress).
-    let idx_task = build_line_index(file.ptr, file.len, ch.borrow(), tok.borrow(), check_cancel);
+    var idx_task: Task(int) = build_line_index(file.ptr, file.len, ch.borrow(), tok.borrow(), check_cancel);
 
     // Local checkpoint table; always contains line 0 start.
     let off_opt: VecU64? = VecU64.init(4096);
     if off_opt == None {
+      tabs_free(mut tabs);
       tok.cancel();
       ch.close();
       let _ = yield idx_task;
+      ansi_mouse_off(mut w);
       ansi_show_cursor(mut w);
       if use_alt { ansi_alt_off(mut w); }
       let _ = w.flush();
@@ -2288,12 +4844,22 @@ export async fn main (argc: int, argv: u64) -> int {
     let mut last_query: BufferU8 = match (q_opt) { Some(v) => v, None => BufferU8.empty() };
     let tmp_opt: BufferU8? = BufferU8.init(256);
     let mut tmp_query: BufferU8 = match (tmp_opt) { Some(v) => v, None => BufferU8.empty() };
+    let cmd_opt: BufferU8? = BufferU8.init(128);
+    let mut tmp_cmd: BufferU8 = match (cmd_opt) { Some(v) => v, None => BufferU8.empty() };
+
+    // In-session search history for the `/` prompt.
+    let sh_data_opt: BufferU8? = BufferU8.init(1024);
+    let mut search_hist_data: BufferU8 = match (sh_data_opt) { Some(v) => v, None => BufferU8.empty() };
+    let sh_idx_opt: VecU64? = VecU64.init(SEARCH_HIST_MAX * 2);
+    let mut search_hist_idx: VecU64 = match (sh_idx_opt) { Some(v) => v, None => VecU64.empty() };
+
     var last_match_off: i64 = -1;
     var last_match_end: i64 = -1;
 
     // Cached compiled regex for repeated `n` searches (avoids recompile work).
     var regex_ready: bool = false;
-    let mut regex_re: std::regex::RegExp = std::regex::RegExp.empty();
+    let mut regex_re: RegExp = RegExp.empty();
+    var regex_out_ptr: u64 = 0;
 
     // Incremental search state (keeps UI responsive on huge inputs).
     var search: SearchState = SearchState{ active: false, phase: SEARCH_PHASE_FWD, cur: 0, end: 0, start_off: 0 };
@@ -2304,9 +4870,15 @@ export async fn main (argc: int, argv: u64) -> int {
     var need_redraw: bool = true;
     var last_rows: int = 0;
     var last_cols: int = 0;
+    var last_view_cols: int = 0;
     var last_status_scan_off: i64 = -1;
     var last_status_lines: i64 = -1;
     var last_status_alert: int = -1;
+    var pending_goto_line: i64 = -1;
+    var sel_on: bool = false;
+    var sel_anchor: i64 = -1;
+    var sel_head: i64 = -1;
+    var sel_drag: bool = false;
 
     // Main UI loop.
     while true {
@@ -2326,14 +4898,14 @@ export async fn main (argc: int, argv: u64) -> int {
             var flags: string = "";
             if cfg.ignore_case { flags = "i"; }
 
-            let cr: ReCompileResult = std::regex::RegExp.compile(pat, flags);
+            let cr: ReCompileResult = RegExp.compile(pat, flags);
             if cr.is_err() {
               alert = 2;
               search.active = false;
               regex_ready = false;
-              regex_re = std::regex::RegExp.empty();
+              regex_re = RegExp.empty();
             } else {
-              let re2: std::regex::RegExp = ReCompileResult.unwrap_or(cr, std::regex::RegExp.empty());
+              let re2: RegExp = ReCompileResult.unwrap_or(cr, RegExp.empty());
               regex_re = move re2;
               regex_ready = true;
             }
@@ -2366,23 +4938,29 @@ export async fn main (argc: int, argv: u64) -> int {
                   alert = 5;
                 }
               } else {
-                let input: string = std::runtime::mem::string_from_ptr_len(file.ptr + (search.cur as u64), take as int);
-                let r: std::regex::ExecResult = std::regex::search(regex_re.as_regexp(), input, 0);
-                if r.code == std::regex::EXEC_MATCH {
+                if regex_out_ptr == 0 {
+                  regex_out_ptr = std::runtime::mem::alloc(RT_EXEC_OUT_BYTES);
+                }
+                if regex_out_ptr == 0 {
+                  search.active = false;
+                  alert = 3;
+                } else {
+                  let r: ExecResult = exec_scratch(&regex_re, file.ptr + (search.cur as u64), take, regex_out_ptr);
+                  if r.code == EXEC_MATCH {
                   let m_off: i64 = search.cur + (r.start as i64);
                   let m_end: i64 = search.cur + (r.end as i64);
-                  let view_cols: int = if last_cols > 0 { last_cols } else { 80 };
+                  let view_cols: int = if last_view_cols > 0 { last_view_cols } else { 80 };
                   top_off = visual_start_for_offset(file.ptr, file.len, m_off, view_cols, cfg.unsafe_raw, allow_ansi);
                   last_match_off = m_off;
                   last_match_end = m_end;
                   search.active = false;
                   alert = 0;
                   need_redraw = true;
-                } else if r.code != std::regex::EXEC_NO_MATCH {
+                  } else if r.code != EXEC_NO_MATCH {
                   // Runtime failure (timeout, invalid input, etc).
                   search.active = false;
                   alert = 3;
-                } else {
+                  } else {
                   // No match: advance to next chunk.
                   var step: i64 = REGEX_CHUNK_BYTES - REGEX_CHUNK_OVERLAP;
                   if step <= 0 { step = REGEX_CHUNK_BYTES; }
@@ -2398,6 +4976,7 @@ export async fn main (argc: int, argv: u64) -> int {
                       search.active = false;
                       alert = 5;
                     }
+                  }
                   }
                 }
               }
@@ -2432,7 +5011,7 @@ export async fn main (argc: int, argv: u64) -> int {
 
               if found_off != None {
                 let m_off: i64 = match (found_off) { Some(v) => v, None => 0 };
-                let view_cols2: int = if last_cols > 0 { last_cols } else { 80 };
+                let view_cols2: int = if last_view_cols > 0 { last_view_cols } else { 80 };
                 top_off = visual_start_for_offset(file.ptr, file.len, m_off, view_cols2, cfg.unsafe_raw, allow_ansi);
                 last_match_off = m_off;
                 last_match_end = m_off + q_len;
@@ -2466,7 +5045,10 @@ export async fn main (argc: int, argv: u64) -> int {
       let sz: Size = get_size(in_fd);
       let rows: int = if sz.rows >= 2 { sz.rows } else { 2 };
       let cols: int = if sz.cols >= 10 { sz.cols } else { 10 };
-      let content_rows: int = rows - 1;
+      let want_tabs: bool = tabs.len > 1;
+      let tab_rows: int = if want_tabs && rows >= 3 { 1 } else { 0 };
+      let content_rows: int = rows - 1 - tab_rows;
+      let start_row: int = 1 + tab_rows;
 
       top_off = clamp_i64(top_off, 0, file.len);
 
@@ -2479,10 +5061,70 @@ export async fn main (argc: int, argv: u64) -> int {
         name = "(stdin)";
       }
 
-      if rows != last_rows || cols != last_cols {
+      // Compute view width (reserve space for gutter if enabled).
+      var gutter_render: bool = false;
+      var gutter_cols: int = 0;
+      var gutter_ln_width: int = 1;
+      var view_cols: int = cols;
+      if gutter_on {
+        // Estimate total lines for stable-ish gutter width while indexing.
+        var est_lines: i64 = 1;
+        if idx.done {
+          est_lines = if idx.lines > 0 { idx.lines } else { 1 };
+        } else if top_line >= 0 {
+          est_lines = top_line + (content_rows as i64) + 1;
+          if idx.lines > est_lines { est_lines = idx.lines; }
+        } else if idx.lines > 0 {
+          est_lines = idx.lines;
+        }
+        gutter_ln_width = digits_i64(est_lines);
+        gutter_cols = gutter_ln_width + 3; // "<n> │ "
+        view_cols = cols - gutter_cols;
+        if view_cols >= 10 {
+          gutter_render = true;
+        } else {
+          // Too narrow: keep content readable.
+          view_cols = cols;
+          gutter_render = false;
+        }
+      }
+
+      let resized: bool = rows != last_rows || cols != last_cols || view_cols != last_view_cols;
+      if resized {
+        // Keep `top_off` aligned to the new viewport width so Up/Down remains
+        // stable after resizes.
+        top_off = visual_start_for_offset(file.ptr, file.len, top_off, view_cols, cfg.unsafe_raw, allow_ansi);
+        top_off = clamp_i64(top_off, 0, file.len);
         need_redraw = true;
         last_rows = rows;
         last_cols = cols;
+        last_view_cols = view_cols;
+      }
+
+      // Pending `:<line>` jump: wait until the index has enough checkpoints.
+      if pending_goto_line >= 0 {
+        alert = 7;
+        let ck: i64 = pending_goto_line / INDEX_STRIDE;
+        if ck >= 0 && ck < offsets.len {
+          let off_opt: i64? = offset_for_line(file.ptr, file.len, &offsets, pending_goto_line);
+          if off_opt != None {
+            let off0: i64 = match (off_opt) { Some(v) => v, None => 0 };
+            top_off = visual_start_for_offset(file.ptr, file.len, off0, view_cols, cfg.unsafe_raw, allow_ansi);
+            pending_goto_line = -1;
+            alert = 0;
+            need_redraw = true;
+          } else {
+            // Out of range (checkpoint existed but line doesn't).
+            pending_goto_line = -1;
+            alert = 8;
+            need_redraw = true;
+          }
+        } else if idx.done {
+          // Index complete but the requested checkpoint never materialized -> out of range.
+          pending_goto_line = -1;
+          alert = 8;
+          need_redraw = true;
+        }
       }
 
       if need_redraw {
@@ -2490,15 +5132,49 @@ export async fn main (argc: int, argv: u64) -> int {
         w.clear();
         ansi_home(mut w);
 
+        if tab_rows > 0 {
+          draw_tabs(mut w, &cfg.theme, cols, tabs.ptr, tabs.cap, tabs.len, active_tab);
+        }
+
+        // Keep stateful comment/string highlighting aligned with `top_off` so
+        // wraps don't lose "inside string/comment" context.
+        if syn_active && file.ptr != 0 && file.len > 0 {
+          if syn_state_off != top_off {
+            if top_off > syn_state_off && (top_off - syn_state_off) <= (SYN_STATE_LOOKBACK_BYTES * 4) {
+              let delta: i64 = top_off - syn_state_off;
+              if delta > 0 {
+                hl_state_advance(&syn, mut syn_state_top, file.ptr + (syn_state_off as u64), delta);
+              }
+            } else {
+              syn_state_top = hl_state_init();
+              var start0: i64 = top_off - SYN_STATE_LOOKBACK_BYTES;
+              if start0 < 0 { start0 = 0; }
+              let delta2: i64 = top_off - start0;
+              if delta2 > 0 {
+                hl_state_advance(&syn, mut syn_state_top, file.ptr + (start0 as u64), delta2);
+              }
+            }
+            syn_state_off = top_off;
+          }
+        } else {
+          syn_state_top = hl_state_init();
+          syn_state_off = top_off;
+        }
+
         if show_help {
-          draw_help(mut w, content_rows, cols, cfg.regex, cfg.ignore_case, cfg.unsafe_raw);
+          draw_help(mut w, &cfg.theme, start_row, content_rows, cols, cfg.regex, cfg.ignore_case, cfg.unsafe_raw);
         } else {
           var cur: i64 = top_off;
+          var cur_line: i64 = top_line;
+          var hl_state: HLState = syn_state_top;
           var r: int = 0;
           while r < content_rows {
-            ansi_move(mut w, r + 1, 1);
+            ansi_move(mut w, start_row + r, 1);
             if cur >= file.len {
-              ansi_fg_256(mut w, COLOR_STATUS_DIM);
+              if gutter_render {
+                push_spaces(mut w, gutter_cols);
+              }
+              ansi_fg_256(mut w, cfg.theme.status_dim);
               ansi_dim_on(mut w);
               let _ = w.push_str("~");
               ansi_reset(mut w);
@@ -2511,7 +5187,7 @@ export async fn main (argc: int, argv: u64) -> int {
             // even on huge single-line inputs (minified JSON, etc).
             let tail_len: i64 = file.len - cur;
             let mult: i64 = if allow_ansi && !cfg.unsafe_raw { ANSI_BYTES_PER_COL } else { 1 };
-            let scan_len: i64 = min_i64(tail_len, ((cols as i64) * mult) + 1);
+            let scan_len: i64 = min_i64(tail_len, ((view_cols as i64) * mult) + 1);
             let nl_ptr: u64 = if scan_len > 0 { memchr(file.ptr + (cur as u64), 10, scan_len) } else { 0 };
 
             var has_nl: bool = false;
@@ -2531,14 +5207,31 @@ export async fn main (argc: int, argv: u64) -> int {
                 }
               }
             } else {
-              seg_len = min_i64(tail_len, (cols as i64) * mult);
+              seg_len = min_i64(tail_len, (view_cols as i64) * mult);
             }
 
             let line_ptr: u64 = file.ptr + (cur as u64);
-            let line_len: i64 = if seg_len > 0 { seg_len } else { 0 };
+            var line_len: i64 = 0;
+            if seg_len > 0 {
+              line_len = measure_line_consumed(line_ptr, seg_len, view_cols, cfg.unsafe_raw, allow_ansi);
+            }
             var hl_s: i64 = -1;
             var hl_e: i64 = -1;
-            if !cfg.unsafe_raw && last_match_off >= 0 && last_match_end > last_match_off {
+            if !cfg.unsafe_raw && sel_on && sel_anchor >= 0 && sel_head >= 0 && sel_anchor != sel_head {
+              let sel_a0: i64 = min_i64(sel_anchor, sel_head);
+              let sel_b0: i64 = max_i64(sel_anchor, sel_head);
+              let sel_a: i64 = clamp_i64(sel_a0, 0, file.len);
+              let sel_b: i64 = clamp_i64(sel_b0, 0, file.len);
+
+              let seg_start: i64 = cur;
+              let seg_end: i64 = cur + line_len;
+              if sel_b > seg_start && sel_a < seg_end {
+                let a: i64 = max_i64(sel_a, seg_start);
+                let b: i64 = min_i64(sel_b, seg_end);
+                hl_s = a - seg_start;
+                hl_e = b - seg_start;
+              }
+            } else if !cfg.unsafe_raw && last_match_off >= 0 && last_match_end > last_match_off {
               let seg_start: i64 = cur;
               let seg_end: i64 = cur + line_len;
               if last_match_end > seg_start && last_match_off < seg_end {
@@ -2553,15 +5246,47 @@ export async fn main (argc: int, argv: u64) -> int {
               hl_e = -1;
             } else {
               if hl_e < hl_s { hl_e = hl_s; }
-              if hl_e > line_len { hl_e = line_len; }
+            if hl_e > line_len { hl_e = line_len; }
             }
 
-            let consumed: i64 = render_line(mut w, line_ptr, line_len, cols, cfg.unsafe_raw, allow_ansi, hl_s, hl_e);
+            var styles: u64 = 0;
+            if syn_active && line_len > 0 {
+              if line_len > style_cap {
+                if style_ptr != 0 { std::runtime::mem::free(style_ptr); }
+                style_ptr = 0;
+                style_cap = 0;
+                var new_cap: i64 = line_len;
+                if new_cap < 8192 { new_cap = 8192; }
+                let p2: u64 = std::runtime::mem::alloc(new_cap);
+                if p2 == 0 {
+                  syn_active = false;
+                } else {
+                  style_ptr = p2;
+                  style_cap = new_cap;
+                }
+              }
+              if syn_active && style_ptr != 0 {
+                let ok_hl: bool = highlight_segment_stateful(&syn, mut hl_state, line_ptr, line_len, style_ptr);
+                if ok_hl { styles = style_ptr; }
+              }
+            }
+
+            if gutter_render {
+              push_gutter(mut w, &cfg.theme, cur_line, gutter_ln_width, use_color, allow_ansi);
+            }
+
+            let consumed: i64 = render_line(mut w, &cfg.theme, line_ptr, line_len, view_cols, cfg.unsafe_raw, allow_ansi, hl_s, hl_e, styles);
             ansi_clear_eol(mut w);
 
             var next: i64 = cur;
-            if has_nl && consumed == line_len {
+            if has_nl && consumed == seg_len {
               next = nl_next;
+              if cur_line >= 0 {
+                cur_line = cur_line + 1;
+              }
+              if syn_active {
+                hl_state_on_newline(mut hl_state);
+              }
             } else if consumed > 0 {
               next = cur + consumed;
             } else {
@@ -2580,7 +5305,7 @@ export async fn main (argc: int, argv: u64) -> int {
           st_line = -1;
           st_off = 0;
         }
-        status_line(mut w, name, st_line, st_off, file.len, rows, cols, idx.done, idx.scan_off, idx.lines, alert, cfg.regex, cfg.ignore_case);
+        status_line(mut w, &cfg.theme, name, st_line, st_off, file.len, rows, cols, idx.done, idx.scan_off, idx.lines, alert, cfg.regex, cfg.ignore_case);
         let _ = w.flush();
         need_redraw = false;
         last_status_scan_off = idx.scan_off;
@@ -2595,7 +5320,7 @@ export async fn main (argc: int, argv: u64) -> int {
           st_line = -1;
           st_off = 0;
         }
-        status_line(mut w, name, st_line, st_off, file.len, rows, cols, idx.done, idx.scan_off, idx.lines, alert, cfg.regex, cfg.ignore_case);
+        status_line(mut w, &cfg.theme, name, st_line, st_off, file.len, rows, cols, idx.done, idx.scan_off, idx.lines, alert, cfg.regex, cfg.ignore_case);
         let _ = w.flush();
         last_status_scan_off = idx.scan_off;
         last_status_lines = idx.lines;
@@ -2612,6 +5337,12 @@ export async fn main (argc: int, argv: u64) -> int {
         break;
       }
 
+      // Any user input cancels a pending `:<line>` jump (avoids surprise jumps).
+      if pending_goto_line >= 0 {
+        pending_goto_line = -1;
+        if alert == 7 { alert = 0; }
+      }
+
       // Clear transient alerts on user input (except "searching", which is live state).
       if alert != 0 && alert != 4 {
         alert = 0;
@@ -2619,6 +5350,7 @@ export async fn main (argc: int, argv: u64) -> int {
 
       let is_byte: bool = k.kind == KEY_BYTE;
       let b: u8 = k.byte;
+      var want_tab: i64 = -1;
 
       // Help overlay (presentation + quick reference).
       if show_help {
@@ -2637,31 +5369,526 @@ export async fn main (argc: int, argv: u64) -> int {
         continue;
       }
 
-      // Cancel an in-flight incremental search.
+      // Cancel an in-flight incremental search or pending `:<line>` jump.
       if k.kind == KEY_ESC {
         if search.active {
           search.active = false;
           alert = 0;
           need_redraw = true;
         }
+        if pending_goto_line >= 0 {
+          pending_goto_line = -1;
+          if alert == 7 { alert = 0; }
+          need_redraw = true;
+        }
+        if sel_on || sel_drag {
+          sel_on = false;
+          sel_anchor = -1;
+          sel_head = -1;
+          sel_drag = false;
+          need_redraw = true;
+        }
         continue;
       }
 
-      if k.kind == KEY_DOWN || (is_byte && b == 106) { // 'j'
-        top_off = visual_next_off(file.ptr, file.len, top_off, cols, cfg.unsafe_raw, allow_ansi);
+      // Text selection (left mouse drag).
+      if k.kind == KEY_MOUSE {
+        let mx: int = k.x;
+        let my: int = k.y;
+        let cb: int = k.aux;
+        let motion: bool = (cb & 32) != 0;
+        let btn: int = cb & 3;
+        let is_press_or_motion: bool = k.byte == 77; // 'M'
+        let is_release: bool = k.byte == 109; // 'm'
+
+        // Stop dragging on release (even if modifiers changed).
+        if sel_drag && is_release {
+          sel_drag = false;
+          need_redraw = true;
+          continue;
+        }
+
+        // Tab switching by mouse click on the tab bar (row 1).
+        if tab_rows > 0 && my == 1 {
+          if is_press_or_motion && btn == 0 && !motion {
+            let hit: i64 = tab_hit_test(cols, tabs.ptr, tabs.cap, tabs.len, active_tab, use_color, mx);
+            if hit >= 0 && hit < tabs.len && hit != active_tab {
+              want_tab = hit;
+            }
+          }
+          // Consume events on the tab bar unless we requested a switch.
+          if want_tab < 0 {
+            continue;
+          }
+          // Fall through to the shared tab switch logic below.
+        } else {
+          // Start selection on Left press. Many terminals use Shift to bypass
+          // mouse reporting for terminal-native selection; selection here is
+          // content-only and excludes the line-number gutter.
+          if is_press_or_motion && btn == 0 && !motion {
+            var row_m: int = my - start_row;
+            var col_m: int = (mx - 1) - gutter_cols;
+            if col_m < 0 { col_m = 0; }
+            if col_m > view_cols { col_m = view_cols; }
+            if row_m >= 0 && row_m < content_rows {
+              let off: i64 = offset_for_view_row_col(file.ptr, file.len, top_off, row_m, col_m, view_cols, cfg.unsafe_raw, allow_ansi);
+              sel_on = true;
+              sel_anchor = off;
+              sel_head = off;
+              sel_drag = true;
+              need_redraw = true;
+            }
+            continue;
+          }
+
+          // Update selection while dragging (motion events have bit 5 set).
+          if sel_drag && is_press_or_motion && btn == 0 {
+            var row_m2: int = my - start_row;
+            var col_m2: int = (mx - 1) - gutter_cols;
+            if col_m2 < 0 { col_m2 = 0; }
+            if col_m2 > view_cols { col_m2 = view_cols; }
+            if row_m2 >= 0 && row_m2 < content_rows {
+              let off2: i64 = offset_for_view_row_col(file.ptr, file.len, top_off, row_m2, col_m2, view_cols, cfg.unsafe_raw, allow_ansi);
+              sel_on = true;
+              sel_head = off2;
+              need_redraw = true;
+            }
+            continue;
+          }
+
+          continue;
+        }
+      }
+
+      // Tab switching (multi-file).
+      if tabs.len > 1 {
+        if want_tab < 0 {
+          if is_byte && b >= 48 && b <= 57 { // '0'..'9'
+            want_tab = (((b - 48) as int) as i64);
+            if want_tab < 0 || want_tab >= tabs.len {
+              want_tab = -1;
+              alert = ALERT_TAB_RANGE;
+              need_redraw = true;
+              continue;
+            }
+          }
+          if is_byte && b == 9 { // Tab
+            want_tab = tab_next(active_tab, tabs.len);
+          } else if k.kind == KEY_SHIFT_TAB {
+            want_tab = tab_prev(active_tab, tabs.len);
+          }
+        }
+
+        if want_tab >= 0 && want_tab < tabs.len && want_tab != active_tab {
+          // Map the new tab first so a failed open doesn't destroy the current view.
+          let new_state: TabState = (tabs.ptr as TabState[](tabs.cap as int))[want_tab];
+          var m2_opt: MappedFile? = None;
+          if new_state.path == "-" {
+            m2_opt = map_stdin_spool(cfg.allow_binary);
+          } else {
+            m2_opt = map_path(new_state.path, cfg.allow_binary);
+          }
+          if m2_opt == None {
+            alert = ALERT_OPEN_FAILED;
+            need_redraw = true;
+            continue;
+          }
+          let mut file2: MappedFile = match (m2_opt) { Some(v) => v, None => MappedFile{ ptr: 0, len: 0 } };
+
+          // Prepare a fresh indexer for the new file.
+          let ch2_r = ChanU64.init(256);
+          if ch2_r.is_err() {
+            alert = ALERT_OPEN_FAILED;
+            need_redraw = true;
+            continue;
+          }
+          let mut ch2: ChanU64 = match (ch2_r) { Ok(v) => v, Err(_) => ChanU64.invalid() };
+
+          let tok2_r = std::sync::CancellationToken.init();
+          let check_cancel2: bool = !tok2_r.is_err();
+          let mut tok2: std::sync::CancellationToken = match (tok2_r) {
+            Ok(v) => v,
+            Err(_) => std::sync::CancellationToken.invalid(),
+          };
+          let mut idx2: IndexState = IndexState{ done: false, scan_off: 0, lines: if file2.len > 0 { 1 } else { 0 } };
+          let idx_task2: Task(int) = build_line_index(file2.ptr, file2.len, ch2.borrow(), tok2.borrow(), check_cancel2);
+
+          // Save current tab state.
+          let mut cur_state: TabState = (tabs.ptr as TabState[](tabs.cap as int))[active_tab];
+          cur_state.top_off = top_off;
+          cur_state.gutter_on = gutter_on;
+          (tabs.ptr as TabState[](tabs.cap as int))[active_tab] = cur_state;
+
+          // Stop the current indexer before unmapping the file.
+          tok.cancel();
+          ch.close();
+          let _ = index_pump_try(mut ch, mut offsets, mut idx);
+          let _ = yield idx_task;
+
+          // Switch active tab.
+          active_tab = want_tab;
+          path = new_state.path;
+          gutter_on = new_state.gutter_on;
+          top_off = new_state.top_off;
+
+          // Replace file mapping.
+          file = move file2;
+          top_off = clamp_i64(top_off, 0, file.len);
+
+          // Swap in the new indexer.
+          ch = move ch2;
+          tok = move tok2;
+          idx = idx2;
+          offsets.len = 0;
+          let _ = offsets.push(0);
+          idx_task = move idx_task2;
+
+          // Reset search state for the new file (keep the query, but clear match).
+          search.active = false;
+          pending_goto_line = -1;
+          last_match_off = -1;
+          last_match_end = -1;
+          sel_on = false;
+          sel_anchor = -1;
+          sel_head = -1;
+          sel_drag = false;
+          if alert == 4 { alert = 0; }
+
+          // Reload syntax/highlighting config for the new path.
+          allow_ansi = cfg.ansi;
+          syn_active = false;
+          syn = highlighter_empty();
+          if cfg.syntax && use_color && !cfg.unsafe_raw && path != "-" {
+            let syn_opt2: Highlighter? = load_for_path(path);
+            if syn_opt2 != None {
+              syn = match (syn_opt2) { Some(v) => v, None => syn };
+              syn_active = true;
+              allow_ansi = false;
+            }
+          }
+
+          // Reset syntax state to the new file's `top_off`.
+          syn_state_top = hl_state_init();
+          syn_state_off = 0;
+          if syn_active && file.ptr != 0 && file.len > 0 {
+            var start2: i64 = top_off - SYN_STATE_LOOKBACK_BYTES;
+            if start2 < 0 { start2 = 0; }
+            if start2 < top_off {
+              hl_state_advance(&syn, mut syn_state_top, file.ptr + (start2 as u64), top_off - start2);
+            }
+            syn_state_off = top_off;
+          } else {
+            syn_state_off = top_off;
+          }
+
+          need_redraw = true;
+          continue;
+        }
+      }
+
+      // Toggle line-number gutter.
+      if is_byte && b == 76 { // 'L'
+        gutter_on = !gutter_on;
         need_redraw = true;
         continue;
       }
-      if k.kind == KEY_UP || (is_byte && b == 107) { // 'k'
-        top_off = visual_prev_off(file.ptr, file.len, top_off, cols, cfg.unsafe_raw, allow_ansi);
+
+      // Vim-like command mode (very small subset).
+      if is_byte && b == 58 { // ':'
+        if search.active {
+          search.active = false;
+        }
+        let ok_cmd: bool = prompt_cmd(mut w, &cfg.theme, mut inp, rows, cols, mut tmp_cmd);
+        if ok_cmd {
+          let cb = tmp_cmd.as_bytes();
+          var s0: i64 = 0;
+          var e0: i64 = cb.len;
+          while s0 < e0 && is_ascii_ws(std::runtime::mem::load_u8(cb.ptr, s0)) { s0 = s0 + 1; }
+          while e0 > s0 && is_ascii_ws(std::runtime::mem::load_u8(cb.ptr, e0 - 1)) { e0 = e0 - 1; }
+          let c_ptr: u64 = cb.ptr + (s0 as u64);
+          let c_len: i64 = e0 - s0;
+
+          if c_len > 0 {
+            if eq_nocase(c_ptr, c_len, "q") || eq_nocase(c_ptr, c_len, "quit") {
+              break;
+            }
+
+            // Split command into `head` and `arg` (whitespace separated).
+            var head_len: i64 = 0;
+            while head_len < c_len && !is_ascii_ws(std::runtime::mem::load_u8(c_ptr, head_len)) {
+              head_len = head_len + 1;
+            }
+            var arg_ptr: u64 = 0;
+            var arg_len: i64 = 0;
+            var a0: i64 = head_len;
+            while a0 < c_len && is_ascii_ws(std::runtime::mem::load_u8(c_ptr, a0)) { a0 = a0 + 1; }
+            if a0 < c_len {
+              arg_ptr = c_ptr + (a0 as u64);
+              arg_len = c_len - a0;
+            }
+
+            // Tab/buffer navigation.
+            var is_tab_cmd: bool = false;
+            var want_tab_cmd: i64 = -1;
+            if eq_nocase(c_ptr, head_len, "bn") || eq_nocase(c_ptr, head_len, "buffer-next") || eq_nocase(c_ptr, head_len, "tn") || eq_nocase(c_ptr, head_len, "tab-next") {
+              is_tab_cmd = true;
+              if tabs.len > 1 {
+                want_tab_cmd = tab_next(active_tab, tabs.len);
+              } else {
+                alert = ALERT_TAB_RANGE;
+              }
+            } else if eq_nocase(c_ptr, head_len, "bp") || eq_nocase(c_ptr, head_len, "buffer-prev") || eq_nocase(c_ptr, head_len, "buffer-previous") || eq_nocase(c_ptr, head_len, "tp") || eq_nocase(c_ptr, head_len, "tab-prev") || eq_nocase(c_ptr, head_len, "tab-previous") {
+              is_tab_cmd = true;
+              if tabs.len > 1 {
+                want_tab_cmd = tab_prev(active_tab, tabs.len);
+              } else {
+                alert = ALERT_TAB_RANGE;
+              }
+            } else if eq_nocase(c_ptr, head_len, "t") {
+              // Vim-ish shortcut: `:t 6`
+              is_tab_cmd = true;
+              if arg_ptr == 0 || arg_len <= 0 || tabs.len <= 0 {
+                alert = ALERT_TAB_RANGE;
+              } else {
+                let t_opt: i64? = parse_i64_dec(arg_ptr, arg_len);
+                if t_opt == None {
+                  alert = ALERT_TAB_RANGE;
+                } else {
+                  let t0: i64 = match (t_opt) { Some(v) => v, None => 0 };
+                  if t0 < 0 || t0 >= tabs.len {
+                    alert = ALERT_TAB_RANGE;
+                  } else {
+                    want_tab_cmd = t0;
+                  }
+                }
+              }
+            } else if head_len >= 2 && (std::runtime::mem::load_u8(c_ptr, 0) == 116 || std::runtime::mem::load_u8(c_ptr, 0) == 84) {
+              // Vim-ish shortcut: `:t6`
+              var ok_digits: bool = true;
+              var di: i64 = 1;
+              while di < head_len {
+                let ch: u8 = std::runtime::mem::load_u8(c_ptr, di);
+                if ch < 48 || ch > 57 {
+                  ok_digits = false;
+                  break;
+                }
+                di = di + 1;
+              }
+              if ok_digits {
+                is_tab_cmd = true;
+                if tabs.len <= 0 {
+                  alert = ALERT_TAB_RANGE;
+                } else {
+                  let t_opt2: i64? = parse_i64_dec(c_ptr + 1, head_len - 1);
+                  if t_opt2 == None {
+                    alert = ALERT_TAB_RANGE;
+                  } else {
+                    let t1: i64 = match (t_opt2) { Some(v) => v, None => 0 };
+                    if t1 < 0 || t1 >= tabs.len {
+                      alert = ALERT_TAB_RANGE;
+                    } else {
+                      want_tab_cmd = t1;
+                    }
+                  }
+                }
+              }
+            } else if eq_nocase(c_ptr, head_len, "tab") {
+              is_tab_cmd = true;
+              if arg_ptr == 0 || arg_len <= 0 || tabs.len <= 0 {
+                alert = ALERT_TAB_RANGE;
+              } else {
+                let t_opt: i64? = parse_i64_dec(arg_ptr, arg_len);
+                if t_opt == None {
+                  alert = ALERT_TAB_RANGE;
+                } else {
+                  let t0: i64 = match (t_opt) { Some(v) => v, None => 0 };
+                  if t0 < 0 || t0 >= tabs.len {
+                    alert = ALERT_TAB_RANGE;
+                  } else {
+                    want_tab_cmd = t0;
+                  }
+                }
+              }
+            }
+
+            if is_tab_cmd {
+              if want_tab_cmd >= 0 && want_tab_cmd < tabs.len && want_tab_cmd != active_tab {
+                // Map the new tab first so a failed open doesn't destroy the current view.
+                let new_state2: TabState = (tabs.ptr as TabState[](tabs.cap as int))[want_tab_cmd];
+                var m3_opt: MappedFile? = None;
+                if new_state2.path == "-" {
+                  m3_opt = map_stdin_spool(cfg.allow_binary);
+                } else {
+                  m3_opt = map_path(new_state2.path, cfg.allow_binary);
+                }
+                if m3_opt == None {
+                  alert = ALERT_OPEN_FAILED;
+                  need_redraw = true;
+                  continue;
+                }
+                let mut file3: MappedFile = match (m3_opt) { Some(v) => v, None => MappedFile{ ptr: 0, len: 0 } };
+
+                // Prepare a fresh indexer for the new file.
+                let ch3_r = ChanU64.init(256);
+                if ch3_r.is_err() {
+                  alert = ALERT_OPEN_FAILED;
+                  need_redraw = true;
+                  continue;
+                }
+                let mut ch3: ChanU64 = match (ch3_r) { Ok(v) => v, Err(_) => ChanU64.invalid() };
+
+                let tok3_r = std::sync::CancellationToken.init();
+                let check_cancel3: bool = !tok3_r.is_err();
+                let mut tok3: std::sync::CancellationToken = match (tok3_r) {
+                  Ok(v) => v,
+                  Err(_) => std::sync::CancellationToken.invalid(),
+                };
+                let mut idx3: IndexState = IndexState{ done: false, scan_off: 0, lines: if file3.len > 0 { 1 } else { 0 } };
+                let idx_task3: Task(int) = build_line_index(file3.ptr, file3.len, ch3.borrow(), tok3.borrow(), check_cancel3);
+
+                // Save current tab state.
+                let mut cur_state2: TabState = (tabs.ptr as TabState[](tabs.cap as int))[active_tab];
+                cur_state2.top_off = top_off;
+                cur_state2.gutter_on = gutter_on;
+                (tabs.ptr as TabState[](tabs.cap as int))[active_tab] = cur_state2;
+
+                // Stop the current indexer before unmapping the file.
+                tok.cancel();
+                ch.close();
+                let _ = index_pump_try(mut ch, mut offsets, mut idx);
+                let _ = yield idx_task;
+
+                // Switch active tab.
+                active_tab = want_tab_cmd;
+                path = new_state2.path;
+                gutter_on = new_state2.gutter_on;
+                top_off = new_state2.top_off;
+
+                // Replace file mapping.
+                file = move file3;
+                top_off = clamp_i64(top_off, 0, file.len);
+
+                // Swap in the new indexer.
+                ch = move ch3;
+                tok = move tok3;
+                idx = idx3;
+                offsets.len = 0;
+                let _ = offsets.push(0);
+                idx_task = move idx_task3;
+
+                // Reset search state for the new file (keep the query, but clear match).
+                search.active = false;
+                pending_goto_line = -1;
+                last_match_off = -1;
+                last_match_end = -1;
+                sel_on = false;
+                sel_anchor = -1;
+                sel_head = -1;
+                sel_drag = false;
+                if alert == 4 { alert = 0; }
+
+                // Reload syntax/highlighting config for the new path.
+                allow_ansi = cfg.ansi;
+                syn_active = false;
+                syn = highlighter_empty();
+                if cfg.syntax && use_color && !cfg.unsafe_raw && path != "-" {
+                  let syn_opt2: Highlighter? = load_for_path(path);
+                  if syn_opt2 != None {
+                    syn = match (syn_opt2) { Some(v) => v, None => syn };
+                    syn_active = true;
+                    allow_ansi = false;
+                  }
+                }
+
+                need_redraw = true;
+                continue;
+              }
+
+              // A tab command that didn't switch (range error, single tab, or same tab).
+              need_redraw = true;
+              continue;
+            }
+
+            let n_opt: i64? = parse_i64_dec(c_ptr, c_len);
+            if n_opt != None {
+              let n: i64 = match (n_opt) { Some(v) => v, None => 0 };
+              if n <= 0 {
+                alert = 8;
+              } else {
+                let line0: i64 = n - 1;
+                let ck: i64 = line0 / INDEX_STRIDE;
+                if ck >= offsets.len {
+                  if idx.done {
+                    alert = 8;
+                  } else {
+                    pending_goto_line = line0;
+                    alert = 7;
+                  }
+                } else {
+                  let off_opt: i64? = offset_for_line(file.ptr, file.len, &offsets, line0);
+                  if off_opt != None {
+                    let off0: i64 = match (off_opt) { Some(v) => v, None => 0 };
+                    top_off = visual_start_for_offset(file.ptr, file.len, off0, view_cols, cfg.unsafe_raw, allow_ansi);
+                    pending_goto_line = -1;
+                    alert = 0;
+                  } else {
+                    pending_goto_line = -1;
+                    alert = 8;
+                  }
+                }
+              }
+            } else {
+              alert = 6;
+            }
+          } else {
+            alert = 6;
+          }
+        }
         need_redraw = true;
         continue;
       }
-      if k.kind == KEY_PAGE_DOWN || (is_byte && b == 32) { // Space
+
+      if cfg.mouse && k.kind == KEY_MOUSE_WHEEL_DOWN {
+        // Vim-like mouse wheel scrolling.
+        let steps: int = 3;
+        var i0: int = 0;
+        while i0 < steps {
+          let n0: i64 = visual_next_off(file.ptr, file.len, top_off, view_cols, cfg.unsafe_raw, allow_ansi);
+          if n0 == top_off { break; }
+          top_off = n0;
+          i0 = i0 + 1;
+        }
+        need_redraw = true;
+        continue;
+      }
+      if cfg.mouse && k.kind == KEY_MOUSE_WHEEL_UP {
+        let steps: int = 3;
+        var i1: int = 0;
+        while i1 < steps {
+          let p0: i64 = visual_prev_off(file.ptr, file.len, top_off, view_cols, cfg.unsafe_raw, allow_ansi);
+          if p0 == top_off { break; }
+          top_off = p0;
+          i1 = i1 + 1;
+        }
+        need_redraw = true;
+        continue;
+      }
+
+      if k.kind == KEY_DOWN || (is_byte && (b == 106 || b == 100)) { // 'j' or 'd'
+        top_off = visual_next_off(file.ptr, file.len, top_off, view_cols, cfg.unsafe_raw, allow_ansi);
+        need_redraw = true;
+        continue;
+      }
+      if k.kind == KEY_UP || (is_byte && (b == 107 || b == 117)) { // 'k' or 'u'
+        top_off = visual_prev_off(file.ptr, file.len, top_off, view_cols, cfg.unsafe_raw, allow_ansi);
+        need_redraw = true;
+        continue;
+      }
+      if k.kind == KEY_PAGE_DOWN || (is_byte && (b == 32 || b == 4)) { // Space / Ctrl-D
         var cur2: i64 = top_off;
         var i2: int = 0;
         while i2 < content_rows {
-          let n2: i64 = visual_next_off(file.ptr, file.len, cur2, cols, cfg.unsafe_raw, allow_ansi);
+          let n2: i64 = visual_next_off(file.ptr, file.len, cur2, view_cols, cfg.unsafe_raw, allow_ansi);
           if n2 == cur2 {
             break;
           }
@@ -2672,11 +5899,11 @@ export async fn main (argc: int, argv: u64) -> int {
         need_redraw = true;
         continue;
       }
-      if k.kind == KEY_PAGE_UP || (is_byte && b == 98) { // 'b'
+      if k.kind == KEY_PAGE_UP || (is_byte && (b == 98 || b == 21)) { // 'b' / Ctrl-U
         var cur3: i64 = top_off;
         var i3: int = 0;
         while i3 < content_rows {
-          let p3: i64 = visual_prev_off(file.ptr, file.len, cur3, cols, cfg.unsafe_raw, allow_ansi);
+          let p3: i64 = visual_prev_off(file.ptr, file.len, cur3, view_cols, cfg.unsafe_raw, allow_ansi);
           if p3 == cur3 {
             break;
           }
@@ -2692,7 +5919,7 @@ export async fn main (argc: int, argv: u64) -> int {
         var cur5: i64 = top_off;
         var i5: int = 0;
         while i5 < content_rows {
-          let n5: i64 = visual_next_off(file.ptr, file.len, cur5, cols, cfg.unsafe_raw, allow_ansi);
+          let n5: i64 = visual_next_off(file.ptr, file.len, cur5, view_cols, cfg.unsafe_raw, allow_ansi);
           if n5 == cur5 {
             break;
           }
@@ -2708,7 +5935,7 @@ export async fn main (argc: int, argv: u64) -> int {
         var cur6: i64 = top_off;
         var i6: int = 0;
         while i6 < content_rows {
-          let p6: i64 = visual_prev_off(file.ptr, file.len, cur6, cols, cfg.unsafe_raw, allow_ansi);
+          let p6: i64 = visual_prev_off(file.ptr, file.len, cur6, view_cols, cfg.unsafe_raw, allow_ansi);
           if p6 == cur6 {
             break;
           }
@@ -2727,12 +5954,12 @@ export async fn main (argc: int, argv: u64) -> int {
       if k.kind == KEY_END || (is_byte && b == 71) { // 'G'
         var cur4: i64 = file.len;
         if cur4 > 0 {
-          cur4 = visual_prev_off(file.ptr, file.len, cur4, cols, cfg.unsafe_raw, allow_ansi);
+          cur4 = visual_prev_off(file.ptr, file.len, cur4, view_cols, cfg.unsafe_raw, allow_ansi);
         }
         let steps: int = if content_rows > 1 { content_rows - 1 } else { 0 };
         var i4: int = 0;
         while i4 < steps {
-          let p4: i64 = visual_prev_off(file.ptr, file.len, cur4, cols, cfg.unsafe_raw, allow_ansi);
+          let p4: i64 = visual_prev_off(file.ptr, file.len, cur4, view_cols, cfg.unsafe_raw, allow_ansi);
           if p4 == cur4 {
             break;
           }
@@ -2745,7 +5972,32 @@ export async fn main (argc: int, argv: u64) -> int {
       }
 
       // Quit.
-      if is_byte && (b == 113 || b == 3) { // 'q' or Ctrl-C
+      if is_byte && b == 3 { // Ctrl-C (or Ctrl-Shift-C in many terminals)
+        if sel_on && sel_anchor >= 0 && sel_head >= 0 && sel_anchor != sel_head {
+          let a0: i64 = min_i64(sel_anchor, sel_head);
+          let b0: i64 = max_i64(sel_anchor, sel_head);
+          let a: i64 = clamp_i64(a0, 0, file.len);
+          let e: i64 = clamp_i64(b0, 0, file.len);
+          let n: i64 = e - a;
+          if n <= 0 {
+            alert = ALERT_COPY_FAILED;
+          } else if n > COPY_MAX_BYTES {
+            alert = ALERT_COPY_TOO_BIG;
+          } else {
+            let ok_copy: bool = osc52_copy(mut w, file.ptr + (a as u64), n);
+            if ok_copy { alert = ALERT_COPIED; }
+            else { alert = ALERT_COPY_FAILED; }
+          }
+          sel_on = false;
+          sel_anchor = -1;
+          sel_head = -1;
+          sel_drag = false;
+          need_redraw = true;
+          continue;
+        }
+        break;
+      }
+      if is_byte && b == 113 { // 'q'
         break;
       }
 
@@ -2755,16 +6007,17 @@ export async fn main (argc: int, argv: u64) -> int {
           search.active = false;
         }
 
-        let ok: bool = prompt_search(mut w, mut inp, rows, cols, mut tmp_query, cfg.regex, cfg.ignore_case);
+        let ok: bool = prompt_search(mut w, &cfg.theme, mut inp, rows, cols, &search_hist_data, &search_hist_idx, mut tmp_query, cfg.regex, cfg.ignore_case);
         if ok {
           alert = 0;
           last_query.clear();
           let bytes = tmp_query.as_bytes();
           let _ = last_query.push_ptr_len(bytes.ptr, bytes.len);
+          search_hist_push(mut search_hist_data, mut search_hist_idx, bytes.ptr, bytes.len);
           last_match_off = -1;
           last_match_end = -1;
           regex_ready = false;
-          regex_re = std::regex::RegExp.empty();
+          regex_re = RegExp.empty();
 
           // Compile regex once per query so incremental search doesn't recompile.
           if cfg.regex && last_query.len > 0 {
@@ -2773,13 +6026,13 @@ export async fn main (argc: int, argv: u64) -> int {
             var flags: string = "";
             if cfg.ignore_case { flags = "i"; }
 
-            let cr: ReCompileResult = std::regex::RegExp.compile(pat, flags);
+            let cr: ReCompileResult = RegExp.compile(pat, flags);
             if cr.is_err() {
               alert = 2;
               regex_ready = false;
-              regex_re = std::regex::RegExp.empty();
+              regex_re = RegExp.empty();
             } else {
-              let re2: std::regex::RegExp = ReCompileResult.unwrap_or(cr, std::regex::RegExp.empty());
+              let re2: RegExp = ReCompileResult.unwrap_or(cr, RegExp.empty());
               regex_re = move re2;
               regex_ready = true;
             }
@@ -2820,14 +6073,14 @@ export async fn main (argc: int, argv: u64) -> int {
           var flags: string = "";
           if cfg.ignore_case { flags = "i"; }
 
-          let cr: ReCompileResult = std::regex::RegExp.compile(pat, flags);
+          let cr: ReCompileResult = RegExp.compile(pat, flags);
           if cr.is_err() {
             alert = 2;
             regex_ready = false;
-            regex_re = std::regex::RegExp.empty();
+            regex_re = RegExp.empty();
             continue;
           }
-          let re2: std::regex::RegExp = ReCompileResult.unwrap_or(cr, std::regex::RegExp.empty());
+          let re2: RegExp = ReCompileResult.unwrap_or(cr, RegExp.empty());
           regex_re = move re2;
           regex_ready = true;
         }
@@ -2852,6 +6105,68 @@ export async fn main (argc: int, argv: u64) -> int {
         continue;
       }
 
+      if is_byte && b == 112 { // 'p'
+        if search.active {
+          continue;
+        }
+        if last_query.len <= 0 || file.len <= 0 {
+          continue;
+        }
+
+        // Compile regex (if needed).
+        if cfg.regex && !regex_ready {
+          let qb = last_query.as_bytes();
+          if qb.ptr == 0 || qb.len <= 0 {
+            continue;
+          }
+          let pat: string = std::runtime::mem::string_from_ptr_len(qb.ptr, qb.len as int);
+          var flags: string = "";
+          if cfg.ignore_case { flags = "i"; }
+
+          let cr: ReCompileResult = RegExp.compile(pat, flags);
+          if cr.is_err() {
+            alert = 2;
+            regex_ready = false;
+            regex_re = RegExp.empty();
+            need_redraw = true;
+            continue;
+          }
+          let re2: RegExp = ReCompileResult.unwrap_or(cr, RegExp.empty());
+          regex_re = move re2;
+          regex_ready = true;
+        }
+
+        var end_off: i64 = top_off;
+        if last_match_off >= 0 {
+          end_off = last_match_off;
+        }
+
+        var r: FindNextResult = FindNextResult{ kind: FIND_NOT_FOUND, off: 0, end: 0 };
+        if cfg.regex {
+          r = find_prev_regex_any(&file, &regex_re, end_off);
+        } else {
+          r = find_prev_literal_any(&file, &last_query, end_off, cfg.ignore_case);
+        }
+
+        if r.kind == FIND_FOUND {
+          top_off = visual_start_for_offset(file.ptr, file.len, r.off, view_cols, cfg.unsafe_raw, allow_ansi);
+          last_match_off = r.off;
+          last_match_end = r.end;
+          alert = 0;
+        } else if r.kind == FIND_NOT_FOUND {
+          alert = 5;
+        } else if r.kind == FIND_REGEX_TOO_LARGE {
+          alert = 1;
+        } else if r.kind == FIND_REGEX_RUNTIME_FAILED {
+          alert = 3;
+        } else {
+          alert = 5;
+        }
+
+        need_redraw = true;
+        continue;
+      }
+
       continue;
     }
 
@@ -2861,14 +6176,19 @@ export async fn main (argc: int, argv: u64) -> int {
     let _ = index_pump_try(mut ch, mut offsets, mut idx);
     let _ = yield idx_task;
 
+    if style_ptr != 0 { std::runtime::mem::free(style_ptr); }
+    if regex_out_ptr != 0 { std::runtime::mem::free(regex_out_ptr); }
+
     // Leave alternate screen + show cursor.
     w.clear();
+    ansi_mouse_off(mut w);
     ansi_show_cursor(mut w);
     if use_alt { ansi_alt_off(mut w); }
     let _ = w.flush();
 
     raw_mode.restore();
     if in_fd != std::runtime::posix::io::STDIN_FD { let _ = std::runtime::posix::fs::close(in_fd); }
+    tabs_free(mut tabs);
     return 0;
   }
 }

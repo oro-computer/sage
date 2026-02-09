@@ -1,0 +1,287 @@
+{
+  "name": "Silk",
+  "scopeName": "source.silk",
+  "fileTypes": [
+    "slk",
+    "silk"
+  ],
+  "patterns": [
+    {
+      "include": "#comments"
+    },
+    {
+      "include": "#strings"
+    },
+    {
+      "include": "#numbers"
+    },
+    {
+      "include": "#keywords"
+    },
+    {
+      "include": "#types"
+    },
+    {
+      "include": "#booleans"
+    },
+    {
+      "include": "#literals"
+    },
+    {
+      "include": "#verification"
+    },
+    {
+      "include": "#operators"
+    },
+    {
+      "include": "#std"
+    }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.line.documentation.silk",
+          "begin": "///",
+          "beginCaptures": {
+            "0": {
+              "name": "punctuation.definition.comment.silk"
+            }
+          },
+          "end": "$\\n?",
+          "patterns": [
+            {
+              "include": "#doc_tags"
+            }
+          ]
+        },
+        {
+          "name": "comment.line.double-slash.silk",
+          "begin": "//",
+          "beginCaptures": {
+            "0": {
+              "name": "punctuation.definition.comment.silk"
+            }
+          },
+          "end": "$\\n?"
+        },
+        {
+          "name": "comment.block.documentation.silk",
+          "begin": "/\\*\\*",
+          "beginCaptures": {
+            "0": {
+              "name": "punctuation.definition.comment.silk"
+            }
+          },
+          "patterns": [
+            {
+              "include": "#doc_tags"
+            }
+          ],
+          "end": "\\*/",
+          "endCaptures": {
+            "0": {
+              "name": "punctuation.definition.comment.silk"
+            }
+          }
+        },
+        {
+          "name": "comment.block.silk",
+          "begin": "/\\*",
+          "beginCaptures": {
+            "0": {
+              "name": "punctuation.definition.comment.silk"
+            }
+          },
+          "end": "\\*/",
+          "endCaptures": {
+            "0": {
+              "name": "punctuation.definition.comment.silk"
+            }
+          }
+        }
+      ]
+    },
+    "doc_tags": {
+      "patterns": [
+        {
+          "name": "keyword.other.documentation.silk",
+          "match": "@(param|returns|throws|external|requires|assures|asserts|theory|example|since|deprecated|remarks|see|misc|cli|synopsis|option|command)\\b"
+        }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.double.silk",
+          "begin": "\"",
+          "beginCaptures": {
+            "0": {
+              "name": "punctuation.definition.string.begin.silk"
+            }
+          },
+          "end": "\"",
+          "endCaptures": {
+            "0": {
+              "name": "punctuation.definition.string.end.silk"
+            }
+          },
+          "patterns": [
+            {
+              "name": "constant.character.escape.silk",
+              "match": "\\\\."
+            }
+          ]
+        },
+        {
+          "name": "string.quoted.other.backtick.silk",
+          "begin": "`",
+          "beginCaptures": {
+            "0": {
+              "name": "punctuation.definition.string.begin.silk"
+            }
+          },
+          "end": "`",
+          "endCaptures": {
+            "0": {
+              "name": "punctuation.definition.string.end.silk"
+            }
+          }
+        },
+        {
+          "name": "string.quoted.single.silk",
+          "begin": "'",
+          "beginCaptures": {
+            "0": {
+              "name": "punctuation.definition.string.begin.silk"
+            }
+          },
+          "end": "'",
+          "endCaptures": {
+            "0": {
+              "name": "punctuation.definition.string.end.silk"
+            }
+          },
+          "patterns": [
+            {
+              "name": "constant.character.escape.silk",
+              "match": "\\\\."
+            }
+          ]
+        }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.duration.silk",
+          "match": "\\b[0-9]+(\\.[0-9]+)?(ns|us|ms|s|min|h|d)\\b"
+        },
+        {
+          "name": "constant.numeric.float.silk",
+          "match": "\\b[0-9]+\\.[0-9]+\\b"
+        },
+        {
+          "name": "constant.numeric.integer.silk",
+          "match": "\\b(0[bB][01]+|0[oO][0-7]+|0[xX][0-9A-Fa-f]+|0[0-7]+|0|[1-9][0-9]*)\\b"
+        }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.silk",
+          "match": "\\b(if|else|loop|match|while|for|in|return|break|continue|panic|assert|await|yield)\\b"
+        },
+        {
+          "name": "keyword.declaration.silk",
+          "match": "\\b(package|module|import|from|export|public|private|default|const|let|var|mut|move|fn|test|theory|struct|extends|enum|type|error|interface|impl|using|as|raw|ext)\\b"
+        },
+        {
+          "name": "keyword.modifier.silk",
+          "match": "\\b(pure|async|task)\\b"
+        },
+        {
+          "name": "keyword.other.silk",
+          "match": "\\b(region|with|new|sizeof|alignof|offsetof|typename|asm|where|is)\\b"
+        }
+      ]
+    },
+    "types": {
+      "patterns": [
+        {
+          "name": "storage.type.silk",
+          "match": "\\b(bool|u8|i8|u16|i16|u32|i32|u64|i64|i128|u128|int|usize|size|isize|f32|f64|f128|char|string|regexp|void)\\b"
+        },
+        {
+          "name": "support.type.silk",
+          "match": "\\b(Region|Instant|Duration|Option|Buffer|Self|Task|Promise)\\b"
+        },
+        {
+          "name": "support.type.silk",
+          "match": "\\bmap\\b(?=\\s*\\()"
+        }
+      ]
+    },
+    "booleans": {
+      "patterns": [
+        {
+          "name": "constant.language.boolean.silk",
+          "match": "\\b(true|false)\\b"
+        }
+      ]
+    },
+    "literals": {
+      "patterns": [
+        {
+          "name": "constant.language.silk",
+          "match": "\\b(None|none|null|Some)\\b"
+        }
+      ]
+    },
+    "verification": {
+      "patterns": [
+        {
+          "name": "meta.preprocessor.silk",
+          "match": "#[ \\t]*(const|require|assure|assert|invariant|variant|monovariant|theory)\\b"
+        }
+      ]
+    },
+    "operators": {
+      "patterns": [
+        {
+          "name": "keyword.operator.silk",
+          "match": "\\?\\.|\\?\\?|::|\\.\\.\\.|\\.\\.=|\\.\\.|->|=>|<<|>>|\\+=|-=|\\*=|/="
+        },
+        {
+          "name": "keyword.operator.silk",
+          "match": "==|!=|<=|>=|&&|\\|\\|"
+        },
+        {
+          "name": "keyword.operator.silk",
+          "match": "[=<>]"
+        },
+        {
+          "name": "keyword.operator.silk",
+          "match": "[&|~^!*/%+\\-]"
+        },
+        {
+          "name": "punctuation.separator.silk",
+          "match": "\\b_\\b"
+        },
+        {
+          "name": "punctuation.separator.silk",
+          "match": "[,:;?()\\[\\]{}.]"
+        }
+      ]
+    },
+    "std": {
+      "patterns": [
+        {
+          "name": "entity.name.namespace.silk",
+          "match": "\\bstd::"
+        }
+      ]
+    }
+  }
+}

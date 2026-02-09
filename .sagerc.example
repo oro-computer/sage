@@ -1,0 +1,56 @@
+# Example `sage` config file.
+#
+# Location (loaded in this order):
+# - $SAGERC (env var, explicit path)
+# - ./.sagerc
+# - $HOME/.sagerc
+#
+# Format:
+#   key = value
+# Comments start with `#` or `;`.
+#
+# CLI flags always override this file.
+
+# Theme + UI chrome.
+theme = ocean            # default | ocean | light
+color = auto             # auto | always | never
+alt_screen = true
+mouse = true             # enable mouse wheel scrolling
+
+# Content handling.
+ansi = true              # allow ESC[...m in content
+syntax = true            # enable syntax highlighting for file paths
+gutter = auto            # auto | always | never | true | false
+
+# Search defaults.
+regex = false
+ignore_case = false
+
+# Safety toggles.
+raw = false              # unsafe: render bytes as-is
+binary = false           # allow NUL bytes in input
+
+# Palette overrides (0–255). Uncomment to tweak.
+# status_bg = 236
+# status_fg = 252
+# status_dim = 244
+# brand = 114
+# accent = 81
+# warn = 214
+# err = 203
+# mode_regex = 141
+# match_bg = 24
+# match_fg = 231
+
+# Syntax palette overrides (0–255). Uncomment to tweak.
+# syn_comment = 244
+# syn_string = 114
+# syn_number = 215
+# syn_keyword = 81
+# syn_type = 110
+# syn_function = 221
+# syn_constant = 141
+# syn_operator = 245
+# syn_heading = 110
+# syn_emphasis = 214
+# syn_preproc = 203

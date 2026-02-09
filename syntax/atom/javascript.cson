@@ -1,0 +1,90 @@
+# Minimal Atom grammar (CSON) for JavaScript — `sage` sample
+#
+# This file is intentionally small and biased toward what `sage` can compile
+# today: `fileTypes` + rules with `match` + `name`, plus a limited `begin`/`end`
+# subset for stateful comment/string highlighting (see `specs/atom/1.0.md`).
+
+scopeName: 'source.js'
+name: 'JavaScript (Sage sample)'
+
+fileTypes: [
+  'js'
+  'jsx'
+  'mjs'
+  'cjs'
+]
+
+patterns: [
+  { include: '#comments' }
+  { include: '#strings' }
+  { include: '#keywords' }
+  { include: '#numbers' }
+]
+
+repository:
+  comments:
+    patterns: [
+      {
+        begin: '//'
+        end: '$'
+        name: 'comment.line.double-slash.js'
+      }
+      {
+        begin: '/\\*'
+        end: '\\*/'
+        name: 'comment.block.js'
+      }
+    ]
+
+  strings:
+    patterns: [
+      {
+        begin: "'"
+        end: "'"
+        name: 'string.quoted.single.js'
+      }
+      {
+        begin: '"'
+        end: '"'
+        name: 'string.quoted.double.js'
+      }
+      {
+        begin: '`'
+        end: '`'
+        name: 'string.quoted.template.js'
+      }
+    ]
+
+  keywords:
+    patterns: [
+      {
+        match: '\\b(break|case|catch|class|const|continue|debugger|default|delete|do|else|export|extends|finally|for|function|if|import|in|instanceof|let|new|return|super|switch|this|throw|try|typeof|var|void|while|yield|await|async)\\b'
+        name: 'keyword.control.js'
+      }
+      {
+        match: '\\b(true|false|null|undefined|NaN|Infinity)\\b'
+        name: 'constant.language.js'
+      }
+      {
+        # Type-ish identifiers (PascalCase).
+        match: '\\b([A-Z][A-Za-z0-9_]*)\\b'
+        name: 'entity.name.type.js'
+      }
+      {
+        # Function call-ish identifiers: `name(` (no lookahead).
+        match: '\\b([A-Za-z_$][A-Za-z0-9_$]*)\\s*\\('
+        name: 'entity.name.function.js'
+      }
+      {
+        match: '(?:\\+\\+|--|===|!==|==|!=|<=|>=|=>|&&|\\|\\||\\+|-|\\*|/|%|=|<|>|!|~|\\?|:|\\.|,|;|\\(|\\)|\\[|\\]|\\{|\\})'
+        name: 'keyword.operator.js'
+      }
+    ]
+
+  numbers:
+    patterns: [
+      {
+        match: '\\b(0[xX][0-9a-fA-F]+|\\d+(?:\\.\\d+)?(?:[eE][+-]?\\d+)?)\\b'
+        name: 'constant.numeric.js'
+      }
+    ]

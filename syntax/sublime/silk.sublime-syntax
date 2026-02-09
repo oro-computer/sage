@@ -1,0 +1,172 @@
+%YAML 1.2
+---
+name: Silk
+file_extensions:
+  - slk
+  - silk
+scope: source.silk
+
+contexts:
+  main:
+    - include: comments
+    - include: strings
+    - include: numbers
+    - include: verification
+    - include: keywords
+    - include: types
+    - include: booleans
+    - include: literals
+    - include: intrinsics
+    - include: operators
+    - include: std
+
+  comments:
+    - include: doc-comments
+    - include: block-comments
+    - include: line-comments
+
+  doc-comments:
+    - match: '///'
+      scope: punctuation.definition.comment.silk comment.line.documentation.silk
+      push:
+        - meta_scope: comment.line.documentation.silk
+        - include: doc-tags
+        - match: '$'
+          pop: true
+
+    - match: '/\*\*'
+      scope: punctuation.definition.comment.begin.silk comment.block.documentation.silk
+      push:
+        - meta_scope: comment.block.documentation.silk
+        - include: doc-tags
+        - match: '\*/'
+          scope: punctuation.definition.comment.end.silk comment.block.documentation.silk
+          pop: true
+
+  line-comments:
+    - match: '//(?!/)'
+      scope: punctuation.definition.comment.silk comment.line.double-slash.silk
+      push:
+        - meta_scope: comment.line.double-slash.silk
+        - match: '$'
+          pop: true
+
+  block-comments:
+    - match: '/\*(?!\*)'
+      scope: punctuation.definition.comment.begin.silk comment.block.silk
+      push:
+        - meta_scope: comment.block.silk
+        - match: '\*/'
+          scope: punctuation.definition.comment.end.silk comment.block.silk
+          pop: true
+
+  doc-tags:
+    - match: '@(param|returns|throws|external|requires|assures|asserts|theory|example|since|deprecated|remarks|see|misc|cli|synopsis|option|command)\b'
+      scope: keyword.other.documentation.silk
+
+  strings:
+    - include: string-double
+    - include: string-raw
+    - include: string-single
+
+  string-double:
+    - match: '"'
+      scope: punctuation.definition.string.begin.silk string.quoted.double.silk
+      push:
+        - meta_scope: string.quoted.double.silk
+        - match: '\\.'
+          scope: constant.character.escape.silk
+        - match: '"'
+          scope: punctuation.definition.string.end.silk string.quoted.double.silk
+          pop: true
+        - match: '\n'
+          scope: invalid.illegal.newline.silk
+          pop: true
+
+  string-raw:
+    - match: '`'
+      scope: punctuation.definition.string.begin.silk string.quoted.other.backtick.silk
+      push:
+        - meta_scope: string.quoted.other.backtick.silk
+        - match: '`'
+          scope: punctuation.definition.string.end.silk string.quoted.other.backtick.silk
+          pop: true
+
+  string-single:
+    - match: "'"
+      scope: punctuation.definition.string.begin.silk string.quoted.single.silk
+      push:
+        - meta_scope: string.quoted.single.silk
+        - match: '\\.'
+          scope: constant.character.escape.silk
+        - match: "'"
+          scope: punctuation.definition.string.end.silk string.quoted.single.silk
+          pop: true
+        - match: '\n'
+          scope: invalid.illegal.newline.silk
+          pop: true
+
+  numbers:
+    - match: '\b[0-9]+(\.[0-9]+)?(ns|us|ms|s|min|h|d)\b'
+      scope: constant.numeric.duration.silk
+    - match: '\b[0-9]+\.[0-9]+\b'
+      scope: constant.numeric.float.silk
+    - match: '\b(0[bB][01]+|0[oO][0-7]+|0[xX][0-9A-Fa-f]+|0[0-7]+|0|[1-9][0-9]*)\b'
+      scope: constant.numeric.integer.silk
+
+  keywords:
+    - match: '\b(if|else|loop|match|while|for|in|return|break|continue|panic|assert|await|yield)\b'
+      scope: keyword.control.silk
+    - match: '\b(package|module|import|from|export|public|private|default|const|let|var|mut|move|fn|test|theory|struct|extends|enum|type|error|interface|impl|using|as|raw|ext)\b'
+      scope: keyword.declaration.silk
+    - match: '\b(pure|async|task)\b'
+      scope: keyword.modifier.silk
+    - match: '\b(region|with|new|sizeof|alignof|offsetof|typename|asm|where|is)\b'
+      scope: keyword.other.silk
+
+  types:
+    - match: '\b(bool|u8|i8|u16|i16|u32|i32|u64|i64|i128|u128|int|usize|size|isize|f32|f64|f128|char|string|regexp|void)\b'
+      scope: storage.type.silk
+    - match: '\b(Instant|Duration|Region|Option|Buffer|Self|Task|Promise)\b'
+      scope: support.type.silk
+    - match: '\bmap\b(?=\s*\()'
+      scope: support.type.silk
+
+  booleans:
+    - match: '\b(true|false)\b'
+      scope: constant.language.boolean.silk
+
+  literals:
+    - match: '\b(None|none|null|Some)\b'
+      scope: constant.language.silk
+    - match: '\b(Ok|Err)\b(?=\s*\()'
+      scope: constant.language.silk
+
+  intrinsics:
+    - match: '\b__silk_[A-Za-z0-9_]+\b'
+      scope: support.function.builtin.silk
+    - match: '\b(constructor|drop)\b(?=\s*\()'
+      scope: support.function.magic.silk
+
+  verification:
+    - match: '#[ \t]*(const|require|assure|assert|invariant|variant|monovariant|theory)\b'
+      scope: meta.preprocessor.silk
+
+  operators:
+    - match: '\?\.|\?\?|::|\.\.\.|\.\.=|\.\.|->|=>|<<|>>|\+\+|--|\+=|-=|\*=|/='
+      scope: keyword.operator.silk
+    - match: '==|!=|<=|>=|&&|\|\|'
+      scope: keyword.operator.silk
+    - match: '[=<>]'
+      scope: keyword.operator.silk
+    - match: '[&|~^!*/%+\-]'
+      scope: keyword.operator.silk
+    - match: '\b_\b'
+      scope: punctuation.separator.silk
+    - match: '[,:;?()\[\]{}.]'
+      scope: punctuation.separator.silk
+
+  std:
+    - match: '\bstd::'
+      scope: entity.name.namespace.silk
+...
