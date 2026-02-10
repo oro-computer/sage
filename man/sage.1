@@ -1,0 +1,305 @@
+.TH SAGE 1 "2026-02-09" "sage 0.1.0" "User Commands"
+.SH NAME
+sage \- a fast, ergonomic terminal pager
+.SH SYNOPSIS
+.B sage
+[\fIOPTIONS\fR]
+[\fIPATH\fR\ ...]
+.PP
+.B sage
+\-\-compile\-cache
+.PP
+.B sage
+\-\-list\-syntax
+.PP
+.B sage
+\-\-index\-only
+[\fIPATH\fR]
+.SH DESCRIPTION
+\fBsage\fR is a terminal pager inspired by \fBmost\fR, focused on speed, reliability, and an ergonomic UX.
+It supports:
+.IP \(bu 2
+fast paging of very large files,
+.IP \(bu 2
+incremental search (literal or regex),
+.IP \(bu 2
+multiple open files with tabs,
+.IP \(bu 2
+mouse scrolling and selection (optional),
+.IP \(bu 2
+optional syntax highlighting via a compiled cache.
+.PP
+When \fBstdin\fR is a pipe (for example, \fBman\fR output), \fBsage\fR reads keys from \fI/dev/tty\fR so it remains interactive.
+If \fBstdout\fR is not a TTY, \fBsage\fR behaves like a safe pass\-through filter.
+.PP
+If a \fIPATH\fR is a directory, \fBsage\fR opens each direct child file as a tab (non\-recursive).
+.SH OPTIONS
+.TP
+.B \-h\fR,\fB \-\-help
+Show help and exit.
+.TP
+.B \-V\fR,\fB \-\-version
+Show version and exit.
+.TP
+.B \-v\fR,\fB \-\-verbose
+Enable verbose logging to \fBstderr\fR.
+.TP
+.B \-\-color\fR \fIMODE\fR
+UI color mode: \fBauto\fR, \fBalways\fR, or \fBnever\fR. In \fBauto\fR mode, \fBNO_COLOR\fR disables UI colors.
+.TP
+.B \-\-no\-color
+Disable UI colors (same as \fB\-\-color never\fR).
+.TP
+.B \-\-theme\fR \fINAME\fR
+UI theme: \fBdefault\fR, \fBocean\fR, \fBlight\fR.
+.TP
+.B \-\-syntax
+Enable syntax highlighting for file paths (default: on). Syntax highlighting is not applied to stdin (\fIPATH\fR \fB\-\fR).
+.TP
+.B \-\-no\-syntax
+Disable syntax highlighting.
+.TP
+.B \-\-gutter\fR,\fB \-\-line\-numbers
+Always show the line number gutter.
+.TP
+.B \-\-no\-gutter\fR,\fB \-\-no\-line\-numbers
+Never show the line number gutter.
+.IP
+Default behavior is \fBauto\fR: show the gutter when a syntax is recognized for the current file.
+The in\-app \fBL\fR key toggles the gutter at runtime.
+.TP
+.B \-\-mouse
+Enable mouse wheel scrolling and mouse interactions (default: on).
+.TP
+.B \-\-no\-mouse
+Disable mouse interactions.
+.TP
+.B \-\-rc\fR \fIPATH\fR
+Read configuration from \fIPATH\fR.
+.TP
+.B \-\-no\-rc
+Do not read any config file.
+.TP
+.B \-\-no\-alt\-screen
+Do not use the terminal alternate screen buffer.
+.TP
+.B \-\-ansi
+Allow ANSI SGR sequences (\fBESC [ ... m\fR) from content (default: on). This enables colored \fBman\fR pages and diffs.
+.TP
+.B \-\-no\-ansi
+Sanitize all escape sequences in content (safer; disables colored \fBman\fR pages).
+.IP
+Note: when syntax highlighting is active, \fBsage\fR disables content\-SGR pass\-through to avoid mixing two independent SGR streams.
+.TP
+.B \-\-raw
+Render bytes as\-is (unsafe). Disables safety sanitization; untrusted input may execute terminal control sequences.
+.TP
+.B \-\-binary
+Allow NUL bytes in input.
+.TP
+.B \-R\fR,\fB \-\-regex
+Use regex search.
+.TP
+.B \-i\fR,\fB \-\-ignore\-case
+Case\-insensitive search (ASCII for literal search).
+.TP
+.B \-\-index\-only
+Build the background line index, print stats, and exit (useful for perf testing).
+.TP
+.B \-\-compile\-cache
+Compile syntax definition sources from \fBXDG_CONFIG_HOME\fR/\fBsage/syntax\fR into a binary cache under \fBXDG_CACHE_HOME\fR/\fBsage/syntax\fR.
+.TP
+.B \-\-list\-syntax
+List compiled syntax keys (one per line). With \fB\-\-verbose\fR, also prints key\->cache mappings to \fBstderr\fR.
+.SH KEYS
+.SS Navigation
+.TP
+.B q
+Quit.
+.TP
+.B Ctrl\-C
+Quit, or copy the active selection (see \fBSelection\fR).
+.TP
+.B j\fR,\fB d\fR,\fB Down
+Scroll down one visual line.
+.TP
+.B k\fR,\fB u\fR,\fB Up
+Scroll up one visual line.
+.TP
+.B Space\fR,\fB PageDown\fR,\fB Ctrl\-D
+Page down.
+.TP
+.B b\fR,\fB PageUp\fR,\fB Ctrl\-U
+Page up.
+.TP
+.B Right\fR,\fB Left
+Page forward/back.
+.TP
+.B gg\fR,\fB Home
+Jump to top.
+.TP
+.B G\fR,\fB End
+Jump to bottom.
+.SS Tabs
+When multiple files are opened, \fBsage\fR shows a tab bar (row 1).
+.TP
+.B Tab\fR,\fB Shift\-Tab
+Cycle to next/previous tab (wraps around).
+.TP
+.B 0\-9
+Jump to tab \fIN\fR (tabs are 1\-indexed; \fB0\fR selects the last tab).
+.TP
+.B MouseClickTab
+Left\-click a tab label to switch to it.
+.SS Search
+.TP
+.B /
+Search prompt (starts incremental search; jumps to first match).
+.TP
+.B n\fR,\fB p
+Next / previous match.
+.TP
+.B Esc
+Cancel an in\-flight search and clear selection state.
+.SS Commands
+.TP
+.B :
+Enter command mode.
+.TP
+.B L
+Toggle the line number gutter.
+.TP
+.B ?\fR,\fB h
+Toggle the in\-app help overlay.
+.SH COMMAND MODE
+Command mode accepts a small vim\-like subset:
+.TP
+.B :q\fR,\fB :quit
+Quit.
+.TP
+.B :\fIN\fR
+Jump to line \fIN\fR (1\-indexed).
+.TP
+.B :bn\fR,\fB :buffer\-next\fR,\fB :tn\fR,\fB :tab\-next
+Next tab.
+.TP
+.B :bp\fR,\fB :buffer\-prev\fR,\fB :buffer\-previous\fR,\fB :tp\fR,\fB :tab\-prev\fR,\fB :tab\-previous
+Previous tab.
+.TP
+.B :tab\fR \fIN\fR
+Jump to tab \fIN\fR (1\-indexed; \fB0\fR selects the last tab).
+.TP
+.B :t\fIN\fR
+Alias for \fB:tab\fR \fIN\fR. Also accepts \fB:t\fR \fIN\fR.
+.SH SELECTION
+With mouse support enabled:
+.IP \(bu 2
+Left\-drag selects text in the content area (the gutter is excluded from selection),
+.IP \(bu 2
+\fBCtrl\-C\fR copies the selection using OSC 52 (max ~200KB),
+.IP \(bu 2
+\fBEsc\fR clears the selection.
+.PP
+Many terminals and muxers use \fBShift\fR to bypass application mouse reporting for terminal\-native selection; use that if you prefer your terminal's selection behavior.
+.SH SYNTAX HIGHLIGHTING
+Syntax highlighting is optional and applies only when \fBsage\fR is given a file path.
+.PP
+Sources live under:
+.IP
+\fBXDG_CONFIG_HOME\fR/\fBsage/syntax/\fR (default: \fI~/.config/sage/syntax/\fR)
+.PP
+Compiled caches live under:
+.IP
+\fBXDG_CACHE_HOME\fR/\fBsage/syntax/\fR (default: \fI~/.cache/sage/syntax/\fR)
+.PP
+Run \fBsage \-\-compile\-cache\fR after installing/updating syntax sources.
+Supported source formats (subset):
+.IP \(bu 2
+\fB.sublime\-syntax\fR (Sublime Text)
+.IP \(bu 2
+\fB.tmLanguage\fR and \fB.tmLanguage.json\fR (TextMate)
+.IP \(bu 2
+\fB.cson\fR (Atom grammar)
+.PP
+The on\-disk binary cache formats are documented in \fIspecs/sagec/2.0.md\fR.
+.SH CONFIGURATION
+At startup, \fBsage\fR loads a config file unless \fB\-\-no\-rc\fR is provided.
+Order:
+.IP 1. 3
+\fBSAGERC\fR (explicit path via env var)
+.IP 2. 3
+\fI./.sagerc\fR
+.IP 3. 3
+\fI$HOME/.sagerc\fR
+.PP
+Use \fB\-\-rc\fR \fIPATH\fR to load a specific config file.
+Command line flags always override config values.
+.PP
+Format:
+.IP
+\fIkey\fR \fB=\fR \fIvalue\fR
+.PP
+Comments start with \fB#\fR or \fB;\fR.
+.PP
+See \fI.sagerc.example\fR for the supported keys, themes, and palette overrides.
+.SH ENVIRONMENT
+.TP
+.B SAGERC
+Path to a \fB.sagerc\fR config file (highest precedence).
+.TP
+.B NO_COLOR
+If set and \fB\-\-color auto\fR, disables UI colors.
+.TP
+.B XDG_CONFIG_HOME
+Base directory for config files (used for syntax sources).
+.TP
+.B XDG_CACHE_HOME
+Base directory for cache files (used for compiled syntax caches).
+.SH FILES
+.TP
+.I ~/.config/sage/syntax/
+Default syntax source directory.
+.TP
+.I ~/.cache/sage/syntax/
+Default compiled syntax cache directory.
+.TP
+.I ./.sagerc
+Config file in the current directory.
+.TP
+.I ~/.sagerc
+Fallback config file in the home directory.
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 2
+Error (failed to open input, invalid config, cache/index failure, etc).
+.SH EXAMPLES
+.TP
+Page a file
+.IP
+\fBsage\fR README.md
+.TP
+Use as a pager for \fBman\fR
+.IP
+\fBPAGER=sage\fR \fBman\fR printf
+.TP
+Open all files in a directory
+.IP
+\fBsage\fR src/
+.TP
+Compile syntax caches
+.IP
+\fBsage\fR \fB\-\-compile\-cache\fR
+.TP
+List compiled syntax keys
+.IP
+\fBsage\fR \fB\-\-list\-syntax\fR
+.SH SECURITY
+By default, \fBsage\fR sanitizes control bytes to reduce terminal injection risk while optionally allowing ANSI SGR sequences for formatted content.
+.PP
+\fB\-\-raw\fR disables sanitization and may execute terminal control sequences from content; only use it on trusted input.
+.SH BUGS
+\fBsage\fR is a work in progress.
+If you hit incorrect rendering or terminal incompatibilities, try disabling features (\fB\-\-no\-alt\-screen\fR, \fB\-\-no\-mouse\fR, \fB\-\-no\-ansi\fR) and report the behavior.

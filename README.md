@@ -13,10 +13,17 @@ silk build --package .
 
 Binary: `./build/bin/sage`
 
+## Man page
+
+```sh
+man -l man/sage.1
+```
+
 ## Usage
 
 ```sh
-./build/bin/sage <path> [path ...]
+./build/bin/sage <path> [path ...]  # files or directories (dirs expand to child files)
+./build/bin/sage src/               # open all files in a directory (non-recursive)
 cat <path> | ./build/bin/sage
 ./build/bin/sage --index-only <path>
 ./build/bin/sage --compile-cache    # compile syntax cache (see below)
@@ -45,12 +52,13 @@ cat <path> | ./build/bin/sage
 - `←` / `Left` — up one page
 - `Tab` — next tab (when multiple files are open)
 - `Shift-Tab` — previous tab
-- `g` / `Home` — top
+- `gg` / `Home` — top
 - `G` / `End` — bottom
 - `/` — search (starts searching; jumps to first match when found)
+- `DoubleClick` — set query to clicked word
 - `n` — next match
 - `p` — previous match
-- `:` — command mode (`:<n>` goto line, `:q` quit, `:bn`/`:bp` next/prev tab, `:tab <n>` go to tab `<n>`; tabs are 0-indexed)
+- `:` — command mode (`:<n>` goto line, `:q` quit, `:bn`/`:bp` next/prev tab, `:tab <n>` go to tab `<n>`; tabs are 1-indexed and `0` jumps to the last tab)
 - `L` — toggle line-number gutter
 - `Esc` — cancel search / cancel pending goto / clear selection
 - `?` / `h` — help

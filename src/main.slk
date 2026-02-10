@@ -155,6 +155,8 @@ let ALERT_COPY_FAILED: int = 13;
 
 let COPY_MAX_BYTES: i64 = 200000;
 let SYN_STATE_LOOKBACK_BYTES: i64 = 65536;
+let DOUBLE_CLICK_NS: i64 = 350000000; // 350ms
+let WORD_QUERY_MAX: i64 = 256;
 
 fn theme_default () -> Theme {
   return Theme{
@@ -505,17 +507,248 @@ struct Tabs {
   cap: i64,
 }
 
+fn cstr_copy_owned (s: string) -> string? {
+  // Allocate an owned, NUL-terminated copy so it can be passed to POSIX APIs.
+  let p: u64 = std::runtime::mem::string_ptr(s);
+  let n: i64 = std::runtime::mem::string_len(s);
+  if p == 0 || n < 0 {
+    return None;
+  }
+
+  let out: u64 = std::runtime::mem::alloc(n + 1);
+  if out == 0 {
+    return None;
+  }
+  var i: i64 = 0;
+  while i < n {
+    std::runtime::mem::store_u8(out, i, std::runtime::mem::load_u8(p, i));
+    i = i + 1;
+  }
+  std::runtime::mem::store_u8(out, n, 0);
+  return Some(std::runtime::mem::string_from_ptr_len(out, n as int));
+}
+
+fn join2 (a: string, b: string) -> string? {
+  // Allocate an owned, NUL-terminated concatenation.
+  let a_ptr: u64 = std::runtime::mem::string_ptr(a);
+  let a_len: i64 = std::runtime::mem::string_len(a);
+  let b_ptr: u64 = std::runtime::mem::string_ptr(b);
+  let b_len: i64 = std::runtime::mem::string_len(b);
+  if a_ptr == 0 || b_ptr == 0 || a_len < 0 || b_len < 0 {
+    return None;
+  }
+  let total: i64 = a_len + b_len;
+  if total < 0 {
+    return None;
+  }
+  let out: u64 = std::runtime::mem::alloc(total + 1);
+  if out == 0 {
+    return None;
+  }
+  var i: i64 = 0;
+  while i < a_len {
+    std::runtime::mem::store_u8(out, i, std::runtime::mem::load_u8(a_ptr, i));
+    i = i + 1;
+  }
+  var j: i64 = 0;
+  while j < b_len {
+    std::runtime::mem::store_u8(out, a_len + j, std::runtime::mem::load_u8(b_ptr, j));
+    j = j + 1;
+  }
+  std::runtime::mem::store_u8(out, total, 0);
+  return Some(std::runtime::mem::string_from_ptr_len(out, total as int));
+}
+
+fn free_joined (s: string) -> void {
+  let p: u64 = std::runtime::mem::string_ptr(s);
+  if p != 0 {
+    std::runtime::mem::free(p);
+  }
+}
+
+fn ends_with_slash (path: string) -> bool {
+  let p: u64 = std::runtime::mem::string_ptr(path);
+  let n: i64 = std::runtime::mem::string_len(path);
+  if p == 0 || n <= 0 {
+    return false;
+  }
+  return std::runtime::mem::load_u8(p, n - 1) == 47; // '/'
+}
+
+fn tabs_ensure_cap (mut tabs: &Tabs, extra: i64) -> bool {
+  if extra <= 0 {
+    return true;
+  }
+  let need: i64 = tabs.len + extra;
+  if need <= tabs.cap {
+    return true;
+  }
+
+  let tab_bytes: i64 = (sizeof (TabState)) as i64;
+  var new_cap: i64 = if tabs.cap > 0 { tabs.cap * 2 } else { 8 };
+  while new_cap < need {
+    new_cap = new_cap * 2;
+  }
+  let new_bytes: i64 = new_cap * tab_bytes;
+  let new_ptr: u64 = if tabs.ptr != 0 { std::runtime::mem::realloc(tabs.ptr, new_bytes) } else { std::runtime::mem::alloc(new_bytes) };
+  if new_ptr == 0 {
+    return false;
+  }
+  tabs.ptr = new_ptr;
+  tabs.cap = new_cap;
+  return true;
+}
+
+fn tabs_push_owned (mut tabs: &Tabs, path_owned: string) -> bool {
+  if !tabs_ensure_cap(mut tabs, 1) {
+    return false;
+  }
+  (tabs.ptr as TabState[](tabs.cap as int))[tabs.len] = TabState{ path: path_owned, top_off: 0, gutter_on: false };
+  tabs.len = tabs.len + 1;
+  return true;
+}
+
+fn tabs_has_path (tabs: &Tabs, path: string) -> bool {
+  if tabs.ptr == 0 || tabs.len <= 0 {
+    return false;
+  }
+  var i: i64 = 0;
+  while i < tabs.len {
+    let t: TabState = (tabs.ptr as TabState[](tabs.cap as int))[i];
+    if t.path == path {
+      return true;
+    }
+    i = i + 1;
+  }
+  return false;
+}
+
+fn tabs_push_owned_unique (mut tabs: &Tabs, path_owned: string) -> int {
+  // Returns:
+  // -  1 if pushed,
+  // -  0 if a duplicate (freed),
+  // - -1 on failure (OOM).
+  if tabs_has_path(tabs, path_owned) {
+    free_joined(path_owned);
+    return 0;
+  }
+  if !tabs_push_owned(mut tabs, path_owned) {
+    return -1;
+  }
+  return 1;
+}
+
+fn tabs_expand_dir (mut tabs: &Tabs, dir_path: string) -> int {
+  // Expand a directory into its direct child files (non-recursive).
+  //
+  // NOTE: In this runtime snapshot, `opendir` is more reliable when paths end
+  // with '/', so ensure a trailing slash.
+  var prefix: string = dir_path;
+  var prefix_owned: bool = false;
+  if !ends_with_slash(dir_path) {
+    let p_opt: string? = join2(dir_path, "/");
+    if p_opt == None { return -1; }
+    prefix = match (p_opt) { Some(v) => v, None => "" };
+    prefix_owned = true;
+  }
+
+  let dir: u64 = std::runtime::posix::fs::opendir(prefix);
+  if dir == 0 {
+    if prefix_owned { free_joined(prefix); }
+    return 0;
+  }
+
+  var added: i64 = 0;
+  var any_file: bool = false;
+  while true {
+    let name_cstr: u64 = std::runtime::posix::fs::readdir_name_owned(dir);
+    if name_cstr == 0 {
+      break;
+    }
+    let name_len: i64 = cstr_len_max(name_cstr, 4096);
+    let name: string = std::runtime::mem::string_from_ptr_len(name_cstr, name_len as int);
+
+    // Skip "." and "..".
+    if name == "." || name == ".." {
+      std::runtime::mem::free(name_cstr);
+      continue;
+    }
+
+    // Build full path (owned).
+    let full_opt: string? = join2(prefix, name);
+    std::runtime::mem::free(name_cstr);
+    if full_opt == None {
+      let _ = std::runtime::posix::fs::closedir(dir);
+      if prefix_owned { free_joined(prefix); }
+      return -1;
+    }
+    let full: string = match (full_opt) { Some(v) => v, None => "" };
+
+    // Skip directories.
+    let child_dir_opt: string? = join2(full, "/");
+    if child_dir_opt == None {
+      free_joined(full);
+      let _ = std::runtime::posix::fs::closedir(dir);
+      if prefix_owned { free_joined(prefix); }
+      return -1;
+    }
+    let child_dir: string = match (child_dir_opt) { Some(v) => v, None => "" };
+    let sub: u64 = std::runtime::posix::fs::opendir(child_dir);
+    if sub != 0 {
+      let _ = std::runtime::posix::fs::closedir(sub);
+      free_joined(child_dir);
+      free_joined(full);
+      continue;
+    }
+    free_joined(child_dir);
+
+    any_file = true;
+    let rc: int = tabs_push_owned_unique(mut tabs, full);
+    if rc < 0 {
+      free_joined(full);
+      let _ = std::runtime::posix::fs::closedir(dir);
+      if prefix_owned { free_joined(prefix); }
+      return -1;
+    }
+    if rc > 0 {
+      added = added + 1;
+    }
+  }
+
+  let _ = std::runtime::posix::fs::closedir(dir);
+  if prefix_owned { free_joined(prefix); }
+
+  // If the directory had no direct child files, keep the original path as a
+  // tab so the caller gets a useful open error.
+  if !any_file {
+    let own_opt: string? = cstr_copy_owned(dir_path);
+    if own_opt == None {
+      return -1;
+    }
+    let own: string = match (own_opt) { Some(v) => v, None => "" };
+    let rc2: int = tabs_push_owned_unique(mut tabs, own);
+    if rc2 < 0 {
+      free_joined(own);
+      return -1;
+    }
+    return 1;
+  }
+
+  return 1;
+}
+
 fn tabs_collect (args: Args) -> Tabs? {
   let n: int = args.count();
-  let tab_bytes: i64 = (sizeof (TabState)) as i64;
   let cap: i64 = if n > 0 { n as i64 } else { 0 };
+  let tab_bytes: i64 = (sizeof (TabState)) as i64;
   let bytes: i64 = cap * tab_bytes;
   let ptr: u64 = if bytes > 0 { std::runtime::mem::alloc(bytes) } else { 0 };
   if cap > 0 && ptr == 0 {
     return None;
   }
 
-  var tabs_len: i64 = 0;
+  let mut tabs: Tabs = Tabs{ ptr: ptr, len: 0, cap: cap };
+
   var i: int = 1;
   var after_dd: bool = false;
   while i < n {
@@ -536,18 +769,46 @@ fn tabs_collect (args: Args) -> Tabs? {
       continue;
     }
 
-    if tabs_len < cap {
-      (ptr as TabState[](cap as int))[tabs_len] = TabState{ path: a, top_off: 0, gutter_on: false };
-      tabs_len = tabs_len + 1;
+    // Directory? Expand to child files. Otherwise, push the path as-is.
+    let exp: int = if a != "-" { tabs_expand_dir(mut tabs, a) } else { 0 };
+    if exp == 1 {
+      // expanded
+    } else if exp == 0 {
+      let own_opt: string? = cstr_copy_owned(a);
+      if own_opt == None {
+        tabs_free(mut tabs);
+        return None;
+      }
+      let own: string = match (own_opt) { Some(v) => v, None => "" };
+      let rc: int = tabs_push_owned_unique(mut tabs, own);
+      if rc < 0 {
+        free_joined(own);
+        tabs_free(mut tabs);
+        return None;
+      }
+    } else {
+      // Fatal error while expanding directory (likely OOM).
+      tabs_free(mut tabs);
+      return None;
     }
+
     i = i + 1;
   }
 
-  return Some(Tabs{ ptr: ptr, len: tabs_len, cap: cap });
+  return Some(tabs);
 }
 
 fn tabs_free (mut tabs: &Tabs) -> void {
   if tabs.ptr != 0 {
+    var i: i64 = 0;
+    while i < tabs.len {
+      let t: TabState = (tabs.ptr as TabState[](tabs.cap as int))[i];
+      let p: u64 = std::runtime::mem::string_ptr(t.path);
+      if p != 0 {
+        std::runtime::mem::free(p);
+      }
+      i = i + 1;
+    }
     std::runtime::mem::free(tabs.ptr);
   }
   tabs.ptr = 0;
@@ -1008,7 +1269,7 @@ fn print_help () -> void {
   let _ = w.push_str("sage — a fast, ergonomic terminal pager (WIP)\n");
   let _ = w.push_str("\n");
   let _ = w.push_str("Usage:\n");
-  let _ = w.push_str("  sage <path> [path ...]\n");
+  let _ = w.push_str("  sage <path> [path ...]  (directories expand to child files)\n");
   let _ = w.push_str("  cat <path> | sage\n");
   let _ = w.push_str("\n");
   let _ = w.push_str("Options:\n");
@@ -1033,7 +1294,7 @@ fn print_help () -> void {
   let _ = w.push_str("  -i, --ignore-case Case-insensitive search\n");
   let _ = w.push_str("      --index-only  Build line index, print stats, exit\n");
   let _ = w.push_str("\n");
-  let _ = w.push_str("Keys: q quit, Ctrl-C quit/copy, j/k/u/d/Up/Down scroll, MouseWheel scroll, Space/PgDn/Ctrl-D page down, b/PgUp/Ctrl-U page up, Left/Right page, g/G top/bottom, Tab/Shift-Tab tabs, MouseDrag select, / search, n next, p prev, : cmd, L gutter, Esc cancel, ? help\n");
+  let _ = w.push_str("Keys: q quit, Ctrl-C quit/copy, j/k/u/d/Up/Down scroll, MouseWheel scroll, Space/PgDn/Ctrl-D page down, b/PgUp/Ctrl-U page up, Left/Right page, gg/G top/bottom, Tab/Shift-Tab tabs, MouseDrag select, / search, n next, p prev, : cmd, L gutter, Esc cancel, ? help\n");
 
   let _ = w.flush();
 }
@@ -1420,6 +1681,25 @@ fn tab_prev (cur: i64, tabs_len: i64) -> i64 {
   return cur - 1;
 }
 
+fn tab_index_from_user_num (n: i64, tabs_len: i64) -> i64? {
+  // User-facing tab numbers are 1-indexed.
+  // `0` is a convenience shortcut that always selects the last tab.
+  if tabs_len <= 0 {
+    return None;
+  }
+  if n == 0 {
+    return Some(tabs_len - 1);
+  }
+  if n < 0 {
+    return None;
+  }
+  let idx: i64 = n - 1;
+  if idx < 0 || idx >= tabs_len {
+    return None;
+  }
+  return Some(idx);
+}
+
 fn min_i64 (a: i64, b: i64) -> i64 {
   if a < b { return a; }
   return b;
@@ -1799,6 +2079,70 @@ fn offset_for_view_row_col (file_ptr: u64, file_len: i64, top_off: i64, row0: in
   let d: i64 = byte_index_for_visual_col(file_ptr + (cur as u64), line_len2, col_t, unsafe_raw, allow_ansi);
   let out: i64 = cur + d;
   return if out <= file_len { out } else { file_len };
+}
+
+struct WordSpan {
+  start: i64,
+  end: i64,
+}
+
+fn is_word_byte (b: u8) -> bool {
+  if b >= 48 && b <= 57 { return true; }   // 0-9
+  if b >= 65 && b <= 90 { return true; }   // A-Z
+  if b >= 97 && b <= 122 { return true; }  // a-z
+  return b == 95; // '_'
+}
+
+fn word_span_at (file_ptr: u64, file_len: i64, off0: i64) -> WordSpan? {
+  if file_ptr == 0 || file_len <= 0 {
+    return None;
+  }
+
+  var off: i64 = off0;
+  if off < 0 { off = 0; }
+  if off >= file_len {
+    if file_len <= 0 { return None; }
+    off = file_len - 1;
+  }
+
+  var b: u8 = std::runtime::mem::load_u8(file_ptr, off);
+  if !is_word_byte(b) {
+    if off > 0 {
+      let b2: u8 = std::runtime::mem::load_u8(file_ptr, off - 1);
+      if is_word_byte(b2) {
+        off = off - 1;
+        b = b2;
+      } else {
+        return None;
+      }
+    } else {
+      return None;
+    }
+  }
+
+  let _ = b;
+  var start: i64 = off;
+  while start > 0 {
+    let p: u8 = std::runtime::mem::load_u8(file_ptr, start - 1);
+    if !is_word_byte(p) { break; }
+    start = start - 1;
+  }
+
+  var end: i64 = off + 1;
+  while end < file_len {
+    let c: u8 = std::runtime::mem::load_u8(file_ptr, end);
+    if !is_word_byte(c) { break; }
+    end = end + 1;
+  }
+
+  if end <= start {
+    return None;
+  }
+
+  // Clamp extremely long "words" to a reasonable query length.
+  let len0: i64 = end - start;
+  let len: i64 = if len0 > WORD_QUERY_MAX { WORD_QUERY_MAX } else { len0 };
+  return Some(WordSpan{ start: start, end: start + len });
 }
 
 fn b64_char (v: int) -> u8 {
@@ -2182,6 +2526,46 @@ test "visual_prev_off inverts visual_next_off (ansi off)" {
   }
 
   std::runtime::mem::free(p);
+}
+
+test "word_span_at extracts identifiers" {
+  let s: string = "hello world\nfoo_bar42 baz\n";
+  let p: u64 = std::runtime::mem::string_ptr(s);
+  let n: i64 = std::runtime::mem::string_len(s);
+
+  let sp1_opt: WordSpan? = word_span_at(p, n, 1);
+  assert(sp1_opt != None, "span hello");
+  let sp1: WordSpan = match (sp1_opt) { Some(v) => v, None => WordSpan{ start: 0, end: 0 } };
+  let w1: string = std::runtime::mem::string_from_ptr_len(p + (sp1.start as u64), (sp1.end - sp1.start) as int);
+  assert(w1 == "hello", "hello word");
+
+  // Cursor on whitespace should still pick the preceding word.
+  let sp2_opt: WordSpan? = word_span_at(p, n, 5);
+  assert(sp2_opt != None, "span hello (space)");
+  let sp2: WordSpan = match (sp2_opt) { Some(v) => v, None => WordSpan{ start: 0, end: 0 } };
+  let w2: string = std::runtime::mem::string_from_ptr_len(p + (sp2.start as u64), (sp2.end - sp2.start) as int);
+  assert(w2 == "hello", "space selects previous word");
+
+  // Underscore + digits are part of the word.
+  let sp3_opt: WordSpan? = word_span_at(p, n, 14); // inside foo_bar42
+  assert(sp3_opt != None, "span foo_bar42");
+  let sp3: WordSpan = match (sp3_opt) { Some(v) => v, None => WordSpan{ start: 0, end: 0 } };
+  let w3: string = std::runtime::mem::string_from_ptr_len(p + (sp3.start as u64), (sp3.end - sp3.start) as int);
+  assert(w3 == "foo_bar42", "foo_bar42 word");
+
+  // Newlines / whitespace select the preceding word when possible.
+  let sp4_opt: WordSpan? = word_span_at(p, n, 11); // newline after "world"
+  assert(sp4_opt != None, "newline span");
+  let sp4: WordSpan = match (sp4_opt) { Some(v) => v, None => WordSpan{ start: 0, end: 0 } };
+  let w4: string = std::runtime::mem::string_from_ptr_len(p + (sp4.start as u64), (sp4.end - sp4.start) as int);
+  assert(w4 == "world", "newline selects previous word");
+
+  // Non-word chars with no adjacent identifier return None.
+  let s2: string = "--\n";
+  let p2: u64 = std::runtime::mem::string_ptr(s2);
+  let n2: i64 = std::runtime::mem::string_len(s2);
+  let sp5_opt: WordSpan? = word_span_at(p2, n2, 0);
+  assert(sp5_opt == None, "dash none");
 }
 
 // ---------------------------------------------------------------------------
@@ -2616,8 +3000,8 @@ fn draw_help (
   if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.accent, "Right / Left", help_desc_col, "forward/back a page"); r = r + 1; }
   if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.accent, "Tab / Shift-Tab", help_desc_col, "next/prev file tab"); r = r + 1; }
   if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.accent, "MouseClickTab", help_desc_col, "switch to clicked tab"); r = r + 1; }
-  if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.accent, "0-9", help_desc_col, "jump to tab N"); r = r + 1; }
-  if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.accent, "g / Home", help_desc_col, "top"); r = r + 1; }
+  if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.accent, "1-9", help_desc_col, "jump to tab N (0 = last tab)"); r = r + 1; }
+  if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.accent, "gg / Home", help_desc_col, "top"); r = r + 1; }
   if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.accent, "G / End", help_desc_col, "bottom"); r = r + 1; }
 
   // Blank.
@@ -2638,6 +3022,7 @@ fn draw_help (
     r = r + 1;
   }
   if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.accent, "/", help_desc_col, "enter a query (jumps to first match)"); r = r + 1; }
+  if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.accent, "DoubleClick", help_desc_col, "set query to clicked word"); r = r + 1; }
   if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.accent, "n", help_desc_col, "next match"); r = r + 1; }
   if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.accent, "p", help_desc_col, "previous match"); r = r + 1; }
 
@@ -2658,7 +3043,7 @@ fn draw_help (
     ansi_clear_eol(mut w);
     r = r + 1;
   }
-  if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.accent, ":", help_desc_col, "goto line (:<n>), :tab <n>/:t<n>, :bn/:bp, :q quit"); r = r + 1; }
+  if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.accent, ":", help_desc_col, "goto line (:<n>), :tab <n>/:t<n> (0 = last), :bn/:bp, :q quit"); r = r + 1; }
   if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.accent, "L", help_desc_col, "toggle line-number gutter"); r = r + 1; }
   if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.accent, "MouseDrag", help_desc_col, "select text (gutter excluded)"); r = r + 1; }
   if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.accent, "Ctrl-C", help_desc_col, "copy selection (OSC 52)"); r = r + 1; }
@@ -2747,10 +3132,11 @@ fn draw_help_row (mut w: &Writer, _theme: &Theme, row: int, key_color: int, key:
 }
 
 fn tab_label_est_len (path: string, idx: i64, name_max: int) -> int {
+  let disp: i64 = idx + 1;
   let name_ptr: u64 = std::runtime::mem::string_ptr(path);
   let name_len: i64 = std::runtime::mem::string_len(path);
   if name_ptr == 0 || name_len <= 0 {
-    return 2 + digits_i64(idx) + 1 + 1; // " <idx>:? "
+    return 2 + digits_i64(disp) + 1 + 1; // " <idx>:? "
   }
 
   let slash: u64 = memrchr(name_ptr, 47, name_len); // '/'
@@ -2761,7 +3147,7 @@ fn tab_label_est_len (path: string, idx: i64, name_max: int) -> int {
   }
 
   let shown: int = if (base_len as int) > name_max { name_max } else { base_len as int };
-  return 2 + digits_i64(idx) + 1 + shown; // " <idx>:<name> "
+  return 2 + digits_i64(disp) + 1 + shown; // " <idx>:<name> "
 }
 
 fn draw_tabs (
@@ -2880,7 +3266,8 @@ fn draw_tabs (
 
     // Remaining space; ensure the segment never wraps.
     let remaining: int = cols - used;
-    let idx_digits: int = digits_i64(i);
+    let disp_i: i64 = i + 1;
+    let idx_digits: int = digits_i64(disp_i);
     let fixed: int = 2 + idx_digits + 1; // " " + <idx> + ":" + (name...) + " "
     var name_max: int = remaining - fixed;
     if name_max > TAB_NAME_MAX { name_max = TAB_NAME_MAX; }
@@ -2894,7 +3281,7 @@ fn draw_tabs (
 
     // "<idx>:"
     if (used + idx_digits + 1) <= cols {
-      let _ = w.push_i64(i);
+      let _ = w.push_i64(disp_i);
       let _ = w.push_u8(58); // ':'
       used = used + idx_digits + 1;
     } else {
@@ -3061,7 +3448,8 @@ fn tab_hit_test (
     }
 
     let remaining: int = cols - used;
-    let idx_digits: int = digits_i64(i);
+    let disp_i: i64 = i + 1;
+    let idx_digits: int = digits_i64(disp_i);
     let fixed: int = 2 + idx_digits + 1; // " " + <idx> + ":" + (name...) + " "
     var name_max: int = remaining - fixed;
     if name_max > TAB_NAME_MAX { name_max = TAB_NAME_MAX; }
@@ -4615,13 +5003,19 @@ export async fn main (argc: int, argv: u64) -> int {
         print_help();
         return 0;
       }
-      if tabs.ptr == 0 || tabs.cap <= 0 {
+      let own_opt: string? = cstr_copy_owned("-");
+      if own_opt == None {
         tabs_free(mut tabs);
         let _ = write_str(std::runtime::posix::io::STDERR_FD, "sage: out of memory\n");
         return 2;
       }
-      (tabs.ptr as TabState[](tabs.cap as int))[0] = TabState{ path: "-", top_off: 0, gutter_on: false };
-      tabs.len = 1;
+      let own: string = match (own_opt) { Some(v) => v, None => "" };
+      if !tabs_push_owned(mut tabs, own) {
+        free_joined(own);
+        tabs_free(mut tabs);
+        let _ = write_str(std::runtime::posix::io::STDERR_FD, "sage: out of memory\n");
+        return 2;
+      }
     }
 
     // Preserve legacy behavior: `sage -` with an interactive stdin prints help
@@ -4879,6 +5273,12 @@ export async fn main (argc: int, argv: u64) -> int {
     var sel_anchor: i64 = -1;
     var sel_head: i64 = -1;
     var sel_drag: bool = false;
+    var last_click_ns: i64 = 0;
+    var last_click_x: int = -1;
+    var last_click_y: int = -1;
+    var last_click_btn: int = -1;
+    var last_click_tab: i64 = -1;
+    var g_pending: bool = false;
 
     // Main UI loop.
     while true {
@@ -5352,6 +5752,12 @@ export async fn main (argc: int, argv: u64) -> int {
       let b: u8 = k.byte;
       var want_tab: i64 = -1;
 
+      // Vim-like `gg` to jump to top. `g` is a prefix and does nothing by itself.
+      let is_g: bool = is_byte && b == 103; // 'g'
+      if g_pending && !is_g {
+        g_pending = false;
+      }
+
       // Help overlay (presentation + quick reference).
       if show_help {
         if is_byte && (b == 113 || b == 3) { // 'q' or Ctrl-C
@@ -5366,6 +5772,17 @@ export async fn main (argc: int, argv: u64) -> int {
       if is_byte && (b == 63 || b == 104) { // '?' or 'h'
         show_help = true;
         need_redraw = true;
+        continue;
+      }
+
+      if is_g {
+        if g_pending {
+          g_pending = false;
+          top_off = 0;
+          need_redraw = true;
+        } else {
+          g_pending = true;
+        }
         continue;
       }
 
@@ -5426,12 +5843,83 @@ export async fn main (argc: int, argv: u64) -> int {
           // mouse reporting for terminal-native selection; selection here is
           // content-only and excludes the line-number gutter.
           if is_press_or_motion && btn == 0 && !motion {
+            let shift: bool = (cb & 4) != 0;
             var row_m: int = my - start_row;
             var col_m: int = (mx - 1) - gutter_cols;
             if col_m < 0 { col_m = 0; }
             if col_m > view_cols { col_m = view_cols; }
             if row_m >= 0 && row_m < content_rows {
               let off: i64 = offset_for_view_row_col(file.ptr, file.len, top_off, row_m, col_m, view_cols, cfg.unsafe_raw, allow_ansi);
+
+              // Double-click (no Shift): capture the word under cursor into the
+              // active search query (and highlight the clicked match).
+              if !shift && (mx - 1) >= gutter_cols {
+                let now_opt: i64? = std::runtime::posix::time::monotonic_now_ns();
+                let now_ns: i64 = match (now_opt) { Some(v) => v, None => 0 };
+                if now_ns != 0 && last_click_ns != 0 {
+                  let dt: i64 = now_ns - last_click_ns;
+                  if dt >= 0 && dt <= DOUBLE_CLICK_NS && last_click_btn == btn && last_click_tab == active_tab {
+                    var dx: int = mx - last_click_x;
+                    if dx < 0 { dx = 0 - dx; }
+                    var dy: int = my - last_click_y;
+                    if dy < 0 { dy = 0 - dy; }
+                    if dx <= 1 && dy <= 1 {
+                      // Double click: set query but don't jump the viewport.
+                      last_click_ns = 0;
+                      if search.active { search.active = false; }
+                      alert = 0;
+                      let sp_opt: WordSpan? = word_span_at(file.ptr, file.len, off);
+                      if sp_opt != None {
+                        let sp: WordSpan = match (sp_opt) { Some(v) => v, None => WordSpan{ start: 0, end: 0 } };
+                        let n_sp: i64 = sp.end - sp.start;
+                        if n_sp > 0 {
+                          last_query.clear();
+                          let _ = last_query.push_ptr_len(file.ptr + (sp.start as u64), n_sp);
+                          let bytes = last_query.as_bytes();
+                          search_hist_push(mut search_hist_data, mut search_hist_idx, bytes.ptr, bytes.len);
+                          last_match_off = sp.start;
+                          last_match_end = sp.end;
+                          regex_ready = false;
+                          regex_re = RegExp.empty();
+
+                          // Compile regex once per query so `n`/`p` don't recompile.
+                          if cfg.regex && last_query.len > 0 {
+                            let qb = last_query.as_bytes();
+                            let pat: string = std::runtime::mem::string_from_ptr_len(qb.ptr, qb.len as int);
+                            var flags: string = "";
+                            if cfg.ignore_case { flags = "i"; }
+
+                            let cr: ReCompileResult = RegExp.compile(pat, flags);
+                            if cr.is_err() {
+                              alert = 2;
+                              regex_ready = false;
+                              regex_re = RegExp.empty();
+                            } else {
+                              let re2: RegExp = ReCompileResult.unwrap_or(cr, RegExp.empty());
+                              regex_re = move re2;
+                              regex_ready = true;
+                            }
+                          }
+                          sel_on = false;
+                          sel_anchor = -1;
+                          sel_head = -1;
+                          sel_drag = false;
+                          need_redraw = true;
+                        }
+                      }
+                      continue;
+                    }
+                  }
+                }
+                if now_ns != 0 {
+                  last_click_ns = now_ns;
+                  last_click_x = mx;
+                  last_click_y = my;
+                  last_click_btn = btn;
+                  last_click_tab = active_tab;
+                }
+              }
+
               sel_on = true;
               sel_anchor = off;
               sel_head = off;
@@ -5464,13 +5952,14 @@ export async fn main (argc: int, argv: u64) -> int {
       if tabs.len > 1 {
         if want_tab < 0 {
           if is_byte && b >= 48 && b <= 57 { // '0'..'9'
-            want_tab = (((b - 48) as int) as i64);
-            if want_tab < 0 || want_tab >= tabs.len {
-              want_tab = -1;
+            let n: i64 = (((b - 48) as int) as i64);
+            let idx_opt: i64? = tab_index_from_user_num(n, tabs.len);
+            if idx_opt == None {
               alert = ALERT_TAB_RANGE;
               need_redraw = true;
               continue;
             }
+            want_tab = match (idx_opt) { Some(v) => v, None => -1 };
           }
           if is_byte && b == 9 { // Tab
             want_tab = tab_next(active_tab, tabs.len);
@@ -5645,7 +6134,7 @@ export async fn main (argc: int, argv: u64) -> int {
                 alert = ALERT_TAB_RANGE;
               }
             } else if eq_nocase(c_ptr, head_len, "t") {
-              // Vim-ish shortcut: `:t 6`
+              // Vim-ish shortcut: `:t 6` (tabs are 1-indexed; 0 selects the last tab)
               is_tab_cmd = true;
               if arg_ptr == 0 || arg_len <= 0 || tabs.len <= 0 {
                 alert = ALERT_TAB_RANGE;
@@ -5655,15 +6144,13 @@ export async fn main (argc: int, argv: u64) -> int {
                   alert = ALERT_TAB_RANGE;
                 } else {
                   let t0: i64 = match (t_opt) { Some(v) => v, None => 0 };
-                  if t0 < 0 || t0 >= tabs.len {
-                    alert = ALERT_TAB_RANGE;
-                  } else {
-                    want_tab_cmd = t0;
-                  }
+                  let idx_opt: i64? = tab_index_from_user_num(t0, tabs.len);
+                  if idx_opt == None { alert = ALERT_TAB_RANGE; }
+                  else { want_tab_cmd = match (idx_opt) { Some(v) => v, None => -1 }; }
                 }
               }
             } else if head_len >= 2 && (std::runtime::mem::load_u8(c_ptr, 0) == 116 || std::runtime::mem::load_u8(c_ptr, 0) == 84) {
-              // Vim-ish shortcut: `:t6`
+              // Vim-ish shortcut: `:t6` (tabs are 1-indexed; 0 selects the last tab)
               var ok_digits: bool = true;
               var di: i64 = 1;
               while di < head_len {
@@ -5684,11 +6171,9 @@ export async fn main (argc: int, argv: u64) -> int {
                     alert = ALERT_TAB_RANGE;
                   } else {
                     let t1: i64 = match (t_opt2) { Some(v) => v, None => 0 };
-                    if t1 < 0 || t1 >= tabs.len {
-                      alert = ALERT_TAB_RANGE;
-                    } else {
-                      want_tab_cmd = t1;
-                    }
+                    let idx_opt2: i64? = tab_index_from_user_num(t1, tabs.len);
+                    if idx_opt2 == None { alert = ALERT_TAB_RANGE; }
+                    else { want_tab_cmd = match (idx_opt2) { Some(v) => v, None => -1 }; }
                   }
                 }
               }
@@ -5702,11 +6187,9 @@ export async fn main (argc: int, argv: u64) -> int {
                   alert = ALERT_TAB_RANGE;
                 } else {
                   let t0: i64 = match (t_opt) { Some(v) => v, None => 0 };
-                  if t0 < 0 || t0 >= tabs.len {
-                    alert = ALERT_TAB_RANGE;
-                  } else {
-                    want_tab_cmd = t0;
-                  }
+                  let idx_opt3: i64? = tab_index_from_user_num(t0, tabs.len);
+                  if idx_opt3 == None { alert = ALERT_TAB_RANGE; }
+                  else { want_tab_cmd = match (idx_opt3) { Some(v) => v, None => -1 }; }
                 }
               }
             }
@@ -5946,7 +6429,7 @@ export async fn main (argc: int, argv: u64) -> int {
         need_redraw = true;
         continue;
       }
-      if k.kind == KEY_HOME || (is_byte && b == 103) { // 'g'
+      if k.kind == KEY_HOME {
         top_off = 0;
         need_redraw = true;
         continue;
