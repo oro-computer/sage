@@ -4,15 +4,18 @@ import { Args } from "std/args";
 import std::runtime::mem;
 import std::runtime::env;
 import std::runtime::posix::fs;
+import std::runtime::io;
 import std::runtime::posix::io;
 import std::runtime::posix::time;
+import std::process;
 import std::result;
 import std::sync;
+import std::strings;
 
-import { isatty, memchr, memmem, memrchr } from "./sage/os.slk";
+import { memchr, memmem, memrchr } from "./sage/os.slk";
 import { MappedFile, map_path, map_stdin_spool } from "./sage/file.slk";
 import { BufferU8, ByteSlice, VecU64 } from "./sage/buf.slk";
-import { CompileFailed, ExecResult, RegExp, EXEC_MATCH, EXEC_NO_MATCH, RT_EXEC_OUT_BYTES, exec_scratch, search_scratch } from "./sage/re.slk";
+import { CompileFailed, ExecResult, RegExp, EXEC_MATCH, EXEC_NO_MATCH, exec_bytes, search_bytes } from "./sage/re.slk";
 import { Writer, write_str } from "./sage/out.slk";
 import {
   Input,
@@ -136,6 +139,7 @@ struct Config {
   ansi: bool,
   color: int,
   theme: Theme,
+  find_cmd: string?,
   path: string?,
 }
 
@@ -157,6 +161,10 @@ let COPY_MAX_BYTES: i64 = 200000;
 let SYN_STATE_LOOKBACK_BYTES: i64 = 65536;
 let DOUBLE_CLICK_NS: i64 = 350000000; // 350ms
 let WORD_QUERY_MAX: i64 = 256;
+
+let FIND_FMT_GREP: int = 0;
+let FIND_FMT_VIMGREP: int = 1;
+let FIND_MAX_RESULTS: i64 = 5000;
 
 fn theme_default () -> Theme {
   return Theme{
@@ -296,6 +304,7 @@ fn cfg_default () -> Config {
     ansi: true,
     color: COLOR_AUTO,
     theme: theme,
+    find_cmd: None,
     path: None
   };
 }
@@ -876,6 +885,70 @@ fn env_get_string (key: string) -> string? {
   return Some(std::runtime::mem::string_from_ptr_len(p, n as int));
 }
 
+let ACCESS_X_OK: i32 = 1;
+
+fn cmd_exists (name: string) -> bool {
+  let n_ptr: u64 = std::runtime::mem::string_ptr(name);
+  let n_len: i64 = std::runtime::mem::string_len(name);
+  if n_ptr == 0 || n_len <= 0 {
+    return false;
+  }
+
+  // Treat any name with '/' as a direct path.
+  if memchr(n_ptr, 47, n_len) != 0 { // '/'
+    return std::runtime::posix::fs::access(name, ACCESS_X_OK) == 0;
+  }
+
+  let path_opt: string? = env_get_string("PATH");
+  if path_opt == None {
+    return false;
+  }
+  let path: string = match (path_opt) { Some(v) => v, None => "" };
+  let p_ptr: u64 = std::runtime::mem::string_ptr(path);
+  let p_len: i64 = std::runtime::mem::string_len(path);
+  if p_ptr == 0 || p_len <= 0 {
+    return false;
+  }
+
+  var start: i64 = 0;
+  while start <= p_len {
+    var end: i64 = start;
+    while end < p_len {
+      if std::runtime::mem::load_u8(p_ptr, end) == 58 { // ':'
+        break;
+      }
+      end = end + 1;
+    }
+
+    let seg_len: i64 = end - start;
+    var dir: string = ".";
+    if seg_len > 0 {
+      dir = std::runtime::mem::string_from_ptr_len(p_ptr + (start as u64), seg_len as int);
+    }
+
+    let prefix_opt: string? = join2(dir, "/");
+    if prefix_opt != None {
+      let prefix: string = match (prefix_opt) { Some(v) => v, None => "" };
+      let full_opt: string? = join2(prefix, name);
+      if full_opt != None {
+        let full: string = match (full_opt) { Some(v) => v, None => "" };
+        let ok: bool = std::runtime::posix::fs::access(full, ACCESS_X_OK) == 0;
+        free_joined(full);
+        free_joined(prefix);
+        if ok {
+          return true;
+        }
+      } else {
+        free_joined(prefix);
+      }
+    }
+
+    start = end + 1;
+  }
+
+  return false;
+}
+
 fn is_ascii_ws (b: u8) -> bool {
   if b == 32 { return true; }
   if b == 9 { return true; }
@@ -1048,6 +1121,28 @@ fn apply_sagerc_kv (mut cfg: &Config, key_ptr: u64, key_len: i64, val_ptr: u64, 
   // Theme selection.
   if eq_nocase(key_ptr, key_len, "theme") {
     let _ = theme_apply_name(mut cfg, val_ptr, val_len);
+    return;
+  }
+
+  // Find tool configuration.
+  if eq_nocase(key_ptr, key_len, "find") || eq_nocase(key_ptr, key_len, "find_cmd") || eq_nocase(key_ptr, key_len, "find-cmd") {
+    if cfg.find_cmd != None {
+      let prev: string = match (cfg.find_cmd) { Some(v) => v, None => "" };
+      let pp: u64 = std::runtime::mem::string_ptr(prev);
+      if pp != 0 {
+        std::runtime::mem::free(pp);
+      }
+      cfg.find_cmd = None;
+    }
+
+    if val_ptr != 0 && val_len > 0 {
+      let val_s: string = std::runtime::mem::string_from_ptr_len(val_ptr, val_len as int);
+      let own_opt: string? = cstr_copy_owned(val_s);
+      if own_opt != None {
+        let own: string = match (own_opt) { Some(v) => v, None => "" };
+        cfg.find_cmd = Some(own);
+      }
+    }
     return;
   }
 
@@ -1294,7 +1389,7 @@ fn print_help () -> void {
   let _ = w.push_str("  -i, --ignore-case Case-insensitive search\n");
   let _ = w.push_str("      --index-only  Build line index, print stats, exit\n");
   let _ = w.push_str("\n");
-  let _ = w.push_str("Keys: q quit, Ctrl-C quit/copy, j/k/u/d/Up/Down scroll, MouseWheel scroll, Space/PgDn/Ctrl-D page down, b/PgUp/Ctrl-U page up, Left/Right page, gg/G top/bottom, Tab/Shift-Tab tabs, MouseDrag select, / search, n next, p prev, : cmd, L gutter, Esc cancel, ? help\n");
+  let _ = w.push_str("Keys: q quit, Ctrl-C quit/copy, Ctrl-K find, j/k/u/d/Up/Down scroll, MouseWheel scroll, Space/PgDn/Ctrl-D page down, b/PgUp/Ctrl-U page up, Left/Right page, gg/G top/bottom, Tab/Shift-Tab tabs, MouseDrag select, / search, n next, p prev, : cmd, L gutter, Esc cancel, ? help\n");
 
   let _ = w.flush();
 }
@@ -3022,6 +3117,7 @@ fn draw_help (
     r = r + 1;
   }
   if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.accent, "/", help_desc_col, "enter a query (jumps to first match)"); r = r + 1; }
+  if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.accent, "Ctrl-K", help_desc_col, "find across open files"); r = r + 1; }
   if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.accent, "DoubleClick", help_desc_col, "set query to clicked word"); r = r + 1; }
   if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.accent, "n", help_desc_col, "next match"); r = r + 1; }
   if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.accent, "p", help_desc_col, "previous match"); r = r + 1; }
@@ -3895,6 +3991,25 @@ fn push_tail_trunc (mut w: &Writer, theme: &Theme, ptr: u64, len: i64, max: int)
   return max;
 }
 
+fn push_head_trunc_plain (mut w: &Writer, ptr: u64, len: i64, max: int) -> int {
+  if ptr == 0 || len <= 0 || max <= 0 {
+    return 0;
+  }
+  if len <= (max as i64) {
+    let _ = w.push_ptr_len(ptr, len);
+    return len as int;
+  }
+  if max <= 3 {
+    let _ = w.push_ptr_len(ptr, max as i64);
+    return max;
+  }
+
+  let take: i64 = (max - 3) as i64;
+  let _ = w.push_ptr_len(ptr, take);
+  let _ = w.push_str("...");
+  return max;
+}
+
 let SEARCH_HIST_MAX: i64 = 64;
 
 fn search_hist_count (idx: &VecU64) -> i64 {
@@ -4299,6 +4414,593 @@ fn prompt_cmd (
   return false;
 }
 
+fn prompt_find (
+  mut w: &Writer,
+  theme: &Theme,
+  mut inp: &Input,
+  rows: int,
+  cols: int,
+  mut out_query: &BufferU8
+) -> bool {
+  out_query.clear();
+
+  while true {
+    // Draw only the status line prompt.
+    w.clear();
+    ansi_move(mut w, rows, 1);
+    ansi_status_on(mut w, theme);
+    ansi_clear_eol(mut w);
+    ansi_move(mut w, rows, 1);
+
+    // Right-side hint (depends on available width).
+    var hint_kind: int = 0;
+    // 0: "ESC cancel"
+    // 1: "Enter find  ESC cancel"
+    if cols >= 56 {
+      hint_kind = 1;
+    } else {
+      hint_kind = 0;
+    }
+
+    var right_len: int = 10; // "ESC cancel"
+    if hint_kind == 1 {
+      right_len = 10 + 2 + 10; // "Enter find" + "  " + "ESC cancel"
+    }
+
+    let min_space: int = 1;
+    let left_fixed: int = 7; // " " + "find> "
+    var q_avail: int = cols - right_len - left_fixed - min_space;
+    if q_avail < 0 { q_avail = 0; }
+
+    // Left: " find> <query>"
+    let _ = w.push_u8(32);
+    ansi_fg_256(mut w, theme.accent);
+    ansi_bold_on(mut w);
+    let _ = w.push_str("find> ");
+    ansi_intensity_normal(mut w);
+    ansi_fg_256(mut w, theme.status_fg);
+
+    let bytes = out_query.as_bytes();
+    let q_len: int = push_tail_trunc(mut w, theme, bytes.ptr, bytes.len, q_avail);
+
+    // Pad.
+    var used_left: int = left_fixed + q_len;
+    var spaces: int = cols - right_len - used_left;
+    if spaces < min_space { spaces = min_space; }
+    var s: int = 0;
+    while s < spaces {
+      let _ = w.push_u8(32);
+      s = s + 1;
+    }
+
+    // Right hint.
+    ansi_fg_256(mut w, theme.status_dim);
+    if hint_kind == 1 {
+      let _ = w.push_str("Enter find  ");
+    }
+    let _ = w.push_str("ESC cancel");
+
+    ansi_clear_eol(mut w);
+    ansi_reset(mut w);
+    let _ = w.flush();
+
+    let k: Key = read_key_timeout(mut inp, -1);
+    if k.kind == KEY_EOF {
+      return false;
+    }
+    if k.kind == KEY_ESC {
+      return false;
+    }
+    if k.kind == KEY_ENTER {
+      return out_query.len > 0;
+    }
+    if k.kind == KEY_BACKSPACE {
+      let _ = out_query.pop_u8();
+      continue;
+    }
+
+    if k.kind == KEY_BYTE {
+      let b: u8 = k.byte;
+      if b >= 32 && b != 127 {
+        let _ = out_query.push_u8(b);
+      }
+    }
+  }
+  return false;
+}
+
+struct FindLoc {
+  path_ptr: u64,
+  path_len: i64,
+  line1: i64,
+  col1: i64,
+}
+
+fn parse_find_loc (line_ptr: u64, line_len: i64, fmt: int) -> FindLoc? {
+  // Supported formats:
+  // - GREP:    path:line:text
+  // - VIMGREP: path:line:col:text
+  if line_ptr == 0 || line_len <= 0 {
+    return None;
+  }
+  let c1_ptr: u64 = memchr(line_ptr, 58, line_len); // ':'
+  if c1_ptr == 0 {
+    return None;
+  }
+  let c1: i64 = (c1_ptr - line_ptr) as i64;
+  if c1 <= 0 {
+    return None;
+  }
+
+  let rest1_ptr: u64 = c1_ptr + 1;
+  let rest1_len: i64 = line_len - c1 - 1;
+  if rest1_ptr == 0 || rest1_len <= 0 {
+    return None;
+  }
+  let c2_ptr: u64 = memchr(rest1_ptr, 58, rest1_len);
+  if c2_ptr == 0 {
+    return None;
+  }
+  let c2: i64 = (c2_ptr - rest1_ptr) as i64;
+  let l_opt: i64? = parse_i64_dec(rest1_ptr, c2);
+  if l_opt == None {
+    return None;
+  }
+  let line1: i64 = match (l_opt) { Some(v) => v, None => 0 };
+  if line1 <= 0 {
+    return None;
+  }
+
+  if fmt == FIND_FMT_VIMGREP {
+    let rest2_ptr: u64 = c2_ptr + 1;
+    let rest2_len: i64 = rest1_len - c2 - 1;
+    if rest2_ptr == 0 || rest2_len <= 0 {
+      return None;
+    }
+    let c3_ptr: u64 = memchr(rest2_ptr, 58, rest2_len);
+    if c3_ptr == 0 {
+      return None;
+    }
+    let c3: i64 = (c3_ptr - rest2_ptr) as i64;
+    let c_opt: i64? = parse_i64_dec(rest2_ptr, c3);
+    if c_opt == None {
+      return None;
+    }
+    let col1: i64 = match (c_opt) { Some(v) => v, None => 0 };
+    if col1 <= 0 {
+      return None;
+    }
+    return Some(FindLoc{ path_ptr: line_ptr, path_len: c1, line1: line1, col1: col1 });
+  }
+
+  return Some(FindLoc{ path_ptr: line_ptr, path_len: c1, line1: line1, col1: 1 });
+}
+
+struct FindRun {
+  fmt: int,
+  exit_code: int,
+  err_code: int,
+  err_stage: int,
+  stdout: std::strings::String,
+  stderr: std::strings::String,
+}
+
+fn find_run_open_files (cfg: &Config, tabs_ptr: u64, tabs_cap: i64, tabs_len: i64, query_ptr: u64, query_len: i64) -> FindRun {
+  var out: FindRun = FindRun{
+    fmt: FIND_FMT_GREP,
+    exit_code: 0,
+    err_code: 0,
+    err_stage: 0,
+    stdout: std::strings::String.empty(),
+    stderr: std::strings::String.empty(),
+  };
+
+  if query_ptr == 0 || query_len <= 0 {
+    out.exit_code = 2;
+    out.err_stage = -10;
+    return out;
+  }
+
+  // Collect file args (skip stdin tabs).
+  var file_count: i64 = 0;
+  if tabs_ptr != 0 && tabs_len > 0 {
+    var i: i64 = 0;
+    while i < tabs_len {
+      let t: TabState = (tabs_ptr as TabState[](tabs_cap as int))[i];
+      if t.path != "-" {
+        file_count = file_count + 1;
+      }
+      i = i + 1;
+    }
+  }
+  if file_count <= 0 {
+    out.exit_code = 2;
+    out.err_stage = -11;
+    return out;
+  }
+
+  // NUL-terminated query (required by `std::process`).
+  let q_view: string = std::runtime::mem::string_from_ptr_len(query_ptr, query_len as int);
+  let q_owned_opt: string? = cstr_copy_owned(q_view);
+  if q_owned_opt == None {
+    out.exit_code = 2;
+    out.err_stage = -12;
+    return out;
+  }
+  let q_owned: string = match (q_owned_opt) { Some(v) => v, None => "" };
+
+  // Decide command.
+  var fmt: int = FIND_FMT_GREP;
+  var use_user: bool = false;
+  var cmd_mem: u64 = 0;
+  var cmd_mem_len: i64 = 0;
+
+  if cfg.find_cmd != None {
+    let cmd_raw: string = match (cfg.find_cmd) { Some(v) => v, None => "" };
+    let p0: u64 = std::runtime::mem::string_ptr(cmd_raw);
+    let n0: i64 = std::runtime::mem::string_len(cmd_raw);
+    if p0 != 0 && n0 > 0 {
+      let mem0: u64 = std::runtime::mem::alloc(n0 + 1);
+      if mem0 != 0 {
+        var k: i64 = 0;
+        while k < n0 {
+          std::runtime::mem::store_u8(mem0, k, std::runtime::mem::load_u8(p0, k));
+          k = k + 1;
+        }
+        std::runtime::mem::store_u8(mem0, n0, 0);
+
+        // Tokenize in place by overwriting whitespace with NULs.
+        cmd_mem = mem0;
+        cmd_mem_len = n0;
+        var off: i64 = 0;
+        // Skip leading whitespace.
+        while off < cmd_mem_len && is_ascii_ws(std::runtime::mem::load_u8(cmd_mem, off)) {
+          std::runtime::mem::store_u8(cmd_mem, off, 0);
+          off = off + 1;
+        }
+
+        if off < cmd_mem_len {
+          // First token is the program.
+          let prog_start: i64 = off;
+          while off < cmd_mem_len && !is_ascii_ws(std::runtime::mem::load_u8(cmd_mem, off)) {
+            off = off + 1;
+          }
+          let prog_end: i64 = off;
+          if prog_end > prog_start {
+            if off < cmd_mem_len {
+              std::runtime::mem::store_u8(cmd_mem, off, 0);
+              off = off + 1;
+            }
+            let program: string = std::runtime::mem::string_from_ptr_len(cmd_mem + (prog_start as u64), (prog_end - prog_start) as int);
+            let mut cmd: std::process::Command = std::process::Command.init(program);
+            cmd.stdin(std::process::Stdio::Null);
+
+            // Remaining tokens are args.
+            while off < cmd_mem_len {
+              while off < cmd_mem_len && is_ascii_ws(std::runtime::mem::load_u8(cmd_mem, off)) {
+                std::runtime::mem::store_u8(cmd_mem, off, 0);
+                off = off + 1;
+              }
+              if off >= cmd_mem_len {
+                break;
+              }
+              let a_start: i64 = off;
+              while off < cmd_mem_len && !is_ascii_ws(std::runtime::mem::load_u8(cmd_mem, off)) {
+                off = off + 1;
+              }
+              let a_end: i64 = off;
+              if a_end > a_start {
+                if off < cmd_mem_len {
+                  std::runtime::mem::store_u8(cmd_mem, off, 0);
+                  off = off + 1;
+                }
+                let a: string = std::runtime::mem::string_from_ptr_len(cmd_mem + (a_start as u64), (a_end - a_start) as int);
+                if a == "--vimgrep" {
+                  fmt = FIND_FMT_VIMGREP;
+                }
+                let _ = cmd.arg(a);
+              }
+            }
+
+            // Append query + file list.
+            let _ = cmd.arg(q_owned);
+            var ti: i64 = 0;
+            while ti < tabs_len {
+              let t: TabState = (tabs_ptr as TabState[](tabs_cap as int))[ti];
+              if t.path != "-" {
+                let _ = cmd.arg(t.path);
+              }
+              ti = ti + 1;
+            }
+
+            let out_r: std::process::OutputResult = cmd.output();
+            if out_r.is_err() {
+              let err: std::process::ChildFailed = std::process::OutputResult.err_value(out_r) ?? std::process::ChildFailed{ code: 0, stage: 0, detail: 0 };
+              out.exit_code = 127;
+              out.err_code = err.code;
+              out.err_stage = err.stage;
+            } else {
+              let mut o: std::process::Output = match (out_r) {
+                Ok(v) => v,
+                Err(_) => std::process::Output{ status: std::process::ExitStatus{ bits: 0 }, stdout: std::strings::String.empty(), stderr: std::strings::String.empty() },
+              };
+              let code_opt: int? = o.status.code();
+              out.exit_code = match (code_opt) { Some(v) => v, None => -1 };
+              let mut so: std::strings::String = o.stdout;
+              let mut se: std::strings::String = o.stderr;
+              o.stdout = std::strings::String.empty();
+              o.stderr = std::strings::String.empty();
+              out.stdout = move so;
+              out.stderr = move se;
+            }
+
+            use_user = true;
+          }
+        }
+      }
+    }
+  }
+
+  if !use_user {
+    // Default smart selection (vimgrep-capable tools first).
+    var program: string = "grep";
+    let mut cmd: std::process::Command = std::process::Command.init(program);
+    cmd.stdin(std::process::Stdio::Null);
+
+    if cmd_exists("rg") {
+      program = "rg";
+      cmd = std::process::Command.init(program);
+      cmd.stdin(std::process::Stdio::Null);
+      let _ = cmd.arg("--vimgrep");
+      let _ = cmd.arg("--");
+      fmt = FIND_FMT_VIMGREP;
+    } else if cmd_exists("ag") {
+      program = "ag";
+      cmd = std::process::Command.init(program);
+      cmd.stdin(std::process::Stdio::Null);
+      let _ = cmd.arg("--vimgrep");
+      let _ = cmd.arg("--");
+      fmt = FIND_FMT_VIMGREP;
+    } else if cmd_exists("slg") {
+      program = "slg";
+      cmd = std::process::Command.init(program);
+      cmd.stdin(std::process::Stdio::Null);
+      let _ = cmd.arg("--");
+      fmt = FIND_FMT_GREP;
+    } else {
+      program = "grep";
+      cmd = std::process::Command.init(program);
+      cmd.stdin(std::process::Stdio::Null);
+      // Grep needs line numbers for jumping.
+      let _ = cmd.arg("-inH");
+      let _ = cmd.arg("--");
+      fmt = FIND_FMT_GREP;
+    }
+
+    let _ = cmd.arg(q_owned);
+    var ti2: i64 = 0;
+    while ti2 < tabs_len {
+      let t: TabState = (tabs_ptr as TabState[](tabs_cap as int))[ti2];
+      if t.path != "-" {
+        let _ = cmd.arg(t.path);
+      }
+      ti2 = ti2 + 1;
+    }
+
+    let out_r2: std::process::OutputResult = cmd.output();
+    if out_r2.is_err() {
+      let err2: std::process::ChildFailed = std::process::OutputResult.err_value(out_r2) ?? std::process::ChildFailed{ code: 0, stage: 0, detail: 0 };
+      out.exit_code = 127;
+      out.err_code = err2.code;
+      out.err_stage = err2.stage;
+    } else {
+      let mut o2: std::process::Output = match (out_r2) {
+        Ok(v) => v,
+        Err(_) => std::process::Output{ status: std::process::ExitStatus{ bits: 0 }, stdout: std::strings::String.empty(), stderr: std::strings::String.empty() },
+      };
+      let code_opt2: int? = o2.status.code();
+      out.exit_code = match (code_opt2) { Some(v) => v, None => -1 };
+      let mut so2: std::strings::String = o2.stdout;
+      let mut se2: std::strings::String = o2.stderr;
+      o2.stdout = std::strings::String.empty();
+      o2.stderr = std::strings::String.empty();
+      out.stdout = move so2;
+      out.stderr = move se2;
+    }
+  }
+
+  out.fmt = fmt;
+
+  if cmd_mem != 0 {
+    std::runtime::mem::free(cmd_mem);
+  }
+  free_joined(q_owned);
+  return out;
+}
+
+fn find_index_stdout (stdout: &std::strings::String, fmt: int, mut idx: &VecU64) -> bool {
+  idx.len = 0;
+  let s: string = stdout.as_string();
+  let p: u64 = std::runtime::mem::string_ptr(s);
+  let n: i64 = std::runtime::mem::string_len(s);
+  if p == 0 || n <= 0 {
+    return false;
+  }
+
+  var truncated: bool = false;
+  var start: i64 = 0;
+  var i: i64 = 0;
+  while i < n {
+    if std::runtime::mem::load_u8(p, i) == 10 { // '\n'
+      let len: i64 = i - start;
+      if len > 0 && parse_find_loc(p + (start as u64), len, fmt) != None {
+        if (idx.len / 2) >= FIND_MAX_RESULTS {
+          truncated = true;
+          break;
+        }
+        let _ = idx.push(start as u64);
+        let _ = idx.push(len as u64);
+      }
+      start = i + 1;
+    }
+    i = i + 1;
+  }
+  if !truncated && start < n {
+    let len2: i64 = n - start;
+    if len2 > 0 && parse_find_loc(p + (start as u64), len2, fmt) != None {
+      if (idx.len / 2) >= FIND_MAX_RESULTS {
+        truncated = true;
+      } else {
+        let _ = idx.push(start as u64);
+        let _ = idx.push(len2 as u64);
+      }
+    }
+  }
+
+  return truncated;
+}
+
+fn draw_find_modal (
+  mut w: &Writer,
+  theme: &Theme,
+  start_row: int,
+  content_rows: int,
+  cols: int,
+  query: &BufferU8,
+  stdout: &std::strings::String,
+  stderr: &std::strings::String,
+  idx: &VecU64,
+  sel: i64,
+  scroll: i64,
+  fmt: int,
+  exit_code: int,
+  truncated: bool,
+  err_stage: int,
+  err_code: int
+) -> void {
+  let _ = fmt;
+
+  var r: int = 0;
+  ansi_reset(mut w);
+
+  let count: i64 = if idx.len > 0 { idx.len / 2 } else { 0 };
+
+  // Header.
+  if r < content_rows {
+    ansi_move(mut w, start_row + r, 1);
+    ansi_fg_256(mut w, theme.brand);
+    ansi_bold_on(mut w);
+    let _ = w.push_str("find");
+    ansi_intensity_normal(mut w);
+    ansi_fg_256(mut w, theme.status_dim);
+    let _ = w.push_str(" — ");
+    ansi_fg_256(mut w, theme.status_fg);
+
+    let qb = query.as_bytes();
+    if qb.ptr != 0 && qb.len > 0 {
+      let _ = push_head_trunc_plain(mut w, qb.ptr, qb.len, cols - 10);
+    } else {
+      let _ = w.push_str("(empty)");
+    }
+
+    ansi_fg_256(mut w, theme.status_dim);
+    let _ = w.push_str("  ");
+    ansi_fg_256(mut w, theme.accent);
+    let _ = w.push_i64(count);
+    ansi_fg_256(mut w, theme.status_dim);
+    let _ = w.push_str(" matches");
+    if truncated {
+      let _ = w.push_str(" (truncated)");
+    }
+    if exit_code == 1 {
+      let _ = w.push_str("  [no matches]");
+    } else if exit_code != 0 && exit_code != 1 {
+      let _ = w.push_str("  [exit ");
+      let _ = w.push_i64(exit_code as i64);
+      let _ = w.push_str("]");
+    }
+    if err_stage != 0 || err_code != 0 {
+      let _ = w.push_str("  [err stage=");
+      let _ = w.push_i64(err_stage as i64);
+      let _ = w.push_str(" code=");
+      let _ = w.push_i64(err_code as i64);
+      let _ = w.push_str("]");
+    }
+    ansi_reset(mut w);
+    ansi_clear_eol(mut w);
+    r = r + 1;
+  }
+
+  // Hint / error line.
+  if r < content_rows {
+    ansi_move(mut w, start_row + r, 1);
+    ansi_fg_256(mut w, theme.status_dim);
+    if err_stage == -11 {
+      let _ = w.push_str("No open file tabs to search.");
+    } else if err_stage == -12 {
+      let _ = w.push_str("Out of memory building query.");
+    } else if exit_code == 127 && (err_stage != 0 || err_code != 0) {
+      let _ = w.push_str("Failed to run find tool.");
+    } else if exit_code >= 2 && stderr.as_string() != "" {
+      let es: string = stderr.as_string();
+      let ep: u64 = std::runtime::mem::string_ptr(es);
+      let en: i64 = std::runtime::mem::string_len(es);
+      if ep != 0 && en > 0 {
+        // First stderr line.
+        let nl: u64 = memchr(ep, 10, en);
+        let take: i64 = if nl != 0 { (nl - ep) as i64 } else { en };
+        let _ = push_head_trunc_plain(mut w, ep, take, cols);
+      }
+    } else {
+      let _ = w.push_str("Up/Down to navigate, Enter to jump, Esc to close, Wheel to scroll.");
+    }
+    ansi_reset(mut w);
+    ansi_clear_eol(mut w);
+    r = r + 1;
+  }
+
+  let list_rows: int = content_rows - r;
+  let base: string = stdout.as_string();
+  let base_ptr: u64 = std::runtime::mem::string_ptr(base);
+
+  var i_row: int = 0;
+  while i_row < list_rows {
+    ansi_move(mut w, start_row + r + i_row, 1);
+    ansi_clear_eol(mut w);
+
+    let idx0: i64 = (scroll as i64) + (i_row as i64);
+    if idx0 >= 0 && idx0 < count && base_ptr != 0 {
+      let start: i64 = idx.get(idx0 * 2) as i64;
+      let len: i64 = idx.get((idx0 * 2) + 1) as i64;
+      if start >= 0 && len > 0 {
+        let line_ptr: u64 = base_ptr + (start as u64);
+        if idx0 == sel {
+          ansi_bg_256(mut w, theme.match_bg);
+          ansi_fg_256(mut w, theme.match_fg);
+        } else {
+          ansi_fg_256(mut w, theme.status_fg);
+        }
+        let _ = push_head_trunc_plain(mut w, line_ptr, len, cols);
+        ansi_reset(mut w);
+      }
+    } else if count == 0 && i_row == 0 {
+      ansi_fg_256(mut w, theme.status_dim);
+      if exit_code == 1 {
+        let _ = w.push_str("No matches.");
+      } else if err_stage == -11 {
+        let _ = w.push_str("No searchable files (stdin only).");
+      } else if exit_code == 0 {
+        let _ = w.push_str("No results.");
+      } else {
+        let _ = w.push_str("No results (command failed).");
+      }
+      ansi_reset(mut w);
+    }
+
+    i_row = i_row + 1;
+  }
+}
+
 struct FindNextResult {
   kind: int,
   off: i64,
@@ -4436,32 +5138,22 @@ fn find_next_regex_with_re (file: &MappedFile, re: &RegExp, start_off: i64) -> F
     return FindNextResult{ kind: FIND_REGEX_TOO_LARGE, off: 0, end: 0 };
   }
 
-  let out_ptr: u64 = std::runtime::mem::alloc(RT_EXEC_OUT_BYTES);
-  if out_ptr == 0 {
-    return FindNextResult{ kind: FIND_REGEX_RUNTIME_FAILED, off: 0, end: 0 };
-  }
-
-  let r1: ExecResult = search_scratch(re, file.ptr, file.len, start_off as int, out_ptr);
+  let r1: ExecResult = search_bytes(re, file.ptr, file.len, start_off as int);
   if r1.code == EXEC_MATCH {
-    std::runtime::mem::free(out_ptr);
     return FindNextResult{ kind: FIND_FOUND, off: r1.start as i64, end: r1.end as i64 };
   }
   if r1.code != EXEC_NO_MATCH {
-    std::runtime::mem::free(out_ptr);
     return FindNextResult{ kind: FIND_REGEX_RUNTIME_FAILED, off: 0, end: 0 };
   }
 
-  let r2: ExecResult = search_scratch(re, file.ptr, file.len, 0, out_ptr);
+  let r2: ExecResult = search_bytes(re, file.ptr, file.len, 0);
   if r2.code == EXEC_MATCH {
-    std::runtime::mem::free(out_ptr);
     return FindNextResult{ kind: FIND_FOUND, off: r2.start as i64, end: r2.end as i64 };
   }
   if r2.code != EXEC_NO_MATCH {
-    std::runtime::mem::free(out_ptr);
     return FindNextResult{ kind: FIND_REGEX_RUNTIME_FAILED, off: 0, end: 0 };
   }
 
-  std::runtime::mem::free(out_ptr);
   return FindNextResult{ kind: FIND_NOT_FOUND, off: 0, end: 0 };
 }
 
@@ -4478,11 +5170,6 @@ fn find_next_regex_range_chunked (file: &MappedFile, re: &RegExp, start: i64, en
     return FindNextResult{ kind: FIND_NOT_FOUND, off: 0, end: 0 };
   }
 
-  let out_ptr: u64 = std::runtime::mem::alloc(RT_EXEC_OUT_BYTES);
-  if out_ptr == 0 {
-    return FindNextResult{ kind: FIND_REGEX_RUNTIME_FAILED, off: 0, end: 0 };
-  }
-
   var step: i64 = REGEX_CHUNK_BYTES - REGEX_CHUNK_OVERLAP;
   if step <= 0 {
     step = REGEX_CHUNK_BYTES;
@@ -4497,15 +5184,13 @@ fn find_next_regex_range_chunked (file: &MappedFile, re: &RegExp, start: i64, en
       break;
     }
 
-    let r: ExecResult = exec_scratch(re, file.ptr + (base as u64), take, out_ptr);
+    let r: ExecResult = exec_bytes(re, file.ptr + (base as u64), take);
     if r.code == EXEC_MATCH {
       let mo: i64 = base + (r.start as i64);
       let me: i64 = base + (r.end as i64);
-      std::runtime::mem::free(out_ptr);
       return FindNextResult{ kind: FIND_FOUND, off: mo, end: me };
     }
     if r.code != EXEC_NO_MATCH {
-      std::runtime::mem::free(out_ptr);
       return FindNextResult{ kind: FIND_REGEX_RUNTIME_FAILED, off: 0, end: 0 };
     }
 
@@ -4514,8 +5199,6 @@ fn find_next_regex_range_chunked (file: &MappedFile, re: &RegExp, start: i64, en
     }
     base = base + step;
   }
-
-  std::runtime::mem::free(out_ptr);
   return FindNextResult{ kind: FIND_NOT_FOUND, off: 0, end: 0 };
 }
 
@@ -4710,11 +5393,6 @@ fn find_prev_regex_range_chunked (file: &MappedFile, re: &RegExp, start: i64, en
     return FindNextResult{ kind: FIND_NOT_FOUND, off: 0, end: 0 };
   }
 
-  let out_ptr: u64 = std::runtime::mem::alloc(RT_EXEC_OUT_BYTES);
-  if out_ptr == 0 {
-    return FindNextResult{ kind: FIND_REGEX_RUNTIME_FAILED, off: 0, end: 0 };
-  }
-
   var step: i64 = REGEX_CHUNK_BYTES - REGEX_CHUNK_OVERLAP;
   if step <= 0 {
     step = REGEX_CHUNK_BYTES;
@@ -4735,7 +5413,7 @@ fn find_prev_regex_range_chunked (file: &MappedFile, re: &RegExp, start: i64, en
     var pos: int = 0;
     var iters: int = 0;
     while iters < 100000 {
-      let r: ExecResult = search_scratch(re, file.ptr + (chunk_start as u64), take, pos, out_ptr);
+      let r: ExecResult = search_bytes(re, file.ptr + (chunk_start as u64), take, pos);
       if r.code == EXEC_MATCH {
         last_s = r.start as i64;
         last_e = r.end as i64;
@@ -4753,18 +5431,15 @@ fn find_prev_regex_range_chunked (file: &MappedFile, re: &RegExp, start: i64, en
       if r.code == EXEC_NO_MATCH {
         break;
       }
-      std::runtime::mem::free(out_ptr);
       return FindNextResult{ kind: FIND_REGEX_RUNTIME_FAILED, off: 0, end: 0 };
     }
     if iters >= 100000 {
-      std::runtime::mem::free(out_ptr);
       return FindNextResult{ kind: FIND_REGEX_RUNTIME_FAILED, off: 0, end: 0 };
     }
 
     if last_s >= 0 && last_e > last_s {
       let mo: i64 = chunk_start + last_s;
       let me: i64 = chunk_start + last_e;
-      std::runtime::mem::free(out_ptr);
       return FindNextResult{ kind: FIND_FOUND, off: mo, end: me };
     }
 
@@ -4779,8 +5454,6 @@ fn find_prev_regex_range_chunked (file: &MappedFile, re: &RegExp, start: i64, en
       base_end = chunk_start;
     }
   }
-
-  std::runtime::mem::free(out_ptr);
   return FindNextResult{ kind: FIND_NOT_FOUND, off: 0, end: 0 };
 }
 
@@ -4835,7 +5508,7 @@ export async fn main (argc: int, argv: u64) -> int {
     return list_compiled_syntax(cfg.verbose);
   }
 
-  let stdout_is_tty: bool = isatty(std::runtime::posix::io::STDOUT_FD) == 1;
+  let stdout_is_tty: bool = std::runtime::io::isatty(std::runtime::posix::io::STDOUT_FD);
 
   task {
     let vw_opt: Writer? = if cfg.verbose { Writer.stderr(false, 8192) } else { None };
@@ -4850,7 +5523,7 @@ export async fn main (argc: int, argv: u64) -> int {
     }
 
     if cfg.index_only {
-      let stdin_is_tty: bool = isatty(std::runtime::posix::io::STDIN_FD) == 1;
+      let stdin_is_tty: bool = std::runtime::io::isatty(std::runtime::posix::io::STDIN_FD);
       let path: string = match (cfg.path) { Some(v) => v, None => "-" };
       if path == "-" && stdin_is_tty {
         print_help();
@@ -4977,7 +5650,7 @@ export async fn main (argc: int, argv: u64) -> int {
     }
 
     // Determine input source.
-    let stdin_is_tty: bool = isatty(std::runtime::posix::io::STDIN_FD) == 1;
+    let stdin_is_tty: bool = std::runtime::io::isatty(std::runtime::posix::io::STDIN_FD);
     if v_on {
       if stdin_is_tty { vlog_line(mut vw, "stdin_tty=true"); }
       else { vlog_line(mut vw, "stdin_tty=false (pager mode: keys via /dev/tty)"); }
@@ -5100,8 +5773,9 @@ export async fn main (argc: int, argv: u64) -> int {
       ignore_sigterm();
 
       // As a pager, stdin is a pipe; take input from the controlling TTY.
-      // Open read+write so termios/ioctl work reliably across platforms.
-      let fd2: int = std::runtime::posix::fs::open("/dev/tty", std::runtime::posix::fs::O_RDWR, 0) as int;
+      // Open read+write so raw mode + window size APIs work reliably.
+      let fd_r = std::runtime::io::tty_open();
+      let fd2: int = match (fd_r) { Ok(v) => v, Err(_) => -1 };
       if fd2 >= 0 {
         in_fd = fd2;
       }
@@ -5122,7 +5796,7 @@ export async fn main (argc: int, argv: u64) -> int {
       if in_fd != std::runtime::posix::io::STDIN_FD { let _ = std::runtime::posix::fs::close(in_fd); }
       return stream_safe_to_stdout(file.ptr, file.len, cfg.unsafe_raw, cfg.ansi);
     }
-    let mut raw_mode: RawMode = match (raw_opt) { Some(v) => v, None => RawMode{ fd: -1, orig: 0, raw_ptr: 0, enabled: false } };
+    let mut raw_mode: RawMode = match (raw_opt) { Some(v) => v, None => RawMode{ handle: 0, enabled: false } };
 
     // Color mode (default: auto; respects NO_COLOR).
     var use_color: bool = true;
@@ -5247,13 +5921,29 @@ export async fn main (argc: int, argv: u64) -> int {
     let sh_idx_opt: VecU64? = VecU64.init(SEARCH_HIST_MAX * 2);
     let mut search_hist_idx: VecU64 = match (sh_idx_opt) { Some(v) => v, None => VecU64.empty() };
 
+    // Ctrl-K find state (search across open tabs).
+    let fq_opt: BufferU8? = BufferU8.init(256);
+    let mut find_query: BufferU8 = match (fq_opt) { Some(v) => v, None => BufferU8.empty() };
+    let fi_opt: VecU64? = VecU64.init(2048);
+    let mut find_idx: VecU64 = match (fi_opt) { Some(v) => v, None => VecU64.empty() };
+    let mut find_stdout: std::strings::String = std::strings::String.empty();
+    let mut find_stderr: std::strings::String = std::strings::String.empty();
+    var find_active: bool = false;
+    var find_fmt: int = FIND_FMT_GREP;
+    var find_exit_code: int = 0;
+    var find_truncated: bool = false;
+    var find_err_stage: int = 0;
+    var find_err_code: int = 0;
+    var find_sel: i64 = 0;
+    var find_scroll: i64 = 0;
+    var find_queued_line0: i64 = -1;
+
     var last_match_off: i64 = -1;
     var last_match_end: i64 = -1;
 
     // Cached compiled regex for repeated `n` searches (avoids recompile work).
     var regex_ready: bool = false;
     let mut regex_re: RegExp = RegExp.empty();
-    var regex_out_ptr: u64 = 0;
 
     // Incremental search state (keeps UI responsive on huge inputs).
     var search: SearchState = SearchState{ active: false, phase: SEARCH_PHASE_FWD, cur: 0, end: 0, start_off: 0 };
@@ -5338,15 +6028,8 @@ export async fn main (argc: int, argv: u64) -> int {
                   alert = 5;
                 }
               } else {
-                if regex_out_ptr == 0 {
-                  regex_out_ptr = std::runtime::mem::alloc(RT_EXEC_OUT_BYTES);
-                }
-                if regex_out_ptr == 0 {
-                  search.active = false;
-                  alert = 3;
-                } else {
-                  let r: ExecResult = exec_scratch(&regex_re, file.ptr + (search.cur as u64), take, regex_out_ptr);
-                  if r.code == EXEC_MATCH {
+                let r: ExecResult = exec_bytes(&regex_re, file.ptr + (search.cur as u64), take);
+                if r.code == EXEC_MATCH {
                   let m_off: i64 = search.cur + (r.start as i64);
                   let m_end: i64 = search.cur + (r.end as i64);
                   let view_cols: int = if last_view_cols > 0 { last_view_cols } else { 80 };
@@ -5356,11 +6039,11 @@ export async fn main (argc: int, argv: u64) -> int {
                   search.active = false;
                   alert = 0;
                   need_redraw = true;
-                  } else if r.code != EXEC_NO_MATCH {
+                } else if r.code != EXEC_NO_MATCH {
                   // Runtime failure (timeout, invalid input, etc).
                   search.active = false;
                   alert = 3;
-                  } else {
+                } else {
                   // No match: advance to next chunk.
                   var step: i64 = REGEX_CHUNK_BYTES - REGEX_CHUNK_OVERLAP;
                   if step <= 0 { step = REGEX_CHUNK_BYTES; }
@@ -5376,7 +6059,6 @@ export async fn main (argc: int, argv: u64) -> int {
                       search.active = false;
                       alert = 5;
                     }
-                  }
                   }
                 }
               }
@@ -5563,6 +6245,25 @@ export async fn main (argc: int, argv: u64) -> int {
 
         if show_help {
           draw_help(mut w, &cfg.theme, start_row, content_rows, cols, cfg.regex, cfg.ignore_case, cfg.unsafe_raw);
+        } else if find_active {
+          draw_find_modal(
+            mut w,
+            &cfg.theme,
+            start_row,
+            content_rows,
+            cols,
+            &find_query,
+            &find_stdout,
+            &find_stderr,
+            &find_idx,
+            find_sel,
+            find_scroll,
+            find_fmt,
+            find_exit_code,
+            find_truncated,
+            find_err_stage,
+            find_err_code
+          );
         } else {
           var cur: i64 = top_off;
           var cur_line: i64 = top_line;
@@ -5751,11 +6452,207 @@ export async fn main (argc: int, argv: u64) -> int {
       let is_byte: bool = k.kind == KEY_BYTE;
       let b: u8 = k.byte;
       var want_tab: i64 = -1;
+      var mouse_consumed: bool = false;
 
       // Vim-like `gg` to jump to top. `g` is a prefix and does nothing by itself.
       let is_g: bool = is_byte && b == 103; // 'g'
       if g_pending && !is_g {
         g_pending = false;
+      }
+
+      // Ctrl-K find modal (highest priority overlay).
+      if find_active {
+        let count: i64 = if find_idx.len > 0 { find_idx.len / 2 } else { 0 };
+        let header_rows: int = 2;
+        let list_rows_i64: i64 = if content_rows > header_rows { (content_rows - header_rows) as i64 } else { 1 };
+        let max_scroll: i64 = if count > list_rows_i64 { count - list_rows_i64 } else { 0 };
+        var do_jump: bool = false;
+
+        // Close.
+        if k.kind == KEY_ESC {
+          find_active = false;
+          find_idx.len = 0;
+          find_sel = 0;
+          find_scroll = 0;
+          find_truncated = false;
+          find_exit_code = 0;
+          find_err_stage = 0;
+          find_err_code = 0;
+          find_fmt = FIND_FMT_GREP;
+          find_stdout.drop();
+          find_stderr.drop();
+          need_redraw = true;
+          continue;
+        }
+
+        // Scroll.
+        if k.kind == KEY_MOUSE_WHEEL_UP {
+          if find_scroll > 0 {
+            find_scroll = find_scroll - 3;
+            if find_scroll < 0 { find_scroll = 0; }
+          }
+          if find_sel < find_scroll {
+            find_sel = find_scroll;
+          }
+          need_redraw = true;
+          continue;
+        }
+        if k.kind == KEY_MOUSE_WHEEL_DOWN {
+          if find_scroll < max_scroll {
+            find_scroll = find_scroll + 3;
+            if find_scroll > max_scroll { find_scroll = max_scroll; }
+          }
+          if find_sel >= (find_scroll + list_rows_i64) {
+            find_sel = (find_scroll + list_rows_i64) - 1;
+          }
+          if find_sel >= count && count > 0 {
+            find_sel = count - 1;
+          }
+          need_redraw = true;
+          continue;
+        }
+
+        // Navigate.
+        if k.kind == KEY_UP || (is_byte && (b == 107 || b == 117)) { // 'k' or 'u'
+          if count > 0 && find_sel > 0 {
+            find_sel = find_sel - 1;
+          }
+          if find_sel < find_scroll {
+            find_scroll = find_sel;
+          }
+          need_redraw = true;
+          continue;
+        }
+        if k.kind == KEY_DOWN || (is_byte && (b == 106 || b == 100)) { // 'j' or 'd'
+          if count > 0 && find_sel < (count - 1) {
+            find_sel = find_sel + 1;
+          }
+          if find_sel >= (find_scroll + list_rows_i64) {
+            find_scroll = find_sel - list_rows_i64 + 1;
+          }
+          if find_scroll > max_scroll {
+            find_scroll = max_scroll;
+          }
+          need_redraw = true;
+          continue;
+        }
+
+        // Click to jump.
+        if k.kind == KEY_MOUSE {
+          mouse_consumed = true;
+
+          let my: int = k.y;
+          let cb: int = k.aux;
+          let motion: bool = (cb & 32) != 0;
+          let btn: int = cb & 3;
+          let is_press_or_motion: bool = k.byte == 77; // 'M'
+
+          if is_press_or_motion && btn == 0 && !motion {
+            let list_start: int = start_row + header_rows;
+            if my >= list_start && my < (start_row + content_rows) {
+              let row: i64 = (my - list_start) as i64;
+              let hit: i64 = find_scroll + row;
+              if hit >= 0 && hit < count {
+                find_sel = hit;
+                do_jump = true;
+              } else {
+                need_redraw = true;
+                continue;
+              }
+            } else {
+              need_redraw = true;
+              continue;
+            }
+          } else {
+            need_redraw = true;
+            continue;
+          }
+        }
+
+        // Enter to jump.
+        if k.kind == KEY_ENTER || do_jump {
+          if count <= 0 || find_sel < 0 || find_sel >= count {
+            need_redraw = true;
+            continue;
+          }
+
+          let base: string = find_stdout.as_string();
+          let base_ptr: u64 = std::runtime::mem::string_ptr(base);
+          if base_ptr == 0 {
+            need_redraw = true;
+            continue;
+          }
+          let start: i64 = find_idx.get(find_sel * 2) as i64;
+          let len: i64 = find_idx.get((find_sel * 2) + 1) as i64;
+          if start < 0 || len <= 0 {
+            need_redraw = true;
+            continue;
+          }
+
+          let loc_opt: FindLoc? = parse_find_loc(base_ptr + (start as u64), len, find_fmt);
+          if loc_opt == None {
+            need_redraw = true;
+            continue;
+          }
+          let loc: FindLoc = match (loc_opt) { Some(v) => v, None => FindLoc{ path_ptr: 0, path_len: 0, line1: 0, col1: 0 } };
+          let path_s: string = std::runtime::mem::string_from_ptr_len(loc.path_ptr, loc.path_len as int);
+
+          // Resolve tab index by exact path match.
+          var hit_tab: i64 = -1;
+          var ti: i64 = 0;
+          while ti < tabs.len {
+            let t: TabState = (tabs.ptr as TabState[](tabs.cap as int))[ti];
+            if t.path == path_s {
+              hit_tab = ti;
+              break;
+            }
+            ti = ti + 1;
+          }
+
+          // Close modal now that we captured the target.
+          find_active = false;
+          find_idx.len = 0;
+          find_sel = 0;
+          find_scroll = 0;
+          find_truncated = false;
+          find_exit_code = 0;
+          find_err_stage = 0;
+          find_err_code = 0;
+          find_fmt = FIND_FMT_GREP;
+          find_stdout.drop();
+          find_stderr.drop();
+
+          if hit_tab < 0 || hit_tab >= tabs.len {
+            alert = ALERT_OPEN_FAILED;
+            need_redraw = true;
+            continue;
+          }
+
+          var line0: i64 = loc.line1 - 1;
+          if line0 < 0 { line0 = 0; }
+
+          if hit_tab == active_tab {
+            let off_opt: i64? = offset_for_line(file.ptr, file.len, &offsets, line0);
+            if off_opt != None {
+              let off0: i64 = match (off_opt) { Some(v) => v, None => 0 };
+              top_off = visual_start_for_offset(file.ptr, file.len, off0, view_cols, cfg.unsafe_raw, allow_ansi);
+              pending_goto_line = -1;
+            } else {
+              pending_goto_line = line0;
+            }
+            need_redraw = true;
+            continue;
+          }
+
+          // Switch tabs and then apply the line jump after the switch.
+          want_tab = hit_tab;
+          find_queued_line0 = line0;
+          need_redraw = true;
+          // Fall through to the shared tab switch logic below.
+        } else {
+          // Consume all other keys while the modal is open.
+          continue;
+        }
       }
 
       // Help overlay (presentation + quick reference).
@@ -5809,7 +6706,7 @@ export async fn main (argc: int, argv: u64) -> int {
       }
 
       // Text selection (left mouse drag).
-      if k.kind == KEY_MOUSE {
+      if k.kind == KEY_MOUSE && !mouse_consumed {
         let mx: int = k.x;
         let my: int = k.y;
         let cb: int = k.aux;
@@ -6070,6 +6967,12 @@ export async fn main (argc: int, argv: u64) -> int {
             syn_state_off = top_off;
           }
 
+          // If Ctrl-K queued a jump into this tab, apply it after the switch.
+          if find_queued_line0 >= 0 {
+            pending_goto_line = find_queued_line0;
+            find_queued_line0 = -1;
+          }
+
           need_redraw = true;
           continue;
         }
@@ -6078,6 +6981,58 @@ export async fn main (argc: int, argv: u64) -> int {
       // Toggle line-number gutter.
       if is_byte && b == 76 { // 'L'
         gutter_on = !gutter_on;
+        need_redraw = true;
+        continue;
+      }
+
+      // Ctrl-K: find across currently open files (tabs).
+      if is_byte && b == 11 { // Ctrl-K
+        if search.active {
+          search.active = false;
+          if alert == 4 { alert = 0; }
+        }
+        show_help = false;
+        sel_on = false;
+        sel_anchor = -1;
+        sel_head = -1;
+        sel_drag = false;
+
+        let ok_find: bool = prompt_find(mut w, &cfg.theme, mut inp, rows, cols, mut tmp_query);
+        if ok_find {
+          find_query.clear();
+          let qb0 = tmp_query.as_bytes();
+          let _ = find_query.push_ptr_len(qb0.ptr, qb0.len);
+
+          find_active = false;
+          find_idx.len = 0;
+          find_sel = 0;
+          find_scroll = 0;
+          find_truncated = false;
+          find_exit_code = 0;
+          find_err_stage = 0;
+          find_err_code = 0;
+          find_fmt = FIND_FMT_GREP;
+          find_stdout.drop();
+          find_stderr.drop();
+
+          let qb = find_query.as_bytes();
+          let mut run: FindRun = find_run_open_files(&cfg, tabs.ptr, tabs.cap, tabs.len, qb.ptr, qb.len);
+          find_fmt = run.fmt;
+          find_exit_code = run.exit_code;
+          find_err_stage = run.err_stage;
+          find_err_code = run.err_code;
+          let mut so: std::strings::String = run.stdout;
+          let mut se: std::strings::String = run.stderr;
+          run.stdout = std::strings::String.empty();
+          run.stderr = std::strings::String.empty();
+          find_stdout = move so;
+          find_stderr = move se;
+          find_truncated = find_index_stdout(&find_stdout, find_fmt, mut find_idx);
+          find_sel = 0;
+          find_scroll = 0;
+          find_active = true;
+        }
+
         need_redraw = true;
         continue;
       }
@@ -6281,6 +7236,12 @@ export async fn main (argc: int, argv: u64) -> int {
                     syn_active = true;
                     allow_ansi = false;
                   }
+                }
+
+                // If Ctrl-K queued a jump into this tab, apply it after the switch.
+                if find_queued_line0 >= 0 {
+                  pending_goto_line = find_queued_line0;
+                  find_queued_line0 = -1;
                 }
 
                 need_redraw = true;
@@ -6660,7 +7621,6 @@ export async fn main (argc: int, argv: u64) -> int {
     let _ = yield idx_task;
 
     if style_ptr != 0 { std::runtime::mem::free(style_ptr); }
-    if regex_out_ptr != 0 { std::runtime::mem::free(regex_out_ptr); }
 
     // Leave alternate screen + show cursor.
     w.clear();

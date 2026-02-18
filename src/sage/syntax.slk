@@ -7,7 +7,7 @@ import std::runtime::posix::fs;
 import std::result;
 
 import { BufferU8, VecU64 } from "./buf.slk";
-import { CompileFailed, ExecResult, RegExp, EXEC_MATCH, EXEC_NO_MATCH, RT_EXEC_OUT_BYTES, exec_scratch, search_scratch } from "./re.slk";
+import { CompileFailed, ExecResult, RegExp, EXEC_MATCH, EXEC_NO_MATCH, search_bytes } from "./re.slk";
 import { write_all, write_str } from "./out.slk";
 import { errno } from "./os.slk";
 
@@ -3353,18 +3353,10 @@ export struct HLState {
   quote: u8,   // when mode == HL_MODE_STRING
   esc: bool,   // trailing '\' escape in string (segment boundary)
   pending: u8, // last byte of previous segment (for 2-byte delimiters)
-  re_out_ptr: u64,
 }
 
 export fn hl_state_init () -> HLState {
-  return HLState{ mode: HL_MODE_NONE, quote: 0, esc: false, pending: 0, re_out_ptr: 0 };
-}
-
-impl HLState as std::interfaces::Drop {
-  public fn drop (mut self: &HLState) -> void {
-    std::runtime::mem::free(self.re_out_ptr);
-    self.re_out_ptr = 0;
-  }
+  return HLState{ mode: HL_MODE_NONE, quote: 0, esc: false, pending: 0 };
 }
 
 export fn hl_state_on_newline (mut st: &HLState) -> void {
@@ -4196,7 +4188,7 @@ fn clear_styles (out_styles: u64, len: i64) -> void {
   }
 }
 
-fn apply_re (tok: u8, re: &RegExp, ptr: u64, len: i64, out_styles: u64, out_ptr: u64) -> bool {
+fn apply_re (tok: u8, re: &RegExp, ptr: u64, len: i64, out_styles: u64) -> bool {
   if len <= 0 || out_styles == 0 {
     return true;
   }
@@ -4204,7 +4196,7 @@ fn apply_re (tok: u8, re: &RegExp, ptr: u64, len: i64, out_styles: u64, out_ptr:
   var start: int = 0;
   var iters: int = 0;
   while iters < MAX_MATCH_ITERS {
-    let r: ExecResult = search_scratch(re, ptr, len, start, out_ptr);
+    let r: ExecResult = search_bytes(re, ptr, len, start);
     if r.code == EXEC_MATCH {
       let a: i64 = r.start as i64;
       let b: i64 = r.end as i64;
@@ -4283,25 +4275,18 @@ export fn highlight_segment_stateful (h: &Highlighter, mut st: &HLState, ptr: u6
     return true;
   }
 
-  if st.re_out_ptr == 0 {
-    st.re_out_ptr = std::runtime::mem::alloc(RT_EXEC_OUT_BYTES);
-  }
-  if st.re_out_ptr == 0 {
-    return true;
-  }
-
   // Priority order: earlier tokens win (we only paint TOK_NONE bytes).
-  if h.has_comment && !range_comments { let _ = apply_re(TOK_COMMENT, &h.comment, ptr, len, out_styles, st.re_out_ptr); }
-  if h.has_string && !range_strings { let _ = apply_re(TOK_STRING, &h.string, ptr, len, out_styles, st.re_out_ptr); }
-  if h.has_preproc { let _ = apply_re(TOK_PREPROC, &h.preproc, ptr, len, out_styles, st.re_out_ptr); }
-  if h.has_number { let _ = apply_re(TOK_NUMBER, &h.number, ptr, len, out_styles, st.re_out_ptr); }
-  if h.has_keyword { let _ = apply_re(TOK_KEYWORD, &h.keyword, ptr, len, out_styles, st.re_out_ptr); }
-  if h.has_ty { let _ = apply_re(TOK_TYPE, &h.ty, ptr, len, out_styles, st.re_out_ptr); }
-  if h.has_function { let _ = apply_re(TOK_FUNCTION, &h.function, ptr, len, out_styles, st.re_out_ptr); }
-  if h.has_constant { let _ = apply_re(TOK_CONSTANT, &h.constant, ptr, len, out_styles, st.re_out_ptr); }
-  if h.has_heading { let _ = apply_re(TOK_HEADING, &h.heading, ptr, len, out_styles, st.re_out_ptr); }
-  if h.has_emphasis { let _ = apply_re(TOK_EMPHASIS, &h.emphasis, ptr, len, out_styles, st.re_out_ptr); }
-  if h.has_operator { let _ = apply_re(TOK_OPERATOR, &h.operator, ptr, len, out_styles, st.re_out_ptr); }
+  if h.has_comment && !range_comments { let _ = apply_re(TOK_COMMENT, &h.comment, ptr, len, out_styles); }
+  if h.has_string && !range_strings { let _ = apply_re(TOK_STRING, &h.string, ptr, len, out_styles); }
+  if h.has_preproc { let _ = apply_re(TOK_PREPROC, &h.preproc, ptr, len, out_styles); }
+  if h.has_number { let _ = apply_re(TOK_NUMBER, &h.number, ptr, len, out_styles); }
+  if h.has_keyword { let _ = apply_re(TOK_KEYWORD, &h.keyword, ptr, len, out_styles); }
+  if h.has_ty { let _ = apply_re(TOK_TYPE, &h.ty, ptr, len, out_styles); }
+  if h.has_function { let _ = apply_re(TOK_FUNCTION, &h.function, ptr, len, out_styles); }
+  if h.has_constant { let _ = apply_re(TOK_CONSTANT, &h.constant, ptr, len, out_styles); }
+  if h.has_heading { let _ = apply_re(TOK_HEADING, &h.heading, ptr, len, out_styles); }
+  if h.has_emphasis { let _ = apply_re(TOK_EMPHASIS, &h.emphasis, ptr, len, out_styles); }
+  if h.has_operator { let _ = apply_re(TOK_OPERATOR, &h.operator, ptr, len, out_styles); }
 
   return true;
 }

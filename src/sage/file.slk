@@ -2,9 +2,10 @@ module sage::file;
 
 import std::interfaces;
 import std::runtime::mem;
+import std::runtime::fs;
 import std::runtime::posix::fs;
 
-import { MAP_FAILED, MAP_PRIVATE, PROT_READ, memchr, mmap, mkstemp, munmap } from "./os.slk";
+import { memchr, mkstemp } from "./os.slk";
 
 fn cstr_len (cstr: u64, max: i64) -> i64 {
   if cstr == 0 || max <= 0 {
@@ -43,9 +44,16 @@ fn map_fd (fd: int, len: i64) -> MappedFile? {
     return Some(mapped_empty());
   }
 
-  let ptr: u64 = mmap(0, len, PROT_READ, MAP_PRIVATE, fd, 0);
+  let ptr_r = std::runtime::fs::mmap_readonly(fd, len, 0);
   let _ = std::runtime::posix::fs::close(fd);
-  if ptr == MAP_FAILED {
+  if ptr_r.is_err() {
+    return None;
+  }
+  let ptr: u64 = match (ptr_r) { Ok(v) => v, Err(_) => 0 };
+  if ptr == 0 {
+    // `sage` uses 0 pointers as a sentinel for "no mapping"; avoid allowing a
+    // successful mapping at address 0 to flow through the app.
+    std::runtime::fs::munmap(ptr, len);
     return None;
   }
   return Some(MappedFile{ ptr: ptr, len: len });
@@ -134,6 +142,11 @@ export fn map_stdin_spool (allow_binary: bool) -> MappedFile? {
 
     var off: i64 = 0;
     let want: i64 = n as i64;
+    if !allow_binary && memchr(buf, 0, want) != 0 {
+      std::runtime::mem::free(buf);
+      let _ = std::runtime::posix::fs::close(fd);
+      return None;
+    }
     while off < want {
       let w: int = std::runtime::posix::fs::write(fd, buf + (off as u64), want - off);
       if w <= 0 {
@@ -165,7 +178,7 @@ export fn map_stdin_spool (allow_binary: bool) -> MappedFile? {
 impl MappedFile as std::interfaces::Drop {
   public fn drop (mut self: &MappedFile) -> void {
     if self.ptr != 0 && self.len > 0 {
-      let _ = munmap(self.ptr, self.len);
+      std::runtime::fs::munmap(self.ptr, self.len);
     }
     self.ptr = 0;
     self.len = 0;
