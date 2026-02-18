@@ -1,0 +1,531 @@
+module sage::plugins;
+
+import std::interfaces;
+import std::runtime::env;
+import std::runtime::mem;
+import std::runtime::posix::fs;
+
+import { plugins_bootstrap_js } from "../../build/gen/plugins_bootstrap.slk";
+
+// ---------------------------------------------------------------------------
+// QuickJS plugin host (C shim).
+//
+// We represent the opaque QuickJS host handle as `u64` so we can treat `0` as
+// "disabled/unavailable" without relying on pointer comparisons in the current
+// subset.
+
+type Qjs = u64;
+
+export ext sage_qjs_new = fn (i64) -> Qjs;
+export ext sage_qjs_free = fn (Qjs) -> void;
+export ext sage_qjs_set_timeouts_ms = fn (Qjs, i64, i64) -> void;
+export ext sage_qjs_set_limits = fn (Qjs, i64, i64) -> void;
+export ext sage_qjs_set_log_path = fn (Qjs, string) -> i64;
+export ext sage_qjs_take_error = fn (Qjs) -> i64;
+export ext sage_qjs_eval_bootstrap = fn (Qjs, string) -> i64;
+export ext sage_qjs_eval_file = fn (Qjs, string) -> i64;
+export ext sage_qjs_emit_open = fn (Qjs, string, i64, i64) -> i64;
+export ext sage_qjs_emit_tab_change = fn (Qjs, i64, i64, i64) -> i64;
+export ext sage_qjs_emit_search = fn (Qjs, string, i64, i64) -> i64;
+export ext sage_qjs_emit_copy = fn (Qjs, i64) -> i64;
+export ext sage_qjs_emit_quit = fn (Qjs) -> i64;
+
+// ---------------------------------------------------------------------------
+// Small helpers for NUL-terminated owned strings (POSIX APIs).
+
+fn cstr_len_max (cstr: u64, max: i64) -> i64 {
+  if cstr == 0 || max <= 0 {
+    return 0;
+  }
+  var i: i64 = 0;
+  while i < max {
+    if std::runtime::mem::load_u8(cstr, i) == 0 {
+      return i;
+    }
+    i = i + 1;
+  }
+  return max;
+}
+
+fn env_get_string (key: string) -> string? {
+  let p: u64 = std::runtime::env::getenv(key);
+  if p == 0 {
+    return None;
+  }
+  let n: i64 = cstr_len_max(p, 8192);
+  if n <= 0 {
+    return None;
+  }
+  return Some(std::runtime::mem::string_from_ptr_len(p, n as int));
+}
+
+fn cstr_copy_owned (s: string) -> string? {
+  // Allocate an owned, NUL-terminated copy so it can be passed to POSIX APIs.
+  let p: u64 = std::runtime::mem::string_ptr(s);
+  let n: i64 = std::runtime::mem::string_len(s);
+  if p == 0 || n < 0 {
+    return None;
+  }
+
+  let out: u64 = std::runtime::mem::alloc(n + 1);
+  if out == 0 {
+    return None;
+  }
+  var i: i64 = 0;
+  while i < n {
+    std::runtime::mem::store_u8(out, i, std::runtime::mem::load_u8(p, i));
+    i = i + 1;
+  }
+  std::runtime::mem::store_u8(out, n, 0);
+  return Some(std::runtime::mem::string_from_ptr_len(out, n as int));
+}
+
+fn join2 (a: string, b: string) -> string? {
+  // Allocate an owned, NUL-terminated concatenation.
+  let a_ptr: u64 = std::runtime::mem::string_ptr(a);
+  let a_len: i64 = std::runtime::mem::string_len(a);
+  let b_ptr: u64 = std::runtime::mem::string_ptr(b);
+  let b_len: i64 = std::runtime::mem::string_len(b);
+  if a_ptr == 0 || b_ptr == 0 || a_len < 0 || b_len < 0 {
+    return None;
+  }
+  let total: i64 = a_len + b_len;
+  if total < 0 {
+    return None;
+  }
+  let out: u64 = std::runtime::mem::alloc(total + 1);
+  if out == 0 {
+    return None;
+  }
+  var i: i64 = 0;
+  while i < a_len {
+    std::runtime::mem::store_u8(out, i, std::runtime::mem::load_u8(a_ptr, i));
+    i = i + 1;
+  }
+  var j: i64 = 0;
+  while j < b_len {
+    std::runtime::mem::store_u8(out, a_len + j, std::runtime::mem::load_u8(b_ptr, j));
+    j = j + 1;
+  }
+  std::runtime::mem::store_u8(out, total, 0);
+  return Some(std::runtime::mem::string_from_ptr_len(out, total as int));
+}
+
+fn free_joined (s: string) -> void {
+  let p: u64 = std::runtime::mem::string_ptr(s);
+  if p != 0 {
+    std::runtime::mem::free(p);
+  }
+}
+
+fn ends_with_slash (path: string) -> bool {
+  let p: u64 = std::runtime::mem::string_ptr(path);
+  let n: i64 = std::runtime::mem::string_len(path);
+  if p == 0 || n <= 0 {
+    return false;
+  }
+  return std::runtime::mem::load_u8(p, n - 1) == 47; // '/'
+}
+
+fn ends_with_js (name: string) -> bool {
+  let p: u64 = std::runtime::mem::string_ptr(name);
+  let n: i64 = std::runtime::mem::string_len(name);
+  if p == 0 || n < 3 {
+    return false;
+  }
+  return std::runtime::mem::load_u8(p, n - 3) == 46 && // '.'
+         std::runtime::mem::load_u8(p, n - 2) == 106 && // 'j'
+         std::runtime::mem::load_u8(p, n - 1) == 115;   // 's'
+}
+
+// ---------------------------------------------------------------------------
+// Plugin path collection (small N, so simple list + selection sort).
+
+struct PathList {
+  ptr: u64,
+  len: i64,
+  cap: i64,
+}
+
+fn pathlist_init (cap: i64) -> PathList? {
+  let want: i64 = if cap > 0 { cap } else { 0 };
+  let elem_bytes: i64 = (sizeof (string)) as i64;
+  let bytes: i64 = want * elem_bytes;
+  let ptr: u64 = if bytes > 0 { std::runtime::mem::alloc(bytes) } else { 0 };
+  if want > 0 && ptr == 0 {
+    return None;
+  }
+  return Some(PathList{ ptr: ptr, len: 0, cap: want });
+}
+
+fn pathlist_free (mut l: &PathList) -> void {
+  if l.ptr != 0 {
+    var i: i64 = 0;
+    while i < l.len {
+      let s: string = (l.ptr as string[](l.cap as int))[i];
+      free_joined(s);
+      i = i + 1;
+    }
+    std::runtime::mem::free(l.ptr);
+  }
+  l.ptr = 0;
+  l.len = 0;
+  l.cap = 0;
+}
+
+fn pathlist_ensure_cap (mut l: &PathList, extra: i64) -> bool {
+  if extra <= 0 {
+    return true;
+  }
+  let need: i64 = l.len + extra;
+  if need <= l.cap {
+    return true;
+  }
+
+  let elem_bytes: i64 = (sizeof (string)) as i64;
+  var new_cap: i64 = if l.cap > 0 { l.cap * 2 } else { 8 };
+  while new_cap < need {
+    new_cap = new_cap * 2;
+  }
+  let new_bytes: i64 = new_cap * elem_bytes;
+  let new_ptr: u64 = if l.ptr != 0 { std::runtime::mem::realloc(l.ptr, new_bytes) } else { std::runtime::mem::alloc(new_bytes) };
+  if new_ptr == 0 {
+    return false;
+  }
+  l.ptr = new_ptr;
+  l.cap = new_cap;
+  return true;
+}
+
+fn pathlist_push_owned (mut l: &PathList, path_owned: string) -> bool {
+  if !pathlist_ensure_cap(mut l, 1) {
+    return false;
+  }
+  (l.ptr as string[](l.cap as int))[l.len] = path_owned;
+  l.len = l.len + 1;
+  return true;
+}
+
+fn cmp_lex (a: string, b: string) -> int {
+  let ap: u64 = std::runtime::mem::string_ptr(a);
+  let an: i64 = std::runtime::mem::string_len(a);
+  let bp: u64 = std::runtime::mem::string_ptr(b);
+  let bn: i64 = std::runtime::mem::string_len(b);
+  if ap == 0 || bp == 0 {
+    return 0;
+  }
+
+  let m: i64 = if an < bn { an } else { bn };
+  var i: i64 = 0;
+  while i < m {
+    let ca: u8 = std::runtime::mem::load_u8(ap, i);
+    let cb: u8 = std::runtime::mem::load_u8(bp, i);
+    if ca < cb { return -1; }
+    if ca > cb { return 1; }
+    i = i + 1;
+  }
+  if an < bn { return -1; }
+  if an > bn { return 1; }
+  return 0;
+}
+
+fn pathlist_sort (mut l: &PathList) -> void {
+  if l.ptr == 0 || l.len <= 1 {
+    return;
+  }
+
+  // Selection sort (list is small).
+  var i: i64 = 0;
+  while i < l.len {
+    var min: i64 = i;
+    var j: i64 = i + 1;
+    while j < l.len {
+      let a: string = (l.ptr as string[](l.cap as int))[min];
+      let b: string = (l.ptr as string[](l.cap as int))[j];
+      if cmp_lex(a, b) > 0 {
+        min = j;
+      }
+      j = j + 1;
+    }
+    if min != i {
+      let tmp: string = (l.ptr as string[](l.cap as int))[i];
+      (l.ptr as string[](l.cap as int))[i] = (l.ptr as string[](l.cap as int))[min];
+      (l.ptr as string[](l.cap as int))[min] = tmp;
+    }
+    i = i + 1;
+  }
+}
+
+fn collect_plugins_dir (dir_path: string, mut out: &PathList) -> void {
+  // NOTE: In this runtime snapshot, `opendir` is more reliable when paths end
+  // with '/', so ensure a trailing slash.
+  var prefix: string = dir_path;
+  var prefix_owned: bool = false;
+  if !ends_with_slash(dir_path) {
+    let p_opt: string? = join2(dir_path, "/");
+    if p_opt == None { return; }
+    prefix = match (p_opt) { Some(v) => v, None => "" };
+    prefix_owned = true;
+  }
+
+  let dir: u64 = std::runtime::posix::fs::opendir(prefix);
+  if dir == 0 {
+    if prefix_owned { free_joined(prefix); }
+    return;
+  }
+
+  while true {
+    let name_cstr: u64 = std::runtime::posix::fs::readdir_name_owned(dir);
+    if name_cstr == 0 {
+      break;
+    }
+    let name_len: i64 = cstr_len_max(name_cstr, 4096);
+    let name: string = std::runtime::mem::string_from_ptr_len(name_cstr, name_len as int);
+
+    // Skip "." and "..".
+    if name == "." || name == ".." {
+      std::runtime::mem::free(name_cstr);
+      continue;
+    }
+
+    if !ends_with_js(name) {
+      std::runtime::mem::free(name_cstr);
+      continue;
+    }
+
+    // Build full path (owned).
+    let full_opt: string? = join2(prefix, name);
+    std::runtime::mem::free(name_cstr);
+    if full_opt == None {
+      break;
+    }
+    let full: string = match (full_opt) { Some(v) => v, None => "" };
+
+    // Skip directories.
+    let child_dir_opt: string? = join2(full, "/");
+    if child_dir_opt == None {
+      free_joined(full);
+      break;
+    }
+    let child_dir: string = match (child_dir_opt) { Some(v) => v, None => "" };
+    let sub: u64 = std::runtime::posix::fs::opendir(child_dir);
+    if sub != 0 {
+      let _ = std::runtime::posix::fs::closedir(sub);
+      free_joined(child_dir);
+      free_joined(full);
+      continue;
+    }
+    free_joined(child_dir);
+
+    if !pathlist_push_owned(mut out, full) {
+      free_joined(full);
+      break;
+    }
+  }
+
+  let _ = std::runtime::posix::fs::closedir(dir);
+  if prefix_owned { free_joined(prefix); }
+
+  pathlist_sort(mut out);
+}
+
+fn plugins_dir (override_opt: string?) -> string? {
+  let env_dir_opt: string? = env_get_string("SAGE_PLUGINS_DIR");
+  if env_dir_opt != None {
+    let v: string = match (env_dir_opt) { Some(x) => x, None => "" };
+    return cstr_copy_owned(v);
+  }
+
+  if override_opt != None {
+    let v2: string = match (override_opt) { Some(x) => x, None => "" };
+    let n2: i64 = std::runtime::mem::string_len(v2);
+    if n2 > 0 {
+      return cstr_copy_owned(v2);
+    }
+  }
+
+  let xdg_opt: string? = env_get_string("XDG_CONFIG_HOME");
+  if xdg_opt != None {
+    let xdg: string = match (xdg_opt) { Some(v) => v, None => "" };
+    let p_opt: string? = join2(xdg, "/sage/plugins");
+    if p_opt != None {
+      return p_opt;
+    }
+  }
+
+  let home_opt: string? = env_get_string("HOME");
+  if home_opt == None {
+    return None;
+  }
+  let home: string = match (home_opt) { Some(v) => v, None => "" };
+  let conf_opt: string? = join2(home, "/.config");
+  if conf_opt == None {
+    return None;
+  }
+  let conf: string = match (conf_opt) { Some(v) => v, None => "" };
+  let p2_opt: string? = join2(conf, "/sage/plugins");
+  free_joined(conf);
+  return p2_opt;
+}
+
+// ---------------------------------------------------------------------------
+// Public API.
+
+export struct Plugins {
+  q: Qjs,
+  init_error: bool,
+}
+
+export fn init (
+  verbose: bool,
+  enabled: bool,
+  plugins_dir_opt: string?,
+  plugin_log_path_opt: string?,
+  load_timeout_ms: i64,
+  event_timeout_ms: i64,
+  mem_limit_mb: i64,
+  stack_limit_kb: i64
+) -> Plugins {
+  // Allow explicit disable for debugging.
+  if !enabled {
+    return Plugins{ q: 0, init_error: false };
+  }
+  if std::runtime::env::getenv("SAGE_NO_PLUGINS") != 0 {
+    return Plugins{ q: 0, init_error: false };
+  }
+
+  let q: Qjs = sage_qjs_new(if verbose { 1 } else { 0 });
+  if q == 0 {
+    return Plugins{ q: 0, init_error: false };
+  }
+
+  // Optional: apply per-session config (env vars win).
+  var lt: i64 = load_timeout_ms;
+  var et: i64 = event_timeout_ms;
+  if std::runtime::env::getenv("SAGE_PLUGIN_LOAD_TIMEOUT_MS") != 0 { lt = -1; }
+  if std::runtime::env::getenv("SAGE_PLUGIN_EVENT_TIMEOUT_MS") != 0 { et = -1; }
+  if lt >= 0 || et >= 0 {
+    sage_qjs_set_timeouts_ms(q, lt, et);
+  }
+
+  var mem_bytes: i64 = -1;
+  var stack_bytes: i64 = -1;
+  if mem_limit_mb >= 0 && std::runtime::env::getenv("SAGE_PLUGIN_MEM_LIMIT_MB") == 0 {
+    mem_bytes = mem_limit_mb * 1024 * 1024;
+  }
+  if stack_limit_kb >= 0 && std::runtime::env::getenv("SAGE_PLUGIN_STACK_LIMIT_KB") == 0 {
+    stack_bytes = stack_limit_kb * 1024;
+  }
+  if mem_bytes >= 0 || stack_bytes >= 0 {
+    sage_qjs_set_limits(q, mem_bytes, stack_bytes);
+  }
+
+  if plugin_log_path_opt != None && std::runtime::env::getenv("SAGE_PLUGIN_LOG") == 0 {
+    let lp: string = match (plugin_log_path_opt) { Some(v) => v, None => "" };
+    let own_opt: string? = cstr_copy_owned(lp);
+    if own_opt != None {
+      let own: string = match (own_opt) { Some(v) => v, None => "" };
+      let _ = sage_qjs_set_log_path(q, own);
+      free_joined(own);
+    }
+  }
+
+  // Bootstrap JS API surface (compiled into the binary via build.slk).
+  let b: string = plugins_bootstrap_js();
+  let b_owned_opt: string? = cstr_copy_owned(b);
+  if b_owned_opt == None {
+    sage_qjs_free(q);
+    return Plugins{ q: 0, init_error: false };
+  }
+  let b_owned: string = match (b_owned_opt) { Some(v) => v, None => "" };
+
+  let boot_rc: i64 = sage_qjs_eval_bootstrap(q, b_owned);
+  free_joined(b_owned);
+  if boot_rc != 0 {
+    sage_qjs_free(q);
+    return Plugins{ q: 0, init_error: false };
+  }
+
+  // Load plugins from the default directory (lexicographic order).
+  let dir_opt: string? = plugins_dir(plugins_dir_opt);
+  if dir_opt != None {
+    let dir: string = match (dir_opt) { Some(v) => v, None => "" };
+    let list_opt: PathList? = pathlist_init(16);
+    if list_opt != None {
+      let mut l: PathList = match (list_opt) { Some(v) => v, None => PathList{ ptr: 0, len: 0, cap: 0 } };
+      collect_plugins_dir(dir, mut l);
+      var i: i64 = 0;
+      while i < l.len {
+        let p: string = (l.ptr as string[](l.cap as int))[i];
+        let _ = sage_qjs_eval_file(q, p);
+        i = i + 1;
+      }
+      pathlist_free(mut l);
+    }
+    free_joined(dir);
+  }
+
+  let init_err: bool = sage_qjs_take_error(q) != 0;
+  return Plugins{ q: q, init_error: init_err };
+}
+
+export fn enabled (p: &Plugins) -> bool {
+  return p.q != 0;
+}
+
+export fn had_init_error (p: &Plugins) -> bool {
+  return p.init_error;
+}
+
+export fn emit_open (p: &Plugins, path: string, tab: i64, tab_count: i64) -> bool {
+  if p.q == 0 { return false; }
+  let own_opt: string? = cstr_copy_owned(path);
+  if own_opt == None { return true; }
+  let own: string = match (own_opt) { Some(v) => v, None => "" };
+  let rc: i64 = sage_qjs_emit_open(p.q, own, tab, tab_count);
+  free_joined(own);
+  if rc != 0 { return true; }
+  return sage_qjs_take_error(p.q) != 0;
+}
+
+export fn emit_tab_change (p: &Plugins, from_tab: i64, to_tab: i64, tab_count: i64) -> bool {
+  if p.q == 0 { return false; }
+  let rc: i64 = sage_qjs_emit_tab_change(p.q, from_tab, to_tab, tab_count);
+  if rc != 0 { return true; }
+  return sage_qjs_take_error(p.q) != 0;
+}
+
+export fn emit_search (p: &Plugins, query: string, regex: bool, ignore_case: bool) -> bool {
+  if p.q == 0 { return false; }
+  let own_opt: string? = cstr_copy_owned(query);
+  if own_opt == None { return true; }
+  let own: string = match (own_opt) { Some(v) => v, None => "" };
+  let rc: i64 = sage_qjs_emit_search(p.q, own, if regex { 1 } else { 0 }, if ignore_case { 1 } else { 0 });
+  free_joined(own);
+  if rc != 0 { return true; }
+  return sage_qjs_take_error(p.q) != 0;
+}
+
+export fn emit_copy (p: &Plugins, bytes: i64) -> bool {
+  if p.q == 0 { return false; }
+  let rc: i64 = sage_qjs_emit_copy(p.q, bytes);
+  if rc != 0 { return true; }
+  return sage_qjs_take_error(p.q) != 0;
+}
+
+export fn emit_quit (p: &Plugins) -> bool {
+  if p.q == 0 { return false; }
+  let rc: i64 = sage_qjs_emit_quit(p.q);
+  if rc != 0 { return true; }
+  return sage_qjs_take_error(p.q) != 0;
+}
+
+impl Plugins as std::interfaces::Drop {
+  public fn drop (mut self: &Plugins) -> void {
+    if self.q != 0 {
+      sage_qjs_free(self.q);
+      self.q = 0;
+    }
+    self.init_error = false;
+  }
+}

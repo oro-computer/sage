@@ -3,10 +3,10 @@
 ## Snapshot (last verified)
 
 - Date: **2026-02-18**
-- `sage`: `f14f446` (base commit; notes reflect subsequent local edits)
-- `silk`: `ea09e87` (`silk (ABI) 0.2.0`)
+- `sage`: `f20d95d` (base commit; notes reflect subsequent local edits)
+- `silk`: `440f569` (`silk (ABI) 0.2.0`)
 - Baseline: linux/glibc x86_64 (hosted POSIX runtime)
-- Verified: `silk test --package .` (19 tests), `silk build --package .`
+- Verified: `silk test --package .` (19 tests), `silk build --package .` (build module enabled)
 
 ## Architecture
 
@@ -59,6 +59,50 @@
   - Output parsing expects a `grep`-like `path:line:` format (and `--vimgrep`’s `path:line:col:`); Enter/click jumps by file+line (column is ignored).
   - For safety, results are capped (`FIND_MAX_RESULTS = 5000`) and the modal shows “(truncated)” when hit.
   - Modal controls: Up/Down (or `j/k`), mouse wheel scroll, Enter/click to jump, Esc to close.
+- **Plugins (QuickJS / JavaScript)**:
+  - **Build**:
+    - `silk.toml` opts in to a build module (`build.slk`) which:
+      - generates `build/gen/plugins_bootstrap.slk` from `src/sage/plugins/bootstrap.js` (embedded JS bootstrap), and
+      - emits a manifest that compiles QuickJS into the `sage` executable via `[[target]].inputs` (`quickjs/*.c` + `src/native/sage_qjs.c`).
+    - Note (current subset limitation): the generated bootstrap exports a `fn plugins_bootstrap_js() -> string` instead of an exported module-level `string` binding.
+    - Note (build-module subset quirks observed):
+      - `match` on `Result` should use unqualified `Ok(...)` / `Err(...)` patterns (qualified variant paths were rejected in this snapshot).
+      - Calling `.drop()` requires a `let mut` local binding (since `drop` takes a mutable receiver).
+  - **Runtime plugin discovery**:
+    - Plugins are initialized only in the interactive TUI path (when stdout is a TTY). In pass-through mode (`stdout_tty=false`), `sage` returns early and does not run plugins.
+    - Disable plugins (safe mode): `SAGE_NO_PLUGINS=1`, `--no-plugins`, or `.sagerc` `plugins = false`.
+    - Loads `*.js` plugins in lexicographic order from:
+      - `--plugins-dir <path>` / `.sagerc` `plugins_dir = <path>` (if set and `$SAGE_PLUGINS_DIR` is not set), else
+      - `$SAGE_PLUGINS_DIR`, else
+      - `$XDG_CONFIG_HOME/sage/plugins`, else
+      - `$HOME/.config/sage/plugins`
+  - **Execution limits (robustness)**:
+    - Plugin execution is bounded to keep the UI responsive:
+      - load/bootstrap budget: `SAGE_PLUGIN_LOAD_TIMEOUT_MS` (default `500`)
+      - per-event budget: `SAGE_PLUGIN_EVENT_TIMEOUT_MS` (default `50`)
+      - memory limit: `SAGE_PLUGIN_MEM_LIMIT_MB` (default `64`)
+      - stack limit: `SAGE_PLUGIN_STACK_LIMIT_KB` (default `1024`)
+    - These can also be set in `.sagerc` (unless the corresponding env var is set):
+      - `plugin_load_timeout_ms`, `plugin_event_timeout_ms`, `plugin_mem_limit_mb`, `plugin_stack_limit_kb`
+    - If a plugin hits a timeout, `sage` disables plugins for the rest of the session.
+  - **Logging / diagnostics**:
+    - Plugin errors and `sage.log(...)` output go to a log file (to avoid corrupting the TUI):
+      - `$SAGE_PLUGIN_LOG` if set, else
+      - `$XDG_CACHE_HOME/sage/plugins.log`, else
+      - `$HOME/.cache/sage/plugins.log`
+    - `SAGE_PLUGIN_LOG_STDERR=1` forces plugin logs to stderr (debug only; may corrupt the TUI).
+  - **JS API surface**:
+    - Global `sage` object is defined before plugins load (from the embedded bootstrap):
+      - `sage.on(event: string, fn: (payload) -> void)`
+      - `sage.log(...args)` (logs only when `sage` runs with `--verbose`)
+    - Plugins run as plain scripts (no QuickJS `std`/`os` modules are linked in the current host).
+    - Events currently emitted by the host:
+      - `open`: `{ path, tab, tab_count }` (tabs are 1-indexed in events)
+      - `tab_change`: `{ from, to, tab_count }`
+      - `search`: `{ query, regex, ignore_case }`
+      - `copy`: `{ bytes }` (OSC 52 success only)
+      - `quit`
+    - Plugin exceptions are reported to the plugin log with a `sage[plugin]` prefix (stack printed in `--verbose` mode). Runtime UI may also show `[plugin err]` on the status line.
 - **Syntax highlighting (optional)**:
   - Syntax source files live in `XDG_CONFIG_HOME/sage/syntax/` (`.sublime-syntax`, `.tmLanguage`, `.tmLanguage.json`, `.cson`).
     - `sage --compile-cache` parses a **subset** of those formats and writes a compact

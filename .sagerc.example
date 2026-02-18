@@ -26,6 +26,19 @@ gutter = auto            # auto | always | never | true | false
 regex = false
 ignore_case = false
 
+# Ctrl-K find tool (defaults to rg/ag/slg/grep).
+# Note: value is whitespace-split (no shell quoting).
+# find_cmd = rg --vimgrep --
+
+# Plugins (QuickJS / JavaScript).
+plugins = true
+# plugins_dir = /absolute/path/to/plugins
+# plugin_log_path = /absolute/path/to/plugins.log
+# plugin_load_timeout_ms = 500
+# plugin_event_timeout_ms = 50
+# plugin_mem_limit_mb = 64
+# plugin_stack_limit_kb = 1024
+
 # Safety toggles.
 raw = false              # unsafe: render bytes as-is
 binary = false           # allow NUL bytes in input

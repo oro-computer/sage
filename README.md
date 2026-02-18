@@ -101,7 +101,34 @@ Supported keys (high level):
 - `color` = `auto` | `always` | `never`
 - `ansi`, `syntax`, `alt_screen`, `mouse`, `raw`, `binary`, `regex`, `ignore_case` = `true|false`
 - `gutter` / `line_numbers` = `auto` | `always` | `never` | `true|false`
+- `find_cmd` (`find`, `find-cmd`) = find command + args (whitespace-split; no shell quoting)
+- `plugins` = `true|false`
+- `plugins_dir` = absolute path to plugins dir (not `~`-expanded)
+- `plugin_log_path` (`plugin_log`) = absolute path to plugin log (not `~`-expanded)
+- Plugin limits: `plugin_load_timeout_ms`, `plugin_event_timeout_ms`, `plugin_mem_limit_mb`, `plugin_stack_limit_kb`
 - Theme palette overrides (0–255): `status_bg`, `status_fg`, `status_dim`, `brand`, `accent`, `warn`, `err`, `mode_regex`, `match_bg`, `match_fg`
 - Syntax palette overrides (0–255): `syn_comment`, `syn_string`, `syn_number`, `syn_keyword`, `syn_type`, `syn_function`, `syn_constant`, `syn_operator`, `syn_heading`, `syn_emphasis`, `syn_preproc`
 
 See `.sagerc.example` for a starting point.
+
+## Plugins (JavaScript / QuickJS)
+
+At startup, `sage` loads `*.js` plugins in lexicographic order from:
+
+- `--plugins-dir <path>` / `.sagerc` `plugins_dir = <path>` (if set and `$SAGE_PLUGINS_DIR` is not set), else
+- `$SAGE_PLUGINS_DIR`, else
+- `$XDG_CONFIG_HOME/sage/plugins` (usually `~/.config/sage/plugins`), else
+- `$HOME/.config/sage/plugins`
+
+Plugins run only in the interactive TUI path (stdout is a TTY). In pass-through
+filter mode, `sage` returns early and does not load plugins.
+
+Disable plugins (safe mode): `SAGE_NO_PLUGINS=1`, `--no-plugins`, or `.sagerc` `plugins = false`.
+
+Plugin diagnostics are written to `$SAGE_PLUGIN_LOG` (if set), else
+`$XDG_CACHE_HOME/sage/plugins.log`, else `$HOME/.cache/sage/plugins.log`.
+
+For robustness, plugin execution is bounded (timeouts + memory/stack limits). If a plugin hits a timeout, `sage` disables plugins for the rest of the session.
+
+Plugins run in an embedded QuickJS runtime and receive events via a global `sage`
+object. See `examples/plugins/00-log-events.js`.

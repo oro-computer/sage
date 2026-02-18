@@ -1,0 +1,154 @@
+module sage::build as Builder;
+
+import { Builder } from "std/interfaces";
+import build from "std/build";
+import fs from "std/fs";
+import path from "std/path";
+import std::memory;
+import std::result;
+import std::runtime::mem;
+import std::strings;
+
+fn hex_digit (n: u8) -> u8 {
+  return if n < 10 { 48 + n } else { 87 + (n - 10) }; // '0'..'9' / 'a'..'f'
+}
+
+fn push_silk_string_literal (mut out: &std::strings::String, s: string) -> std::memory::OutOfMemory? {
+  let err0: std::memory::OutOfMemory? = out.push_u8(34); // '"'
+  if err0 != None { return err0; }
+
+  let p: u64 = std::runtime::mem::string_ptr(s);
+  let n: i64 = std::runtime::mem::string_len(s);
+  var i: i64 = 0;
+  while i < n {
+    let b: u8 = std::runtime::mem::load_u8(p, i);
+
+    // Common escapes.
+    if b == 92 { // '\\'
+      let e = out.push_string("\\\\");
+      if e != None { return e; }
+      i = i + 1;
+      continue;
+    }
+    if b == 34 { // '"'
+      let e = out.push_string("\\\"");
+      if e != None { return e; }
+      i = i + 1;
+      continue;
+    }
+    if b == 10 { // '\n'
+      let e = out.push_string("\\n");
+      if e != None { return e; }
+      i = i + 1;
+      continue;
+    }
+    if b == 9 { // '\t'
+      let e = out.push_string("\\t");
+      if e != None { return e; }
+      i = i + 1;
+      continue;
+    }
+    if b == 0 { // NUL
+      let e = out.push_string("\\0");
+      if e != None { return e; }
+      i = i + 1;
+      continue;
+    }
+
+    // Printable ASCII.
+    if b >= 32 && b <= 126 {
+      let e = out.push_u8(b);
+      if e != None { return e; }
+      i = i + 1;
+      continue;
+    }
+
+    // Fallback: byte escape `\xNN`.
+    let e0 = out.push_string("\\x");
+    if e0 != None { return e0; }
+    let e1 = out.push_u8(hex_digit((b >> 4) & 15));
+    if e1 != None { return e1; }
+    let e2 = out.push_u8(hex_digit(b & 15));
+    if e2 != None { return e2; }
+
+    i = i + 1;
+  }
+
+  return out.push_u8(34); // '"'
+}
+
+fn generate_bootstrap (package_root: string) -> int {
+  // Read `src/sage/plugins/bootstrap.js` and embed it into generated Silk code.
+  let p_r = path::join(package_root, "src/sage/plugins/bootstrap.js");
+  if p_r.is_err() {
+    return 1;
+  }
+  let mut p: std::strings::String = match (p_r) {
+    Ok(v) => v,
+    Err(_) => std::strings::String.empty(),
+  };
+
+  let js_r = fs::read_file_string(p.as_string());
+  if js_r.is_err() {
+    p.drop();
+    return 1;
+  }
+  let mut js: std::strings::String = match (js_r) {
+    Ok(v) => v,
+    Err(_) => std::strings::String.empty(),
+  };
+  p.drop();
+
+  let mut out: std::strings::String = std::strings::String.empty();
+  let _ = out.push_string("module sage::plugins_bootstrap;\n\n");
+  let _ = out.push_string("export fn plugins_bootstrap_js () -> string {\n  return ");
+  let esc_err: std::memory::OutOfMemory? = push_silk_string_literal(mut out, js.as_string());
+  js.drop();
+  if esc_err != None {
+    out.drop();
+    return 1;
+  }
+  let _ = out.push_string(";\n}\n");
+
+  // Write `build/gen/plugins_bootstrap.slk` deterministically.
+  let mut g: build::StepGraph = build::StepGraph.init(package_root);
+  let dir = g.mkdir_all("build/gen", 493); // 0755
+  let gen = g.write_file_string("build/gen/plugins_bootstrap.slk", out.as_string(), 420); // 0644
+  g.depends_on(gen, dir);
+  let rc: int = g.run();
+  out.drop();
+  return rc;
+}
+
+export async fn run (package_root: string, action: string) -> int {
+  let _ = action;
+
+  if generate_bootstrap(package_root) != 0 {
+    return 1;
+  }
+
+  let mut b: build::Build = build::Build.init();
+  b.package("sage", "0.1.0");
+  b.set_default_target("sage");
+
+  b.sources_add_include("src/**/*.slk");
+  b.sources_add_include("build/gen/**/*.slk");
+
+  let t = b.add_executable("sage", "src/main.slk");
+  b.target_set_output(t, "build/bin/sage");
+
+  // QuickJS + host shim.
+  b.target_add_input(t, "src/native/sage_qjs.c");
+  b.target_add_input(t, "quickjs/cutils.c");
+  b.target_add_input(t, "quickjs/dtoa.c");
+  b.target_add_input(t, "quickjs/libregexp.c");
+  b.target_add_input(t, "quickjs/libunicode.c");
+  b.target_add_input(t, "quickjs/quickjs.c");
+
+  b.target_add_cflag(t, "-std=c11");
+  b.target_add_cflag(t, "-D_GNU_SOURCE");
+  b.target_add_cflag(t, "-Iquickjs");
+  b.target_add_ldflag(t, "-lm");
+
+  return b.emit();
+}

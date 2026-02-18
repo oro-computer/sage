@@ -11,6 +11,8 @@ include = [
 [build]
 default_target = "sage"
 profile = "release"
+build_module = true
+build_module_path = "build.slk"
 
 [test]
 command = "silk test --package ."
@@ -20,4 +22,3 @@ name = "sage"
 kind = "executable"
 entry = "src/main.slk"
 output = "build/bin/sage"
-

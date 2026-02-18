@@ -1,4 +1,4 @@
-.TH SAGE 1 "2026-02-09" "sage 0.1.0" "User Commands"
+.TH SAGE 1 "2026-02-18" "sage 0.1.0" "User Commands"
 .SH NAME
 sage \- a fast, ergonomic terminal pager
 .SH SYNOPSIS
@@ -43,6 +43,12 @@ Show version and exit.
 .TP
 .B \-v\fR,\fB \-\-verbose
 Enable verbose logging to \fBstderr\fR.
+.TP
+.B \-\-no\-plugins
+Disable JavaScript plugins (QuickJS).
+.TP
+.B \-\-plugins\-dir\fR \fIPATH\fR
+Load plugins from \fIPATH\fR (unless \fBSAGE_PLUGINS_DIR\fR is set).
 .TP
 .B \-\-color\fR \fIMODE\fR
 UI color mode: \fBauto\fR, \fBalways\fR, or \fBnever\fR. In \fBauto\fR mode, \fBNO_COLOR\fR disables UI colors.
@@ -166,6 +172,9 @@ Cancel an in\-flight search and clear selection state.
 .B :
 Enter command mode.
 .TP
+.B Ctrl\-K
+Open a "find" modal to search across the currently open file paths.
+.TP
 .B L
 Toggle the line number gutter.
 .TP
@@ -255,6 +264,30 @@ Base directory for config files (used for syntax sources).
 .TP
 .B XDG_CACHE_HOME
 Base directory for cache files (used for compiled syntax caches).
+.TP
+.B SAGE_NO_PLUGINS
+If set, disables plugin loading (safe mode).
+.TP
+.B SAGE_PLUGINS_DIR
+Override the plugins directory (loads \fB*.js\fR in lexicographic order).
+.TP
+.B SAGE_PLUGIN_LOG
+Override the plugin log file path.
+.TP
+.B SAGE_PLUGIN_LOG_STDERR
+If set, writes plugin logs/errors to \fBstderr\fR (debug only; may corrupt the TUI).
+.TP
+.B SAGE_PLUGIN_LOAD_TIMEOUT_MS
+Plugin bootstrap/load execution budget in milliseconds (default: 500).
+.TP
+.B SAGE_PLUGIN_EVENT_TIMEOUT_MS
+Per-event execution budget in milliseconds (default: 50).
+.TP
+.B SAGE_PLUGIN_MEM_LIMIT_MB
+Plugin runtime memory limit in MiB (default: 64).
+.TP
+.B SAGE_PLUGIN_STACK_LIMIT_KB
+Plugin runtime stack limit in KiB (default: 1024).
 .SH FILES
 .TP
 .I ~/.config/sage/syntax/
@@ -262,6 +295,12 @@ Default syntax source directory.
 .TP
 .I ~/.cache/sage/syntax/
 Default compiled syntax cache directory.
+.TP
+.I ~/.config/sage/plugins/
+Default plugins directory (loads \fB*.js\fR in lexicographic order).
+.TP
+.I ~/.cache/sage/plugins.log
+Default plugin log file.
 .TP
 .I ./.sagerc
 Config file in the current directory.

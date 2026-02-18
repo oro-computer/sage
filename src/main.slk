@@ -75,6 +75,7 @@ import {
   load_for_path,
   has_syntax_for_path
 } from "./sage/syntax.slk";
+import plugins from "./sage/plugins.slk";
 
 type ChanU64 = std::sync::Channel(u64);
 type ReCompileResult = std::result::Result(RegExp, CompileFailed);
@@ -140,6 +141,13 @@ struct Config {
   color: int,
   theme: Theme,
   find_cmd: string?,
+  plugins: bool,
+  plugins_dir: string?,
+  plugin_log_path: string?,
+  plugin_load_timeout_ms: i64,
+  plugin_event_timeout_ms: i64,
+  plugin_mem_limit_mb: i64,
+  plugin_stack_limit_kb: i64,
   path: string?,
 }
 
@@ -156,6 +164,7 @@ let ALERT_OPEN_FAILED: int = 10;
 let ALERT_COPIED: int = 11;
 let ALERT_COPY_TOO_BIG: int = 12;
 let ALERT_COPY_FAILED: int = 13;
+let ALERT_PLUGIN_ERROR: int = 14;
 
 let COPY_MAX_BYTES: i64 = 200000;
 let SYN_STATE_LOOKBACK_BYTES: i64 = 65536;
@@ -305,6 +314,13 @@ fn cfg_default () -> Config {
     color: COLOR_AUTO,
     theme: theme,
     find_cmd: None,
+    plugins: true,
+    plugins_dir: None,
+    plugin_log_path: None,
+    plugin_load_timeout_ms: -1,
+    plugin_event_timeout_ms: -1,
+    plugin_mem_limit_mb: -1,
+    plugin_stack_limit_kb: -1,
     path: None
   };
 }
@@ -322,7 +338,7 @@ fn is_flag_token (a: string) -> bool {
 }
 
 fn flag_takes_value (a: string) -> bool {
-  return streq(a, "--color") || streq(a, "--theme") || streq(a, "--rc");
+  return streq(a, "--color") || streq(a, "--theme") || streq(a, "--rc") || streq(a, "--plugins-dir");
 }
 
 fn ignore_sigterm () -> void {
@@ -364,6 +380,34 @@ fn parse_cli (args: Args, base: Config) -> Config? {
     if streq(a, "--verbose") || streq(a, "-v") {
       cfg.verbose = true;
       i = i + 1;
+      continue;
+    }
+    if streq(a, "--no-plugins") {
+      cfg.plugins = false;
+      i = i + 1;
+      continue;
+    }
+    if streq(a, "--plugins-dir") {
+      if (i + 1) >= n {
+        return None;
+      }
+
+      if cfg.plugins_dir != None {
+        let prev: string = match (cfg.plugins_dir) { Some(v) => v, None => "" };
+        let pp: u64 = std::runtime::mem::string_ptr(prev);
+        if pp != 0 {
+          std::runtime::mem::free(pp);
+        }
+        cfg.plugins_dir = None;
+      }
+
+      let v: string = args.get(i + 1);
+      let own_opt: string? = cstr_copy_owned(v);
+      if own_opt != None {
+        let own: string = match (own_opt) { Some(x) => x, None => "" };
+        cfg.plugins_dir = Some(own);
+      }
+      i = i + 2;
       continue;
     }
     if streq(a, "--syntax") {
@@ -1146,6 +1190,103 @@ fn apply_sagerc_kv (mut cfg: &Config, key_ptr: u64, key_len: i64, val_ptr: u64, 
     return;
   }
 
+  // Plugins (QuickJS / JavaScript).
+  if eq_nocase(key_ptr, key_len, "plugins") {
+    let b_opt_p: bool? = parse_bool(val_ptr, val_len);
+    if b_opt_p != None {
+      cfg.plugins = match (b_opt_p) { Some(v) => v, None => cfg.plugins };
+    }
+    return;
+  }
+  if eq_nocase(key_ptr, key_len, "no_plugins") || eq_nocase(key_ptr, key_len, "no-plugins") {
+    let b_opt_np: bool? = parse_bool(val_ptr, val_len);
+    if b_opt_np != None {
+      let v: bool = match (b_opt_np) { Some(x) => x, None => false };
+      cfg.plugins = !v;
+    }
+    return;
+  }
+  if eq_nocase(key_ptr, key_len, "plugins_dir") || eq_nocase(key_ptr, key_len, "plugins-dir") {
+    if cfg.plugins_dir != None {
+      let prev: string = match (cfg.plugins_dir) { Some(v) => v, None => "" };
+      let pp: u64 = std::runtime::mem::string_ptr(prev);
+      if pp != 0 {
+        std::runtime::mem::free(pp);
+      }
+      cfg.plugins_dir = None;
+    }
+
+    if val_ptr != 0 && val_len > 0 {
+      let val_s: string = std::runtime::mem::string_from_ptr_len(val_ptr, val_len as int);
+      let own_opt: string? = cstr_copy_owned(val_s);
+      if own_opt != None {
+        let own: string = match (own_opt) { Some(v) => v, None => "" };
+        cfg.plugins_dir = Some(own);
+      }
+    }
+    return;
+  }
+  if eq_nocase(key_ptr, key_len, "plugin_log") || eq_nocase(key_ptr, key_len, "plugin-log") || eq_nocase(key_ptr, key_len, "plugin_log_path") || eq_nocase(key_ptr, key_len, "plugin-log-path") {
+    if cfg.plugin_log_path != None {
+      let prev: string = match (cfg.plugin_log_path) { Some(v) => v, None => "" };
+      let pp: u64 = std::runtime::mem::string_ptr(prev);
+      if pp != 0 {
+        std::runtime::mem::free(pp);
+      }
+      cfg.plugin_log_path = None;
+    }
+
+    if val_ptr != 0 && val_len > 0 {
+      let val_s: string = std::runtime::mem::string_from_ptr_len(val_ptr, val_len as int);
+      let own_opt: string? = cstr_copy_owned(val_s);
+      if own_opt != None {
+        let own: string = match (own_opt) { Some(v) => v, None => "" };
+        cfg.plugin_log_path = Some(own);
+      }
+    }
+    return;
+  }
+  if eq_nocase(key_ptr, key_len, "plugin_load_timeout_ms") || eq_nocase(key_ptr, key_len, "plugin-load-timeout-ms") {
+    let v_opt: i64? = parse_i64_dec(val_ptr, val_len);
+    if v_opt != None {
+      let v: i64 = match (v_opt) { Some(x) => x, None => -1 };
+      if v >= 0 {
+        cfg.plugin_load_timeout_ms = v;
+      }
+    }
+    return;
+  }
+  if eq_nocase(key_ptr, key_len, "plugin_event_timeout_ms") || eq_nocase(key_ptr, key_len, "plugin-event-timeout-ms") {
+    let v_opt2: i64? = parse_i64_dec(val_ptr, val_len);
+    if v_opt2 != None {
+      let v: i64 = match (v_opt2) { Some(x) => x, None => -1 };
+      if v >= 0 {
+        cfg.plugin_event_timeout_ms = v;
+      }
+    }
+    return;
+  }
+  if eq_nocase(key_ptr, key_len, "plugin_mem_limit_mb") || eq_nocase(key_ptr, key_len, "plugin-mem-limit-mb") {
+    let v_opt3: i64? = parse_i64_dec(val_ptr, val_len);
+    if v_opt3 != None {
+      let v: i64 = match (v_opt3) { Some(x) => x, None => -1 };
+      if v >= 0 {
+        cfg.plugin_mem_limit_mb = v;
+      }
+    }
+    return;
+  }
+  if eq_nocase(key_ptr, key_len, "plugin_stack_limit_kb") || eq_nocase(key_ptr, key_len, "plugin-stack-limit-kb") {
+    let v_opt4: i64? = parse_i64_dec(val_ptr, val_len);
+    if v_opt4 != None {
+      let v: i64 = match (v_opt4) { Some(x) => x, None => -1 };
+      if v >= 0 {
+        cfg.plugin_stack_limit_kb = v;
+      }
+    }
+    return;
+  }
+
   // Theme overrides (256-color palette indices).
   let c_opt: int? = parse_u8_0_255(val_ptr, val_len);
   if c_opt == None {
@@ -1373,6 +1514,8 @@ fn print_help () -> void {
   let _ = w.push_str("      --compile-cache Compile syntax files in XDG_CONFIG_HOME/sage/syntax\n");
   let _ = w.push_str("      --list-syntax  List compiled syntax keys\n");
   let _ = w.push_str("  -v, --verbose     Verbose logging to stderr\n");
+  let _ = w.push_str("      --no-plugins  Disable JavaScript plugins\n");
+  let _ = w.push_str("      --plugins-dir <path> Load plugins from <path>\n");
   let _ = w.push_str("      --color <mode> Colorize UI (auto|always|never)\n");
   let _ = w.push_str("      --no-color     Disable colors (same as --color never)\n");
   let _ = w.push_str("      --theme <name> UI theme (default|ocean|light)\n");
@@ -2757,6 +2900,7 @@ fn status_alert_len (alert: int) -> int {
   if alert == ALERT_COPIED { return 6; }        // "copied"
   if alert == ALERT_COPY_TOO_BIG { return 12; } // "copy too big"
   if alert == ALERT_COPY_FAILED { return 11; }  // "copy failed"
+  if alert == ALERT_PLUGIN_ERROR { return 10; } // "plugin err"
   return 5;                    // "error"
 }
 
@@ -3006,6 +3150,8 @@ fn push_status_right (
       let _ = w.push_str("copy too big");
     } else if alert == ALERT_COPY_FAILED {
       let _ = w.push_str("copy failed");
+    } else if alert == ALERT_PLUGIN_ERROR {
+      let _ = w.push_str("plugin err");
     } else {
       let _ = w.push_str("error");
     }
@@ -5765,6 +5911,25 @@ export async fn main (argc: int, argv: u64) -> int {
       let _ = vw.flush();
     }
 
+    // Plugins (QuickJS JavaScript).
+    //
+    // Initialized before entering raw mode / alt screen so any plugin startup
+    // diagnostics can be safely emitted.
+    let plug: plugins::Plugins = plugins::init(
+      cfg.verbose,
+      cfg.plugins,
+      cfg.plugins_dir,
+      cfg.plugin_log_path,
+      cfg.plugin_load_timeout_ms,
+      cfg.plugin_event_timeout_ms,
+      cfg.plugin_mem_limit_mb,
+      cfg.plugin_stack_limit_kb
+    );
+    var plug_init_err: bool = plugins::had_init_error(&plug);
+    if plugins::emit_open(&plug, path, active_tab + 1, tabs.len) {
+      plug_init_err = true;
+    }
+
     // Keyboard input fd: stdin if TTY, otherwise /dev/tty.
     var in_fd: int = std::runtime::posix::io::STDIN_FD;
     if !stdin_is_tty {
@@ -5792,6 +5957,7 @@ export async fn main (argc: int, argv: u64) -> int {
       if v_on {
         vlog_line(mut vw, "raw_mode_enable failed; falling back to safe stream mode");
       }
+      let _ = plugins::emit_quit(&plug);
       tabs_free(mut tabs);
       if in_fd != std::runtime::posix::io::STDIN_FD { let _ = std::runtime::posix::fs::close(in_fd); }
       return stream_safe_to_stdout(file.ptr, file.len, cfg.unsafe_raw, cfg.ansi);
@@ -5832,6 +5998,7 @@ export async fn main (argc: int, argv: u64) -> int {
 
     let w_opt: Writer? = Writer.stdout(use_color, 65536);
     if w_opt == None {
+      let _ = plugins::emit_quit(&plug);
       tabs_free(mut tabs);
       raw_mode.restore();
       if in_fd != std::runtime::posix::io::STDIN_FD { let _ = std::runtime::posix::fs::close(in_fd); }
@@ -5949,7 +6116,7 @@ export async fn main (argc: int, argv: u64) -> int {
     var search: SearchState = SearchState{ active: false, phase: SEARCH_PHASE_FWD, cur: 0, end: 0, start_off: 0 };
 
     var top_off: i64 = 0;
-    var alert: int = 0;
+    var alert: int = if plug_init_err { ALERT_PLUGIN_ERROR } else { 0 };
     var show_help: bool = false;
     var need_redraw: bool = true;
     var last_rows: int = 0;
@@ -6911,6 +7078,8 @@ export async fn main (argc: int, argv: u64) -> int {
           let _ = index_pump_try(mut ch, mut offsets, mut idx);
           let _ = yield idx_task;
 
+          let prev_tab: i64 = active_tab;
+
           // Switch active tab.
           active_tab = want_tab;
           path = new_state.path;
@@ -6920,6 +7089,13 @@ export async fn main (argc: int, argv: u64) -> int {
           // Replace file mapping.
           file = move file2;
           top_off = clamp_i64(top_off, 0, file.len);
+
+          if plugins::emit_tab_change(&plug, prev_tab + 1, active_tab + 1, tabs.len) {
+            alert = ALERT_PLUGIN_ERROR;
+          }
+          if plugins::emit_open(&plug, path, active_tab + 1, tabs.len) {
+            alert = ALERT_PLUGIN_ERROR;
+          }
 
           // Swap in the new indexer.
           ch = move ch2;
@@ -7196,6 +7372,8 @@ export async fn main (argc: int, argv: u64) -> int {
                 let _ = index_pump_try(mut ch, mut offsets, mut idx);
                 let _ = yield idx_task;
 
+                let prev_tab: i64 = active_tab;
+
                 // Switch active tab.
                 active_tab = want_tab_cmd;
                 path = new_state2.path;
@@ -7205,6 +7383,13 @@ export async fn main (argc: int, argv: u64) -> int {
                 // Replace file mapping.
                 file = move file3;
                 top_off = clamp_i64(top_off, 0, file.len);
+
+                if plugins::emit_tab_change(&plug, prev_tab + 1, active_tab + 1, tabs.len) {
+                  alert = ALERT_PLUGIN_ERROR;
+                }
+                if plugins::emit_open(&plug, path, active_tab + 1, tabs.len) {
+                  alert = ALERT_PLUGIN_ERROR;
+                }
 
                 // Swap in the new indexer.
                 ch = move ch3;
@@ -7429,7 +7614,12 @@ export async fn main (argc: int, argv: u64) -> int {
             alert = ALERT_COPY_TOO_BIG;
           } else {
             let ok_copy: bool = osc52_copy(mut w, file.ptr + (a as u64), n);
-            if ok_copy { alert = ALERT_COPIED; }
+            if ok_copy {
+              alert = ALERT_COPIED;
+              if plugins::emit_copy(&plug, n) {
+                alert = ALERT_PLUGIN_ERROR;
+              }
+            }
             else { alert = ALERT_COPY_FAILED; }
           }
           sel_on = false;
@@ -7456,6 +7646,10 @@ export async fn main (argc: int, argv: u64) -> int {
           alert = 0;
           last_query.clear();
           let bytes = tmp_query.as_bytes();
+          let q_view: string = std::runtime::mem::string_from_ptr_len(bytes.ptr, bytes.len as int);
+          if plugins::emit_search(&plug, q_view, cfg.regex, cfg.ignore_case) {
+            alert = ALERT_PLUGIN_ERROR;
+          }
           let _ = last_query.push_ptr_len(bytes.ptr, bytes.len);
           search_hist_push(mut search_hist_data, mut search_hist_idx, bytes.ptr, bytes.len);
           last_match_off = -1;
@@ -7615,6 +7809,7 @@ export async fn main (argc: int, argv: u64) -> int {
     }
 
     // Exit UI: cancel indexer, restore terminal, clean up.
+    let _ = plugins::emit_quit(&plug);
     tok.cancel();
     ch.close();
     let _ = index_pump_try(mut ch, mut offsets, mut idx);
