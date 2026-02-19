@@ -1,8 +1,10 @@
-'use strict';
+'use strict'
 
-// Logs high-level `sage` events.
+// Logs high-level `sage` events (ESM).
 //
-// Run with `--verbose` to enable `sage.log(...)` output.
+// Console output is filtered by `SAGE_CONSOLE_LEVEL`:
+// - default: `warn` (or `debug` when `sage` runs with `--verbose`)
+// - examples: `SAGE_CONSOLE_LEVEL=info`, `SAGE_CONSOLE_LEVEL=debug`
 // Logs are written to `$SAGE_PLUGIN_LOG` (if set), else `$XDG_CACHE_HOME/sage/plugins.log`,
 // else `~/.cache/sage/plugins.log`.
 //
@@ -10,22 +12,26 @@
 //   mkdir -p ~/.config/sage/plugins
 //   cp examples/plugins/00-log-events.js ~/.config/sage/plugins/
 
-sage.on('open', (p) => {
-  sage.log('open', p.path, `tab=${p.tab}/${p.tab_count}`);
-});
+import navigator from 'sage:navigator'
 
-sage.on('tab_change', (p) => {
-  sage.log('tab_change', `${p.from} -> ${p.to}`, `tabs=${p.tab_count}`);
-});
+console.debug('navigator.userAgent', navigator.userAgent)
 
-sage.on('search', (p) => {
-  sage.log('search', JSON.stringify({ q: p.query, regex: p.regex, ignore_case: p.ignore_case }));
-});
+globalThis.on('open', (p) => {
+  console.info('open', p.path, `tab=${p.tab}/${p.tab_count}`)
+})
 
-sage.on('copy', (p) => {
-  sage.log('copy', `${p.bytes} bytes`);
-});
+globalThis.on('tab_change', (p) => {
+  console.info('tab_change', `${p.from} -> ${p.to}`, `tabs=${p.tab_count}`)
+})
 
-sage.on('quit', () => {
-  sage.log('quit');
-});
+globalThis.on('search', (p) => {
+  console.debug('search', JSON.stringify({ q: p.query, regex: p.regex, ignore_case: p.ignore_case }))
+})
+
+globalThis.on('copy', (p) => {
+  console.info('copy', `${p.bytes} bytes`)
+})
+
+globalThis.on('quit', () => {
+  console.info('quit')
+})

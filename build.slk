@@ -13,6 +13,21 @@ fn hex_digit (n: u8) -> u8 {
   return if n < 10 { 48 + n } else { 87 + (n - 10) }; // '0'..'9' / 'a'..'f'
 }
 
+fn push_decimal_u64_rec (mut out: &std::strings::String, v: u64) -> std::memory::OutOfMemory? {
+  if v >= 10 {
+    let err = push_decimal_u64_rec(mut out, v / 10);
+    if err != None { return err; }
+  }
+  return out.push_u8(48 + (v % 10) as u8);
+}
+
+fn push_decimal_u64 (mut out: &std::strings::String, v: u64) -> std::memory::OutOfMemory? {
+  if v == 0 {
+    return out.push_u8(48);
+  }
+  return push_decimal_u64_rec(mut out, v);
+}
+
 fn push_silk_string_literal (mut out: &std::strings::String, s: string) -> std::memory::OutOfMemory? {
   let err0: std::memory::OutOfMemory? = out.push_u8(34); // '"'
   if err0 != None { return err0; }
@@ -77,6 +92,264 @@ fn push_silk_string_literal (mut out: &std::strings::String, s: string) -> std::
   return out.push_u8(34); // '"'
 }
 
+fn cmp_lex (a: string, b: string) -> int {
+  let ap: u64 = std::runtime::mem::string_ptr(a);
+  let an: i64 = std::runtime::mem::string_len(a);
+  let bp: u64 = std::runtime::mem::string_ptr(b);
+  let bn: i64 = std::runtime::mem::string_len(b);
+  if ap == 0 || bp == 0 || an < 0 || bn < 0 {
+    return 0;
+  }
+  let n: i64 = if an < bn { an } else { bn };
+  var i: i64 = 0;
+  while i < n {
+    let ca: u8 = std::runtime::mem::load_u8(ap, i);
+    let cb: u8 = std::runtime::mem::load_u8(bp, i);
+    if ca < cb { return -1; }
+    if ca > cb { return 1; }
+    i = i + 1;
+  }
+  if an < bn { return -1; }
+  if an > bn { return 1; }
+  return 0;
+}
+
+fn ends_with_bytes (s: string, a: u8, b: u8, c: u8) -> bool {
+  let p: u64 = std::runtime::mem::string_ptr(s);
+  let n: i64 = std::runtime::mem::string_len(s);
+  if p == 0 || n < 3 {
+    return false;
+  }
+  return std::runtime::mem::load_u8(p, n - 3) == a &&
+         std::runtime::mem::load_u8(p, n - 2) == b &&
+         std::runtime::mem::load_u8(p, n - 1) == c;
+}
+
+fn ends_with_mjs (s: string) -> bool {
+  let p: u64 = std::runtime::mem::string_ptr(s);
+  let n: i64 = std::runtime::mem::string_len(s);
+  if p == 0 || n < 4 {
+    return false;
+  }
+  return std::runtime::mem::load_u8(p, n - 4) == 46 && // '.'
+         std::runtime::mem::load_u8(p, n - 3) == 109 && // 'm'
+         std::runtime::mem::load_u8(p, n - 2) == 106 && // 'j'
+         std::runtime::mem::load_u8(p, n - 1) == 115;   // 's'
+}
+
+fn ends_with_js (s: string) -> bool {
+  return ends_with_bytes(s, 46, 106, 115); // ".js"
+}
+
+fn strip_module_ext (s: string) -> string {
+  let p: u64 = std::runtime::mem::string_ptr(s);
+  let n: i64 = std::runtime::mem::string_len(s);
+  if p == 0 || n <= 0 {
+    return s;
+  }
+  if ends_with_mjs(s) {
+    return std::runtime::mem::string_from_ptr_len(p, (n - 4) as int);
+  }
+  if ends_with_js(s) {
+    return std::runtime::mem::string_from_ptr_len(p, (n - 3) as int);
+  }
+  return s;
+}
+
+struct PathList {
+  ptr: u64,
+  len: i64,
+  cap: i64,
+}
+
+fn pathlist_init (cap: i64) -> PathList? {
+  let want: i64 = if cap > 0 { cap } else { 0 };
+  let elem_bytes: i64 = (sizeof (string)) as i64;
+  let bytes: i64 = want * elem_bytes;
+  let ptr: u64 = if bytes > 0 { std::runtime::mem::alloc(bytes) } else { 0 };
+  if want > 0 && ptr == 0 {
+    return None;
+  }
+  return Some(PathList{ ptr: ptr, len: 0, cap: want });
+}
+
+fn free_owned_string (s: string) -> void {
+  let p: u64 = std::runtime::mem::string_ptr(s);
+  if p != 0 {
+    std::runtime::mem::free(p);
+  }
+}
+
+fn pathlist_free (mut l: &PathList) -> void {
+  if l.ptr != 0 {
+    var i: i64 = 0;
+    while i < l.len {
+      let s: string = (l.ptr as string[](l.cap as int))[i];
+      free_owned_string(s);
+      i = i + 1;
+    }
+    std::runtime::mem::free(l.ptr);
+  }
+  l.ptr = 0;
+  l.len = 0;
+  l.cap = 0;
+}
+
+fn pathlist_ensure_cap (mut l: &PathList, extra: i64) -> bool {
+  if extra <= 0 {
+    return true;
+  }
+  let need: i64 = l.len + extra;
+  if need <= l.cap {
+    return true;
+  }
+
+  let elem_bytes: i64 = (sizeof (string)) as i64;
+  var new_cap: i64 = if l.cap > 0 { l.cap * 2 } else { 8 };
+  while new_cap < need {
+    new_cap = new_cap * 2;
+  }
+  let new_bytes: i64 = new_cap * elem_bytes;
+  let new_ptr: u64 = if l.ptr != 0 { std::runtime::mem::realloc(l.ptr, new_bytes) } else { std::runtime::mem::alloc(new_bytes) };
+  if new_ptr == 0 {
+    return false;
+  }
+  l.ptr = new_ptr;
+  l.cap = new_cap;
+  return true;
+}
+
+fn pathlist_push_owned (mut l: &PathList, path_owned: string) -> bool {
+  if !pathlist_ensure_cap(mut l, 1) {
+    free_owned_string(path_owned);
+    return false;
+  }
+  (l.ptr as string[](l.cap as int))[l.len] = path_owned;
+  l.len = l.len + 1;
+  return true;
+}
+
+fn pathlist_sort_lex (mut l: &PathList) -> void {
+  if l.len <= 1 {
+    return;
+  }
+  var i: i64 = 0;
+  while i < l.len - 1 {
+    var min: i64 = i;
+    var j: i64 = i + 1;
+    while j < l.len {
+      let a: string = (l.ptr as string[](l.cap as int))[j];
+      let b: string = (l.ptr as string[](l.cap as int))[min];
+      if cmp_lex(a, b) < 0 {
+        min = j;
+      }
+      j = j + 1;
+    }
+    if min != i {
+      let tmp: string = (l.ptr as string[](l.cap as int))[i];
+      (l.ptr as string[](l.cap as int))[i] = (l.ptr as string[](l.cap as int))[min];
+      (l.ptr as string[](l.cap as int))[min] = tmp;
+    }
+    i = i + 1;
+  }
+}
+
+fn take_string_owned (mut s: &std::strings::String) -> string {
+  let ptr: u64 = s.ptr;
+  let len: i64 = s.len;
+  s.ptr = 0;
+  s.cap = 0;
+  s.len = 0;
+  return std::runtime::mem::string_from_ptr_len(ptr, len as int);
+}
+
+fn join_rel (prefix: string, name: string) -> std::strings::String? {
+  let mut out: std::strings::String = std::strings::String.empty();
+  let prefix_len: i64 = std::runtime::mem::string_len(prefix);
+  if prefix_len > 0 {
+    if out.push_string(prefix) != None { out.drop(); return None; }
+    if out.push_u8(47) != None { out.drop(); return None; } // '/'
+  }
+  if out.push_string(name) != None { out.drop(); return None; }
+  return Some(out);
+}
+
+fn collect_api_files_dir (dir_abs: string, prefix: string, mut l: &PathList) -> bool {
+  let d_r = fs::read_dir(dir_abs);
+  if d_r.is_err() {
+    // Not a directory (or does not exist).
+    return true;
+  }
+  let mut d: fs::Dir = match (d_r) {
+    Ok(v) => v,
+    Err(_) => fs::Dir.invalid(),
+  };
+
+  while true {
+    let e_r_opt: fs::DirEntryResult? = d.next();
+    if e_r_opt == None {
+      break;
+    }
+    let e_r: fs::DirEntryResult = match (e_r_opt) {
+      Some(v) => v,
+      None => fs::DirEntryResult.err(fs::FSFailed{ code: 0, requested: 0 }),
+    };
+    if e_r.is_err() {
+      d.close();
+      return false;
+    }
+
+    let e: fs::DirEntry = match (e_r) {
+      Ok(v) => v,
+      Err(_) => fs::DirEntry{ name: std::strings::String.empty() },
+    };
+    let name: string = e.name();
+
+    // Build a relative path under the api root.
+    let rel_opt: std::strings::String? = join_rel(prefix, name);
+    if rel_opt == None {
+      d.close();
+      return false;
+    }
+    let mut rel_s: std::strings::String = match (rel_opt) {
+      Some(v) => v,
+      None => std::strings::String.empty(),
+    };
+
+    if ends_with_mjs(name) || ends_with_js(name) {
+      let rel_owned: string = take_string_owned(mut rel_s);
+      // `rel_s` invalidated; safe to drop.
+      rel_s.drop();
+      if !pathlist_push_owned(mut l, rel_owned) {
+        d.close();
+        return false;
+      }
+      continue;
+    }
+
+    // Recurse into subdirectories (no-op for non-directories).
+    let abs_r = path::join(dir_abs, name);
+    if abs_r.is_err() {
+      rel_s.drop();
+      continue;
+    }
+    let mut abs_s: std::strings::String = match (abs_r) {
+      Ok(v) => v,
+      Err(_) => std::strings::String.empty(),
+    };
+    let ok: bool = collect_api_files_dir(abs_s.as_string(), rel_s.as_string(), mut l);
+    abs_s.drop();
+    rel_s.drop();
+    if !ok {
+      d.close();
+      return false;
+    }
+  }
+
+  d.close();
+  return true;
+}
+
 fn generate_bootstrap (package_root: string) -> int {
   // Read `src/sage/plugins/bootstrap.js` and embed it into generated Silk code.
   let p_r = path::join(package_root, "src/sage/plugins/bootstrap.js");
@@ -120,10 +393,192 @@ fn generate_bootstrap (package_root: string) -> int {
   return rc;
 }
 
+fn generate_plugins_api_modules (package_root: string) -> int {
+  // Read `src/sage/plugins/api/**/*.mjs` and embed them into generated Silk code.
+  let api_r = path::join(package_root, "src/sage/plugins/api");
+  if api_r.is_err() {
+    return 1;
+  }
+  let mut api_abs: std::strings::String = match (api_r) {
+    Ok(v) => v,
+    Err(_) => std::strings::String.empty(),
+  };
+
+  let list_opt: PathList? = pathlist_init(16);
+  if list_opt == None {
+    api_abs.drop();
+    return 1;
+  }
+  let mut l: PathList = match (list_opt) {
+    Some(v) => v,
+    None => PathList{ ptr: 0, len: 0, cap: 0 },
+  };
+  if !collect_api_files_dir(api_abs.as_string(), "", mut l) {
+    pathlist_free(mut l);
+    api_abs.drop();
+    return 1;
+  }
+  pathlist_sort_lex(mut l);
+
+  let mut out: std::strings::String = std::strings::String.empty();
+  let _ = out.push_string("module sage::plugins_api_modules;\n\n");
+  let _ = out.push_string("// Generated by `build.slk` from `src/sage/plugins/api/**`.\n");
+  let _ = out.push_string("// DO NOT EDIT.\n\n");
+
+  // Per-module source thunks keep the index dispatch readable.
+  var i: i64 = 0;
+  while i < l.len {
+    let rel: string = (l.ptr as string[](l.cap as int))[i];
+    let rel_base: string = strip_module_ext(rel);
+
+    let mut mod_name: std::strings::String = std::strings::String.empty();
+    if mod_name.push_string("sage:") != None { pathlist_free(mut l); api_abs.drop(); out.drop(); return 1; }
+    if mod_name.push_string(rel_base) != None { mod_name.drop(); pathlist_free(mut l); api_abs.drop(); out.drop(); return 1; }
+
+    let file_r = path::join(api_abs.as_string(), rel);
+    if file_r.is_err() {
+      mod_name.drop();
+      pathlist_free(mut l);
+      api_abs.drop();
+      out.drop();
+      return 1;
+    }
+    let mut file_abs: std::strings::String = match (file_r) {
+      Ok(v) => v,
+      Err(_) => std::strings::String.empty(),
+    };
+    let js_r = fs::read_file_string(file_abs.as_string());
+    file_abs.drop();
+    if js_r.is_err() {
+      mod_name.drop();
+      pathlist_free(mut l);
+      api_abs.drop();
+      out.drop();
+      return 1;
+    }
+    let mut js: std::strings::String = match (js_r) {
+      Ok(v) => v,
+      Err(_) => std::strings::String.empty(),
+    };
+
+    let _ = out.push_string("// ");
+    let _ = out.push_string(mod_name.as_string());
+    let _ = out.push_string("\nfn plugins_api_module_source_");
+    let _ = push_decimal_u64(mut out, i as u64);
+    let _ = out.push_string(" () -> string {\n  return ");
+    let esc_err: std::memory::OutOfMemory? = push_silk_string_literal(mut out, js.as_string());
+    js.drop();
+    mod_name.drop();
+    if esc_err != None {
+      pathlist_free(mut l);
+      api_abs.drop();
+      out.drop();
+      return 1;
+    }
+    let _ = out.push_string(";\n}\n\n");
+
+    i = i + 1;
+  }
+
+  let _ = out.push_string("export fn plugins_api_modules_count () -> i64 {\n  return ");
+  let _ = push_decimal_u64(mut out, l.len as u64);
+  let _ = out.push_string(";\n}\n\n");
+
+  let _ = out.push_string("export fn plugins_api_module_name (i: i64) -> string {\n");
+  var ni: i64 = 0;
+  while ni < l.len {
+    let rel: string = (l.ptr as string[](l.cap as int))[ni];
+    let rel_base: string = strip_module_ext(rel);
+    let mut mod_name: std::strings::String = std::strings::String.empty();
+    if mod_name.push_string("sage:") != None { pathlist_free(mut l); api_abs.drop(); out.drop(); return 1; }
+    if mod_name.push_string(rel_base) != None { mod_name.drop(); pathlist_free(mut l); api_abs.drop(); out.drop(); return 1; }
+
+    let _ = out.push_string("  if i == ");
+    let _ = push_decimal_u64(mut out, ni as u64);
+    let _ = out.push_string(" { return ");
+    let esc_err: std::memory::OutOfMemory? = push_silk_string_literal(mut out, mod_name.as_string());
+    mod_name.drop();
+    if esc_err != None {
+      pathlist_free(mut l);
+      api_abs.drop();
+      out.drop();
+      return 1;
+    }
+    let _ = out.push_string("; }\n");
+    ni = ni + 1;
+  }
+  let _ = out.push_string("  return \"\";\n}\n\n");
+
+  let _ = out.push_string("export fn plugins_api_module_source (i: i64) -> string {\n");
+  var si: i64 = 0;
+  while si < l.len {
+    let _ = out.push_string("  if i == ");
+    let _ = push_decimal_u64(mut out, si as u64);
+    let _ = out.push_string(" { return plugins_api_module_source_");
+    let _ = push_decimal_u64(mut out, si as u64);
+    let _ = out.push_string("(); }\n");
+    si = si + 1;
+  }
+  let _ = out.push_string("  return \"\";\n}\n");
+
+  pathlist_free(mut l);
+  api_abs.drop();
+
+  // Write `build/gen/plugins_api_modules.slk` deterministically.
+  let mut g: build::StepGraph = build::StepGraph.init(package_root);
+  let dir = g.mkdir_all("build/gen", 493); // 0755
+  let gen = g.write_file_string("build/gen/plugins_api_modules.slk", out.as_string(), 420); // 0644
+  g.depends_on(gen, dir);
+  let rc: int = g.run();
+  out.drop();
+  return rc;
+}
+
+fn build_mbedtls_shared (package_root: string) -> int {
+  // `std::tls` currently pulls in a DT_NEEDED dependency on `libmbedtls.so.14`.
+  // Build a local shared library from the vendored static archives so `sage`
+  // runs on minimal systems without a system mbedTLS install.
+  //
+  // NOTE: `std::tls` binds the mbedTLS 2.x-era symbol surface (soname 14). The
+  // `silk/vendor` mbedTLS snapshot is newer and does not export the expected
+  // function names, so we use the runtime's pinned build.
+  let lib_tls: string = "../legacy-runtime/build/x86_64-desktop/mbedtls/build/library/libmbedtls.a";
+  let lib_x509: string = "../legacy-runtime/build/x86_64-desktop/mbedtls/build/library/libmbedx509.a";
+  let lib_crypto: string = "../legacy-runtime/build/x86_64-desktop/mbedtls/build/library/libmbedcrypto.a";
+
+  if !fs::exists(lib_tls) || !fs::exists(lib_x509) || !fs::exists(lib_crypto) {
+    return 0;
+  }
+
+  let mut g: build::StepGraph = build::StepGraph.init(package_root);
+  let dir = g.mkdir_all("build/lib", 493); // 0755
+
+  let cmd = g.run_cmd("cc");
+  g.cmd_arg(cmd, "-shared");
+  g.cmd_arg(cmd, "-Wl,-soname,libmbedtls.so.14");
+  g.cmd_arg(cmd, "-Wl,--whole-archive");
+  g.cmd_arg(cmd, "-o");
+  g.cmd_arg(cmd, "build/lib/libmbedtls.so.14");
+  g.cmd_arg(cmd, lib_tls);
+  g.cmd_arg(cmd, lib_x509);
+  g.cmd_arg(cmd, lib_crypto);
+  g.cmd_arg(cmd, "-Wl,--no-whole-archive");
+  g.cmd_arg(cmd, "-lm");
+  g.depends_on(cmd, dir);
+
+  return g.run();
+}
+
 export async fn run (package_root: string, action: string) -> int {
   let _ = action;
 
   if generate_bootstrap(package_root) != 0 {
+    return 1;
+  }
+  if generate_plugins_api_modules(package_root) != 0 {
+    return 1;
+  }
+  if build_mbedtls_shared(package_root) != 0 {
     return 1;
   }
 
@@ -148,7 +603,13 @@ export async fn run (package_root: string, action: string) -> int {
   b.target_add_cflag(t, "-std=c11");
   b.target_add_cflag(t, "-D_GNU_SOURCE");
   b.target_add_cflag(t, "-Iquickjs");
+  b.target_add_cflag(t, "-pthread");
   b.target_add_ldflag(t, "-lm");
+  b.target_add_needed(t, "libpthread.so.0");
+  b.target_add_needed(t, "libcurl.so.4");
+
+  // Find `build/lib/libmbedtls.so.14` without requiring LD_LIBRARY_PATH.
+  b.target_add_runpath(t, "$ORIGIN/../lib");
 
   return b.emit();
 }

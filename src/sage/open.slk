@@ -1,0 +1,15 @@
+module sage::open;
+
+import { MappedFile, map_path, map_stdin_spool } from "./file.slk";
+import netfile from "./netfile.slk";
+
+export fn map_input (path: string, allow_binary: bool) -> MappedFile? {
+  if path == "-" {
+    return map_stdin_spool(allow_binary);
+  }
+  if netfile::is_network_path(path) {
+    return netfile::map_url(path, allow_binary);
+  }
+  return map_path(path, allow_binary);
+}
+

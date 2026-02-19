@@ -6,6 +6,9 @@ import std::runtime::mem;
 import std::runtime::posix::fs;
 
 import { plugins_bootstrap_js } from "../../build/gen/plugins_bootstrap.slk";
+import { plugins_api_modules_count, plugins_api_module_name, plugins_api_module_source } from "../../build/gen/plugins_api_modules.slk";
+import { BufferU8 } from "./buf.slk";
+import { mkstemp } from "./os.slk";
 
 // ---------------------------------------------------------------------------
 // QuickJS plugin host (C shim).
@@ -21,6 +24,8 @@ export ext sage_qjs_free = fn (Qjs) -> void;
 export ext sage_qjs_set_timeouts_ms = fn (Qjs, i64, i64) -> void;
 export ext sage_qjs_set_limits = fn (Qjs, i64, i64) -> void;
 export ext sage_qjs_set_log_path = fn (Qjs, string) -> i64;
+export ext sage_qjs_reserve_plugins = fn (Qjs, i64) -> i64;
+export ext sage_qjs_add_builtin_module = fn (Qjs, u64, i64, u64, i64) -> i64;
 export ext sage_qjs_take_error = fn (Qjs) -> i64;
 export ext sage_qjs_eval_bootstrap = fn (Qjs, string) -> i64;
 export ext sage_qjs_eval_file = fn (Qjs, string) -> i64;
@@ -29,6 +34,10 @@ export ext sage_qjs_emit_tab_change = fn (Qjs, i64, i64, i64) -> i64;
 export ext sage_qjs_emit_search = fn (Qjs, string, i64, i64) -> i64;
 export ext sage_qjs_emit_copy = fn (Qjs, i64) -> i64;
 export ext sage_qjs_emit_quit = fn (Qjs) -> i64;
+export ext sage_qjs_command = fn (Qjs, string, string) -> i64;
+export ext sage_qjs_take_exec_cmd = fn (Qjs, u64, i64) -> i64;
+export ext sage_qjs_allow_fs_read_path = fn (Qjs, string) -> i64;
+export ext sage_qjs_poll = fn (Qjs) -> i64;
 
 // ---------------------------------------------------------------------------
 // Small helpers for NUL-terminated owned strings (POSIX APIs).
@@ -136,6 +145,27 @@ fn ends_with_js (name: string) -> bool {
   return std::runtime::mem::load_u8(p, n - 3) == 46 && // '.'
          std::runtime::mem::load_u8(p, n - 2) == 106 && // 'j'
          std::runtime::mem::load_u8(p, n - 1) == 115;   // 's'
+}
+
+fn qjs_register_builtin_modules (q: Qjs) -> bool {
+  let n: i64 = plugins_api_modules_count();
+  var i: i64 = 0;
+  while i < n {
+    let name: string = plugins_api_module_name(i);
+    let src: string = plugins_api_module_source(i);
+    let name_ptr: u64 = std::runtime::mem::string_ptr(name);
+    let name_len: i64 = std::runtime::mem::string_len(name);
+    let src_ptr: u64 = std::runtime::mem::string_ptr(src);
+    let src_len: i64 = std::runtime::mem::string_len(src);
+    if name_ptr == 0 || src_ptr == 0 || name_len <= 0 || src_len <= 0 {
+      return false;
+    }
+    if sage_qjs_add_builtin_module(q, name_ptr, name_len, src_ptr, src_len) != 0 {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -430,6 +460,12 @@ export fn init (
     }
   }
 
+  // Register built-in `sage:*` modules (compiled into the binary via build.slk).
+  if !qjs_register_builtin_modules(q) {
+    sage_qjs_free(q);
+    return Plugins{ q: 0, init_error: true };
+  }
+
   // Bootstrap JS API surface (compiled into the binary via build.slk).
   let b: string = plugins_bootstrap_js();
   let b_owned_opt: string? = cstr_copy_owned(b);
@@ -454,6 +490,14 @@ export fn init (
     if list_opt != None {
       let mut l: PathList = match (list_opt) { Some(v) => v, None => PathList{ ptr: 0, len: 0, cap: 0 } };
       collect_plugins_dir(dir, mut l);
+      // Reserve plugin slots up-front so SageQjsPlugin pointers stay stable.
+      // (QuickJS stores opaque pointers to each SageQjsPlugin.)
+      if sage_qjs_reserve_plugins(q, l.len) != 0 {
+        pathlist_free(mut l);
+        free_joined(dir);
+        sage_qjs_free(q);
+        return Plugins{ q: 0, init_error: true };
+      }
       var i: i64 = 0;
       while i < l.len {
         let p: string = (l.ptr as string[](l.cap as int))[i];
@@ -520,6 +564,103 @@ export fn emit_quit (p: &Plugins) -> bool {
   return sage_qjs_take_error(p.q) != 0;
 }
 
+// Filesystem (JS `sage:fs`)
+//
+// Plugin reads are restricted by default; callers can whitelist additional
+// readable paths (typically the tab set) during initialization.
+export fn allow_fs_read_path (p: &Plugins, path: string) -> bool {
+  if p.q == 0 { return false; }
+  let own_opt: string? = cstr_copy_owned(path);
+  if own_opt == None { return true; }
+  let own: string = match (own_opt) { Some(v) => v, None => "" };
+  let rc: i64 = sage_qjs_allow_fs_read_path(p.q, own);
+  free_joined(own);
+  if rc != 0 { return true; }
+  return sage_qjs_take_error(p.q) != 0;
+}
+
+// Poll for async completions (e.g. child process results) and resolve any
+// pending JS promises.
+export fn poll (p: &Plugins) -> bool {
+  if p.q == 0 { return false; }
+  let rc: i64 = sage_qjs_poll(p.q);
+  if rc != 0 { return true; }
+  return sage_qjs_take_error(p.q) != 0;
+}
+
+// Commands
+//
+// - `command(name, args)` dispatches `:<name> <args>` to plugins.
+// - `take_exec_cmd(...)` drains queued host command strings requested by JS via `exec(...)`.
+
+// Return values:
+// - 0: not handled
+// - 1: handled
+// - 2: plugin error (timeout/exception/oom)
+export fn command (p: &Plugins, name: string, args: string) -> i64 {
+  if p.q == 0 { return 0; }
+  let n_opt: string? = cstr_copy_owned(name);
+  if n_opt == None { return 2; }
+  let n: string = match (n_opt) { Some(v) => v, None => "" };
+  let a_opt: string? = cstr_copy_owned(args);
+  if a_opt == None { free_joined(n); return 2; }
+  let a: string = match (a_opt) { Some(v) => v, None => "" };
+
+  let rc: i64 = sage_qjs_command(p.q, n, a);
+  free_joined(n);
+  free_joined(a);
+
+  if sage_qjs_take_error(p.q) != 0 {
+    return 2;
+  }
+  if rc != 0 {
+    return 1;
+  }
+  return 0;
+}
+
+export fn take_exec_cmd (p: &Plugins, mut out: &BufferU8) -> bool {
+  if p.q == 0 {
+    return false;
+  }
+  out.clear();
+
+  var tries: int = 0;
+  while tries < 8 {
+    if out.ptr == 0 || out.cap <= 0 {
+      let oom0 = out.reserve_additional(256);
+      if oom0 != None {
+        return false;
+      }
+    }
+
+    let rc: i64 = sage_qjs_take_exec_cmd(p.q, out.ptr, out.cap);
+    if rc == 0 {
+      return false;
+    }
+    if rc < 0 {
+      let need: i64 = 0 - rc;
+      if need <= 0 {
+        return false;
+      }
+      let oom = out.reserve_additional(need);
+      if oom != None {
+        return false;
+      }
+      tries = tries + 1;
+      continue;
+    }
+
+    if rc > out.cap {
+      return false;
+    }
+    out.len = rc;
+    return true;
+  }
+
+  return false;
+}
+
 impl Plugins as std::interfaces::Drop {
   public fn drop (mut self: &Plugins) -> void {
     if self.q != 0 {
@@ -528,4 +669,77 @@ impl Plugins as std::interfaces::Drop {
     }
     self.init_error = false;
   }
+}
+
+fn touch_file (path: string) -> bool {
+  let fd: int = std::runtime::posix::fs::open(
+    path,
+    std::runtime::posix::fs::O_WRONLY | std::runtime::posix::fs::O_CREAT | std::runtime::posix::fs::O_TRUNC,
+    420
+  ) as int;
+  if fd < 0 {
+    return false;
+  }
+  let _ = std::runtime::posix::fs::close(fd);
+  return true;
+}
+
+test "sage::plugins collect_plugins_dir sorts and filters" {
+  let tmpl_opt: string? = cstr_copy_owned("/tmp/sage-plugins-dir-test-XXXXXX");
+  assert(tmpl_opt != None, "mkstemp template");
+  let tmpl: string = match (tmpl_opt) { Some(v) => v, None => "" };
+  let tmpl_ptr: u64 = std::runtime::mem::string_ptr(tmpl);
+  assert(tmpl_ptr != 0, "mkstemp template ptr");
+  let fd: int = mkstemp(tmpl_ptr);
+  assert(fd >= 0, "mkstemp");
+  let _ = std::runtime::posix::fs::close(fd);
+
+  let root_opt: string? = join2(tmpl, ".d");
+  assert(root_opt != None, "root dir");
+  let root: string = match (root_opt) { Some(v) => v, None => "" };
+  let _ = std::runtime::posix::fs::mkdir(root, 493); // 0755
+
+  let plugins_dir_opt: string? = join2(root, "/plugins");
+  assert(plugins_dir_opt != None, "plugins dir");
+  let plugins_dir: string = match (plugins_dir_opt) { Some(v) => v, None => "" };
+  let _ = std::runtime::posix::fs::mkdir(plugins_dir, 493); // 0755
+
+  let a_opt: string? = join2(plugins_dir, "/00-a.js");
+  assert(a_opt != None, "a path");
+  let a: string = match (a_opt) { Some(v) => v, None => "" };
+  assert(touch_file(a), "touch a");
+
+  let b_opt: string? = join2(plugins_dir, "/01-b.js");
+  assert(b_opt != None, "b path");
+  let b: string = match (b_opt) { Some(v) => v, None => "" };
+  assert(touch_file(b), "touch b");
+
+  let txt_opt: string? = join2(plugins_dir, "/99-not-js.txt");
+  assert(txt_opt != None, "txt path");
+  let txt: string = match (txt_opt) { Some(v) => v, None => "" };
+  assert(touch_file(txt), "touch txt");
+
+  let dir_js_opt: string? = join2(plugins_dir, "/10-dir.js");
+  assert(dir_js_opt != None, "dir.js path");
+  let dir_js: string = match (dir_js_opt) { Some(v) => v, None => "" };
+  let _ = std::runtime::posix::fs::mkdir(dir_js, 493); // 0755
+
+  let list_opt: PathList? = pathlist_init(8);
+  assert(list_opt != None, "pathlist");
+  let mut l: PathList = match (list_opt) { Some(v) => v, None => PathList{ ptr: 0, len: 0, cap: 0 } };
+  collect_plugins_dir(plugins_dir, mut l);
+  assert(l.len == 2, "collected js only");
+  let got0: string = (l.ptr as string[](l.cap as int))[0];
+  let got1: string = (l.ptr as string[](l.cap as int))[1];
+  assert(got0 == a, "sorted a first");
+  assert(got1 == b, "sorted b second");
+  pathlist_free(mut l);
+
+  free_joined(tmpl);
+  free_joined(root);
+  free_joined(plugins_dir);
+  free_joined(a);
+  free_joined(b);
+  free_joined(txt);
+  free_joined(dir_js);
 }

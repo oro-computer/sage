@@ -13,7 +13,9 @@ import std::sync;
 import std::strings;
 
 import { memchr, memmem, memrchr } from "./sage/os.slk";
-import { MappedFile, map_path, map_stdin_spool } from "./sage/file.slk";
+import { MappedFile } from "./sage/file.slk";
+import { map_input } from "./sage/open.slk";
+import { is_network_path } from "./sage/netfile.slk";
 import { BufferU8, ByteSlice, VecU64 } from "./sage/buf.slk";
 import { CompileFailed, ExecResult, RegExp, EXEC_MATCH, EXEC_NO_MATCH, exec_bytes, search_bytes } from "./sage/re.slk";
 import { Writer, write_str } from "./sage/out.slk";
@@ -823,7 +825,9 @@ fn tabs_collect (args: Args) -> Tabs? {
     }
 
     // Directory? Expand to child files. Otherwise, push the path as-is.
-    let exp: int = if a != "-" { tabs_expand_dir(mut tabs, a) } else { 0 };
+    //
+    // Network paths should be treated as opaque.
+    let exp: int = if a != "-" && !is_network_path(a) { tabs_expand_dir(mut tabs, a) } else { 0 };
     if exp == 1 {
       // expanded
     } else if exp == 0 {
@@ -1532,7 +1536,7 @@ fn print_help () -> void {
   let _ = w.push_str("  -i, --ignore-case Case-insensitive search\n");
   let _ = w.push_str("      --index-only  Build line index, print stats, exit\n");
   let _ = w.push_str("\n");
-  let _ = w.push_str("Keys: q quit, Ctrl-C quit/copy, Ctrl-K find, j/k/u/d/Up/Down scroll, MouseWheel scroll, Space/PgDn/Ctrl-D page down, b/PgUp/Ctrl-U page up, Left/Right page, gg/G top/bottom, Tab/Shift-Tab tabs, MouseDrag select, / search, n next, p prev, : cmd, L gutter, Esc cancel, ? help\n");
+  let _ = w.push_str("Keys: q quit, Ctrl-C quit/copy, Ctrl-K find, j/k/u/d/Up/Down scroll, MouseWheel scroll, Space/PgDn/Ctrl-D page down, b/PgUp/Ctrl-U page up, Left/Right page, gg/G top/bottom, Tab/Shift-Tab tabs, MouseDrag select, / or Ctrl-F search, n next, p prev, : cmd, L gutter, Esc cancel, ? help\n");
 
   let _ = w.flush();
 }
@@ -2105,6 +2109,107 @@ fn render_line (mut w: &Writer, theme: &Theme, ptr: u64, len: i64, width: int, u
   }
   if use_syntax && cur_tok != TOK_NONE {
     ansi_tok_apply(mut w, theme, TOK_NONE);
+  }
+  return i;
+}
+
+fn render_line_modal (mut w: &Writer, theme: &Theme, ptr: u64, len: i64, width: int, base_fg: int, base_bg: int, styles: u64) -> i64 {
+  if width <= 0 {
+    return 0;
+  }
+  if ptr == 0 || len <= 0 {
+    return 0;
+  }
+
+  // Modal rendering is always "safe" (escapes control bytes) and never passes
+  // through SGR from content.
+  let use_syntax: bool = styles != 0;
+  var cur_tok: u8 = TOK_NONE;
+
+  ansi_reset(mut w);
+  if base_bg >= 0 {
+    ansi_bg_256(mut w, base_bg);
+  }
+  ansi_intensity_normal(mut w);
+  if base_fg >= 0 {
+    ansi_fg_256(mut w, base_fg);
+  } else {
+    ansi_fg_default(mut w);
+  }
+
+  var col: int = 0;
+  var i: i64 = 0;
+  while i < len && col < width {
+    if use_syntax {
+      let tok: u8 = std::runtime::mem::load_u8(styles, i);
+      if tok != cur_tok {
+        if tok == TOK_NONE {
+          ansi_intensity_normal(mut w);
+          if base_fg >= 0 {
+            ansi_fg_256(mut w, base_fg);
+          } else {
+            ansi_fg_default(mut w);
+          }
+        } else {
+          ansi_tok_apply(mut w, theme, tok);
+        }
+        cur_tok = tok;
+      }
+    }
+
+    let b: u8 = std::runtime::mem::load_u8(ptr, i);
+
+    if b == 9 { // tab
+      let tabw: int = 8 - (col & 7);
+      var s: int = 0;
+      while s < tabw && col < width {
+        let _ = w.push_u8(32);
+        s = s + 1;
+        col = col + 1;
+      }
+      i = i + 1;
+      continue;
+    }
+
+    if b == 27 { // ESC
+      if (col + 2) > width { break; }
+      let _ = w.push_u8(94); // ^
+      let _ = w.push_u8(91); // [
+      col = col + 2;
+      i = i + 1;
+      continue;
+    }
+
+    if b < 32 {
+      if (col + 2) > width { break; }
+      let _ = w.push_u8(94); // ^
+      let _ = w.push_u8(b + 64);
+      col = col + 2;
+      i = i + 1;
+      continue;
+    }
+
+    if b == 127 {
+      if (col + 2) > width { break; }
+      let _ = w.push_u8(94); // ^
+      let _ = w.push_u8(63); // ?
+      col = col + 2;
+      i = i + 1;
+      continue;
+    }
+
+    let _ = w.push_u8(b);
+    col = col + 1;
+    i = i + 1;
+  }
+
+  if use_syntax && cur_tok != TOK_NONE {
+    ansi_intensity_normal(mut w);
+    if base_fg >= 0 {
+      ansi_fg_256(mut w, base_fg);
+    } else {
+      ansi_fg_default(mut w);
+    }
   }
   return i;
 }
@@ -3262,8 +3367,8 @@ fn draw_help (
     ansi_clear_eol(mut w);
     r = r + 1;
   }
-  if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.accent, "/", help_desc_col, "enter a query (jumps to first match)"); r = r + 1; }
-  if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.accent, "Ctrl-K", help_desc_col, "find across open files"); r = r + 1; }
+  if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.accent, "/ or Ctrl-F", help_desc_col, "enter a query (jumps to first match)"); r = r + 1; }
+  if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.accent, "Ctrl-K", help_desc_col, "find across open files (Tab/Shift-Tab navigate)"); r = r + 1; }
   if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.accent, "DoubleClick", help_desc_col, "set query to clicked word"); r = r + 1; }
   if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.accent, "n", help_desc_col, "next match"); r = r + 1; }
   if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.accent, "p", help_desc_col, "previous match"); r = r + 1; }
@@ -3285,7 +3390,7 @@ fn draw_help (
     ansi_clear_eol(mut w);
     r = r + 1;
   }
-  if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.accent, ":", help_desc_col, "goto line (:<n>), :tab <n>/:t<n> (0 = last), :bn/:bp, :q quit"); r = r + 1; }
+  if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.accent, ":", help_desc_col, "goto line (:<n>, :0=top, :<neg>=from end), :tab <n>/:t<n> (0 = last), :bn/:bp, :q quit"); r = r + 1; }
   if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.accent, "L", help_desc_col, "toggle line-number gutter"); r = r + 1; }
   if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.accent, "MouseDrag", help_desc_col, "select text (gutter excluded)"); r = r + 1; }
   if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.accent, "Ctrl-C", help_desc_col, "copy selection (OSC 52)"); r = r + 1; }
@@ -4108,6 +4213,29 @@ fn offset_for_line (file_ptr: u64, file_len: i64, checkpoints: &VecU64, line0: i
   return Some(cur);
 }
 
+fn offset_for_line_from_end (file_ptr: u64, file_len: i64, back: i64) -> i64? {
+  // Returns the byte offset for the start of the line `back` lines above the
+  // last line. (`back=1` => last-1, `back=2` => last-2, ...).
+  if file_ptr == 0 || file_len < 0 {
+    return None;
+  }
+  if back <= 0 {
+    return Some(line_start_for_offset(file_ptr, file_len));
+  }
+
+  var cur: i64 = line_start_for_offset(file_ptr, file_len);
+  var i: i64 = 0;
+  while i < back {
+    let prev: i64 = prev_line_start(file_ptr, file_len, cur);
+    if prev == cur {
+      return None;
+    }
+    cur = prev;
+    i = i + 1;
+  }
+  return Some(cur);
+}
+
 fn push_tail_trunc (mut w: &Writer, theme: &Theme, ptr: u64, len: i64, max: int) -> int {
   if ptr == 0 || len <= 0 || max <= 0 {
     return 0;
@@ -4747,13 +4875,13 @@ fn find_run_open_files (cfg: &Config, tabs_ptr: u64, tabs_cap: i64, tabs_len: i6
     return out;
   }
 
-  // Collect file args (skip stdin tabs).
+  // Collect file args (skip stdin + network tabs).
   var file_count: i64 = 0;
   if tabs_ptr != 0 && tabs_len > 0 {
     var i: i64 = 0;
     while i < tabs_len {
       let t: TabState = (tabs_ptr as TabState[](tabs_cap as int))[i];
-      if t.path != "-" {
+      if t.path != "-" && !is_network_path(t.path) {
         file_count = file_count + 1;
       }
       i = i + 1;
@@ -4853,7 +4981,7 @@ fn find_run_open_files (cfg: &Config, tabs_ptr: u64, tabs_cap: i64, tabs_len: i6
             var ti: i64 = 0;
             while ti < tabs_len {
               let t: TabState = (tabs_ptr as TabState[](tabs_cap as int))[ti];
-              if t.path != "-" {
+              if t.path != "-" && !is_network_path(t.path) {
                 let _ = cmd.arg(t.path);
               }
               ti = ti + 1;
@@ -4927,7 +5055,7 @@ fn find_run_open_files (cfg: &Config, tabs_ptr: u64, tabs_cap: i64, tabs_len: i6
     var ti2: i64 = 0;
     while ti2 < tabs_len {
       let t: TabState = (tabs_ptr as TabState[](tabs_cap as int))[ti2];
-      if t.path != "-" {
+      if t.path != "-" && !is_network_path(t.path) {
         let _ = cmd.arg(t.path);
       }
       ti2 = ti2 + 1;
@@ -5006,6 +5134,53 @@ fn find_index_stdout (stdout: &std::strings::String, fmt: int, mut idx: &VecU64)
   return truncated;
 }
 
+struct FindSynSlot {
+  path_ptr: u64,
+  path_len: i64,
+  ok: bool,
+  syn: Highlighter,
+}
+
+struct FindSynCache {
+  next: int,
+  s0: FindSynSlot,
+  s1: FindSynSlot,
+  s2: FindSynSlot,
+  s3: FindSynSlot,
+}
+
+fn find_syn_slot_empty () -> FindSynSlot {
+  return FindSynSlot{ path_ptr: 0, path_len: 0, ok: false, syn: highlighter_empty() };
+}
+
+fn find_syn_cache_init () -> FindSynCache {
+  return FindSynCache{
+    next: 0,
+    s0: find_syn_slot_empty(),
+    s1: find_syn_slot_empty(),
+    s2: find_syn_slot_empty(),
+    s3: find_syn_slot_empty(),
+  };
+}
+
+fn find_syn_cache_reset (mut c: &FindSynCache) -> void {
+  c.next = 0;
+  c.s0 = find_syn_slot_empty();
+  c.s1 = find_syn_slot_empty();
+  c.s2 = find_syn_slot_empty();
+  c.s3 = find_syn_slot_empty();
+}
+
+fn find_syn_slot_match (slot_ptr: u64, slot_len: i64, path_ptr: u64, path_len: i64) -> bool {
+  if slot_ptr == 0 || path_ptr == 0 || slot_len <= 0 || path_len <= 0 {
+    return false;
+  }
+  if slot_len != path_len {
+    return false;
+  }
+  return bytes_match_exact(slot_ptr, path_ptr, path_len);
+}
+
 fn draw_find_modal (
   mut w: &Writer,
   theme: &Theme,
@@ -5022,10 +5197,11 @@ fn draw_find_modal (
   exit_code: int,
   truncated: bool,
   err_stage: int,
-  err_code: int
+  err_code: int,
+  syntax_on: bool,
+  mut styles: &BufferU8,
+  mut syn_cache: &FindSynCache
 ) -> void {
-  let _ = fmt;
-
   var r: int = 0;
   ansi_reset(mut w);
 
@@ -5098,7 +5274,7 @@ fn draw_find_modal (
         let _ = push_head_trunc_plain(mut w, ep, take, cols);
       }
     } else {
-      let _ = w.push_str("Up/Down to navigate, Enter to jump, Esc to close, Wheel to scroll.");
+      let _ = w.push_str("Up/Down/Tab/Shift-Tab to navigate, Enter to jump, Esc to close, Wheel to scroll.");
     }
     ansi_reset(mut w);
     ansi_clear_eol(mut w);
@@ -5120,14 +5296,157 @@ fn draw_find_modal (
       let len: i64 = idx.get((idx0 * 2) + 1) as i64;
       if start >= 0 && len > 0 {
         let line_ptr: u64 = base_ptr + (start as u64);
-        if idx0 == sel {
-          ansi_bg_256(mut w, theme.match_bg);
-          ansi_fg_256(mut w, theme.match_fg);
+        let is_sel: bool = idx0 == sel;
+
+        // Parse into prefix + snippet so we can syntax-highlight the snippet.
+        let loc_opt: FindLoc? = parse_find_loc(line_ptr, len, fmt);
+        if loc_opt == None {
+          if is_sel {
+            ansi_bg_256(mut w, theme.match_bg);
+            ansi_fg_256(mut w, theme.match_fg);
+          } else {
+            ansi_fg_256(mut w, theme.status_fg);
+          }
+          let _ = push_head_trunc_plain(mut w, line_ptr, len, cols);
+          ansi_reset(mut w);
         } else {
-          ansi_fg_256(mut w, theme.status_fg);
+          let loc: FindLoc = match (loc_opt) { Some(v) => v, None => FindLoc{ path_ptr: 0, path_len: 0, line1: 0, col1: 0 } };
+
+          // Split into `prefix` (path:line:col:) and `snippet` (code text).
+          var snippet_ptr: u64 = 0;
+          var prefix_len: i64 = 0;
+          if line_ptr != 0 && len > 0 {
+            let c1_ptr: u64 = memchr(line_ptr, 58, len); // ':'
+            if c1_ptr != 0 {
+              let c1: i64 = (c1_ptr - line_ptr) as i64;
+              let rest1_ptr: u64 = c1_ptr + 1;
+              let rest1_len: i64 = len - c1 - 1;
+              if rest1_ptr != 0 && rest1_len > 0 {
+                let c2_ptr: u64 = memchr(rest1_ptr, 58, rest1_len);
+                if c2_ptr != 0 {
+                  if fmt == FIND_FMT_VIMGREP {
+                    let c2: i64 = (c2_ptr - rest1_ptr) as i64;
+                    let rest2_ptr: u64 = c2_ptr + 1;
+                    let rest2_len: i64 = rest1_len - c2 - 1;
+                    if rest2_ptr != 0 && rest2_len > 0 {
+                      let c3_ptr: u64 = memchr(rest2_ptr, 58, rest2_len);
+                      if c3_ptr != 0 {
+                        snippet_ptr = c3_ptr + 1;
+                      }
+                    }
+                  } else {
+                    snippet_ptr = c2_ptr + 1;
+                  }
+                }
+              }
+            }
+          }
+          if snippet_ptr == 0 || snippet_ptr < line_ptr || snippet_ptr > (line_ptr + (len as u64)) {
+            // Fallback: show the full line if it isn't splittable.
+            if is_sel {
+              ansi_bg_256(mut w, theme.match_bg);
+              ansi_fg_256(mut w, theme.match_fg);
+            } else {
+              ansi_fg_256(mut w, theme.status_fg);
+            }
+            let _ = push_head_trunc_plain(mut w, line_ptr, len, cols);
+            ansi_reset(mut w);
+          } else {
+            prefix_len = (snippet_ptr - line_ptr) as i64;
+            let snippet_len: i64 = len - prefix_len;
+
+            // Prefix.
+            if is_sel {
+              ansi_bg_256(mut w, theme.match_bg);
+              ansi_fg_256(mut w, theme.match_fg);
+            } else {
+              ansi_fg_256(mut w, theme.status_dim);
+            }
+            let prefix_cols: int = push_head_trunc_plain(mut w, line_ptr, prefix_len, cols);
+
+            // Snippet.
+            var rem_cols: int = cols - prefix_cols;
+            if rem_cols > 0 && snippet_ptr != 0 && snippet_len > 0 {
+              var elide: bool = false;
+              var snippet_width: int = rem_cols;
+              if snippet_width > 3 {
+                let consumed_full: i64 = measure_line_consumed(snippet_ptr, snippet_len, snippet_width, false, false);
+                if consumed_full < snippet_len {
+                  snippet_width = snippet_width - 3;
+                  elide = true;
+                }
+              }
+
+              // Compute the visible byte range at `snippet_width` columns.
+              let take: i64 = measure_line_consumed(snippet_ptr, snippet_len, snippet_width, false, false);
+
+              var styles_ptr: u64 = 0;
+              if syntax_on && take > 0 && loc.path_ptr != 0 && loc.path_len > 0 {
+                styles.clear();
+                let oom = styles.reserve_additional(take);
+                if oom == None && styles.ptr != 0 && styles.cap >= take {
+                  // Look up a cached highlighter or load it into the next slot.
+                  var slot: int = -1;
+                  if find_syn_slot_match(syn_cache.s0.path_ptr, syn_cache.s0.path_len, loc.path_ptr, loc.path_len) { slot = 0; }
+                  else if find_syn_slot_match(syn_cache.s1.path_ptr, syn_cache.s1.path_len, loc.path_ptr, loc.path_len) { slot = 1; }
+                  else if find_syn_slot_match(syn_cache.s2.path_ptr, syn_cache.s2.path_len, loc.path_ptr, loc.path_len) { slot = 2; }
+                  else if find_syn_slot_match(syn_cache.s3.path_ptr, syn_cache.s3.path_len, loc.path_ptr, loc.path_len) { slot = 3; }
+
+                  if slot < 0 {
+                    slot = syn_cache.next;
+                    syn_cache.next = (syn_cache.next + 1) & 3;
+
+                    let path_s: string = std::runtime::mem::string_from_ptr_len(loc.path_ptr, loc.path_len as int);
+                    let syn_opt2: Highlighter? = load_for_path(path_s);
+                    let mut syn_loaded: Highlighter = highlighter_empty();
+                    var ok_loaded: bool = false;
+                    if syn_opt2 != None {
+                      syn_loaded = match (syn_opt2) { Some(v) => v, None => syn_loaded };
+                      ok_loaded = true;
+                    }
+
+                    if slot == 0 { syn_cache.s0 = FindSynSlot{ path_ptr: loc.path_ptr, path_len: loc.path_len, ok: ok_loaded, syn: move syn_loaded }; }
+                    else if slot == 1 { syn_cache.s1 = FindSynSlot{ path_ptr: loc.path_ptr, path_len: loc.path_len, ok: ok_loaded, syn: move syn_loaded }; }
+                    else if slot == 2 { syn_cache.s2 = FindSynSlot{ path_ptr: loc.path_ptr, path_len: loc.path_len, ok: ok_loaded, syn: move syn_loaded }; }
+                    else { syn_cache.s3 = FindSynSlot{ path_ptr: loc.path_ptr, path_len: loc.path_len, ok: ok_loaded, syn: move syn_loaded }; }
+                  }
+
+                  var ok_hl: bool = false;
+                  let mut st: HLState = hl_state_init();
+                  if slot == 0 {
+                    if syn_cache.s0.ok { ok_hl = highlight_segment_stateful(&syn_cache.s0.syn, mut st, snippet_ptr, take, styles.ptr); }
+                  } else if slot == 1 {
+                    if syn_cache.s1.ok { ok_hl = highlight_segment_stateful(&syn_cache.s1.syn, mut st, snippet_ptr, take, styles.ptr); }
+                  } else if slot == 2 {
+                    if syn_cache.s2.ok { ok_hl = highlight_segment_stateful(&syn_cache.s2.syn, mut st, snippet_ptr, take, styles.ptr); }
+                  } else {
+                    if syn_cache.s3.ok { ok_hl = highlight_segment_stateful(&syn_cache.s3.syn, mut st, snippet_ptr, take, styles.ptr); }
+                  }
+
+                  if ok_hl {
+                    styles_ptr = styles.ptr;
+                  }
+                }
+              }
+
+              // Render snippet (safe; no ANSI passthrough).
+              let base_fg: int = if is_sel { theme.match_fg } else { theme.status_fg };
+              let base_bg: int = if is_sel { theme.match_bg } else { -1 };
+              let _ = render_line_modal(mut w, theme, snippet_ptr, take, snippet_width, base_fg, base_bg, styles_ptr);
+
+              if elide {
+                if is_sel {
+                  ansi_fg_256(mut w, theme.match_fg);
+                } else {
+                  ansi_fg_256(mut w, theme.status_dim);
+                }
+                let _ = w.push_str("...");
+              }
+            }
+
+            ansi_reset(mut w);
+          }
         }
-        let _ = push_head_trunc_plain(mut w, line_ptr, len, cols);
-        ansi_reset(mut w);
       }
     } else if count == 0 && i_row == 0 {
       ansi_fg_256(mut w, theme.status_dim);
@@ -5677,12 +5996,7 @@ export async fn main (argc: int, argv: u64) -> int {
       }
 
       // Map file contents.
-      var m_opt: MappedFile? = None;
-      if path == "-" {
-        m_opt = map_stdin_spool(cfg.allow_binary);
-      } else {
-        m_opt = map_path(path, cfg.allow_binary);
-      }
+      let m_opt: MappedFile? = map_input(path, cfg.allow_binary);
       if m_opt == None {
         let _ = write_str(std::runtime::posix::io::STDERR_FD, "sage: failed to open input\n");
         return 2;
@@ -5891,12 +6205,7 @@ export async fn main (argc: int, argv: u64) -> int {
     }
 
     // Map file contents for the active tab.
-    var m_opt: MappedFile? = None;
-    if path == "-" {
-      m_opt = map_stdin_spool(cfg.allow_binary);
-    } else {
-      m_opt = map_path(path, cfg.allow_binary);
-    }
+    let m_opt: MappedFile? = map_input(path, cfg.allow_binary);
     if m_opt == None {
       tabs_free(mut tabs);
       let _ = write_str(std::runtime::posix::io::STDERR_FD, "sage: failed to open input\n");
@@ -5926,6 +6235,20 @@ export async fn main (argc: int, argv: u64) -> int {
       cfg.plugin_stack_limit_kb
     );
     var plug_init_err: bool = plugins::had_init_error(&plug);
+
+    // Allow plugins to read the currently open local files via `sage:fs.readFile(...)`.
+    // (Stdin + network tabs are excluded.)
+    var p_i: i64 = 0;
+    while p_i < tabs.len {
+      let t: TabState = (tabs.ptr as TabState[](tabs.cap as int))[p_i];
+      if t.path != "-" && !is_network_path(t.path) {
+        if plugins::allow_fs_read_path(&plug, t.path) {
+          plug_init_err = true;
+        }
+      }
+      p_i = p_i + 1;
+    }
+
     if plugins::emit_open(&plug, path, active_tab + 1, tabs.len) {
       plug_init_err = true;
     }
@@ -6104,6 +6427,9 @@ export async fn main (argc: int, argv: u64) -> int {
     var find_sel: i64 = 0;
     var find_scroll: i64 = 0;
     var find_queued_line0: i64 = -1;
+    let fs_opt: BufferU8? = BufferU8.init(8192);
+    let mut find_styles: BufferU8 = match (fs_opt) { Some(v) => v, None => BufferU8.empty() };
+    let mut find_syn_cache: FindSynCache = find_syn_cache_init();
 
     var last_match_off: i64 = -1;
     var last_match_end: i64 = -1;
@@ -6429,7 +6755,10 @@ export async fn main (argc: int, argv: u64) -> int {
             find_exit_code,
             find_truncated,
             find_err_stage,
-            find_err_code
+            find_err_code,
+            cfg.syntax && use_color && !cfg.unsafe_raw,
+            mut find_styles,
+            mut find_syn_cache
           );
         } else {
           var cur: i64 = top_off;
@@ -6598,32 +6927,53 @@ export async fn main (argc: int, argv: u64) -> int {
       // Read one key (while allowing background indexing + resize detection).
       let timeout_ms: int = if search.active { 25 } else { if idx.done { 250 } else { 50 } };
       let k: Key = read_key_timeout(mut inp, timeout_ms);
+      // Plugin-requested `:` commands (`exec(...)`) are executed on idle
+      // ticks so they don't compete with real user input.
+      var run_cmd_now: bool = false;
       if k.kind == KEY_NONE {
-        continue;
+        if plugins::poll(&plug) {
+          alert = ALERT_PLUGIN_ERROR;
+          need_redraw = true;
+        }
+        if !find_active && !show_help && !sel_drag {
+          if plugins::take_exec_cmd(&plug, mut tmp_cmd) {
+            run_cmd_now = true;
+          } else {
+            continue;
+          }
+        } else {
+          continue;
+        }
       }
       if k.kind == KEY_EOF {
         break;
       }
 
+      let has_user_input: bool = !run_cmd_now;
+
       // Any user input cancels a pending `:<line>` jump (avoids surprise jumps).
-      if pending_goto_line >= 0 {
+      if has_user_input && pending_goto_line >= 0 {
         pending_goto_line = -1;
         if alert == 7 { alert = 0; }
       }
 
       // Clear transient alerts on user input (except "searching", which is live state).
-      if alert != 0 && alert != 4 {
+      if has_user_input && alert != 0 && alert != 4 {
         alert = 0;
       }
 
-      let is_byte: bool = k.kind == KEY_BYTE;
-      let b: u8 = k.byte;
+      var is_byte: bool = k.kind == KEY_BYTE;
+      var b: u8 = k.byte;
+      if run_cmd_now {
+        is_byte = true;
+        b = 58; // ':'
+      }
       var want_tab: i64 = -1;
       var mouse_consumed: bool = false;
 
       // Vim-like `gg` to jump to top. `g` is a prefix and does nothing by itself.
       let is_g: bool = is_byte && b == 103; // 'g'
-      if g_pending && !is_g {
+      if has_user_input && g_pending && !is_g {
         g_pending = false;
       }
 
@@ -6648,6 +6998,8 @@ export async fn main (argc: int, argv: u64) -> int {
           find_fmt = FIND_FMT_GREP;
           find_stdout.drop();
           find_stderr.drop();
+          find_styles.clear();
+          find_syn_cache_reset(mut find_syn_cache);
           need_redraw = true;
           continue;
         }
@@ -6680,7 +7032,7 @@ export async fn main (argc: int, argv: u64) -> int {
         }
 
         // Navigate.
-        if k.kind == KEY_UP || (is_byte && (b == 107 || b == 117)) { // 'k' or 'u'
+        if k.kind == KEY_UP || k.kind == KEY_SHIFT_TAB || (is_byte && (b == 107 || b == 117)) { // Up / Shift-Tab / 'k' / 'u'
           if count > 0 && find_sel > 0 {
             find_sel = find_sel - 1;
           }
@@ -6690,7 +7042,7 @@ export async fn main (argc: int, argv: u64) -> int {
           need_redraw = true;
           continue;
         }
-        if k.kind == KEY_DOWN || (is_byte && (b == 106 || b == 100)) { // 'j' or 'd'
+        if k.kind == KEY_DOWN || (is_byte && (b == 106 || b == 100 || b == 9)) { // Down / Tab / 'j' / 'd'
           if count > 0 && find_sel < (count - 1) {
             find_sel = find_sel + 1;
           }
@@ -6788,6 +7140,8 @@ export async fn main (argc: int, argv: u64) -> int {
           find_fmt = FIND_FMT_GREP;
           find_stdout.drop();
           find_stderr.drop();
+          find_styles.clear();
+          find_syn_cache_reset(mut find_syn_cache);
 
           if hit_tab < 0 || hit_tab >= tabs.len {
             alert = ALERT_OPEN_FAILED;
@@ -7035,12 +7389,7 @@ export async fn main (argc: int, argv: u64) -> int {
         if want_tab >= 0 && want_tab < tabs.len && want_tab != active_tab {
           // Map the new tab first so a failed open doesn't destroy the current view.
           let new_state: TabState = (tabs.ptr as TabState[](tabs.cap as int))[want_tab];
-          var m2_opt: MappedFile? = None;
-          if new_state.path == "-" {
-            m2_opt = map_stdin_spool(cfg.allow_binary);
-          } else {
-            m2_opt = map_path(new_state.path, cfg.allow_binary);
-          }
+          let m2_opt: MappedFile? = map_input(new_state.path, cfg.allow_binary);
           if m2_opt == None {
             alert = ALERT_OPEN_FAILED;
             need_redraw = true;
@@ -7190,6 +7539,8 @@ export async fn main (argc: int, argv: u64) -> int {
           find_fmt = FIND_FMT_GREP;
           find_stdout.drop();
           find_stderr.drop();
+          find_styles.clear();
+          find_syn_cache_reset(mut find_syn_cache);
 
           let qb = find_query.as_bytes();
           let mut run: FindRun = find_run_open_files(&cfg, tabs.ptr, tabs.cap, tabs.len, qb.ptr, qb.len);
@@ -7218,7 +7569,12 @@ export async fn main (argc: int, argv: u64) -> int {
         if search.active {
           search.active = false;
         }
-        let ok_cmd: bool = prompt_cmd(mut w, &cfg.theme, mut inp, rows, cols, mut tmp_cmd);
+        var ok_cmd: bool = false;
+        if run_cmd_now {
+          ok_cmd = true;
+        } else {
+          ok_cmd = prompt_cmd(mut w, &cfg.theme, mut inp, rows, cols, mut tmp_cmd);
+        }
         if ok_cmd {
           let cb = tmp_cmd.as_bytes();
           var s0: i64 = 0;
@@ -7329,12 +7685,7 @@ export async fn main (argc: int, argv: u64) -> int {
               if want_tab_cmd >= 0 && want_tab_cmd < tabs.len && want_tab_cmd != active_tab {
                 // Map the new tab first so a failed open doesn't destroy the current view.
                 let new_state2: TabState = (tabs.ptr as TabState[](tabs.cap as int))[want_tab_cmd];
-                var m3_opt: MappedFile? = None;
-                if new_state2.path == "-" {
-                  m3_opt = map_stdin_spool(cfg.allow_binary);
-                } else {
-                  m3_opt = map_path(new_state2.path, cfg.allow_binary);
-                }
+                let m3_opt: MappedFile? = map_input(new_state2.path, cfg.allow_binary);
                 if m3_opt == None {
                   alert = ALERT_OPEN_FAILED;
                   need_redraw = true;
@@ -7441,9 +7792,14 @@ export async fn main (argc: int, argv: u64) -> int {
             let n_opt: i64? = parse_i64_dec(c_ptr, c_len);
             if n_opt != None {
               let n: i64 = match (n_opt) { Some(v) => v, None => 0 };
-              if n <= 0 {
-                alert = 8;
-              } else {
+
+              // `:0` is a convenient alias for the top of the file (line 1).
+              if n == 0 {
+                top_off = 0;
+                pending_goto_line = -1;
+                alert = 0;
+              } else if n > 0 {
+                // Positive line numbers are 1-indexed.
                 let line0: i64 = n - 1;
                 let ck: i64 = line0 / INDEX_STRIDE;
                 if ck >= offsets.len {
@@ -7465,9 +7821,56 @@ export async fn main (argc: int, argv: u64) -> int {
                     alert = 8;
                   }
                 }
+              } else {
+                // Negative line numbers are counted from the end: `:-2` = last line minus 2.
+                pending_goto_line = -1;
+                if idx.done {
+                  let want_line: i64 = idx.lines + n;
+                  if want_line <= 0 {
+                    alert = 8;
+                  } else {
+                    let line0: i64 = want_line - 1;
+                    let ck: i64 = line0 / INDEX_STRIDE;
+                    if ck < 0 || ck >= offsets.len {
+                      alert = 8;
+                    } else {
+                      let off_opt: i64? = offset_for_line(file.ptr, file.len, &offsets, line0);
+                      if off_opt != None {
+                        let off0: i64 = match (off_opt) { Some(v) => v, None => 0 };
+                        top_off = visual_start_for_offset(file.ptr, file.len, off0, view_cols, cfg.unsafe_raw, allow_ansi);
+                        alert = 0;
+                      } else {
+                        alert = 8;
+                      }
+                    }
+                  }
+                } else {
+                  let back: i64 = 0 - n;
+                  let off_opt: i64? = offset_for_line_from_end(file.ptr, file.len, back);
+                  if off_opt != None {
+                    let off0: i64 = match (off_opt) { Some(v) => v, None => 0 };
+                    top_off = visual_start_for_offset(file.ptr, file.len, off0, view_cols, cfg.unsafe_raw, allow_ansi);
+                    alert = 0;
+                  } else {
+                    alert = 8;
+                  }
+                }
               }
             } else {
-              alert = 6;
+              // Not a built-in command or numeric jump: try plugins.
+              let head_s: string = std::runtime::mem::string_from_ptr_len(c_ptr, head_len as int);
+              var args_s: string = "";
+              if arg_ptr != 0 && arg_len > 0 {
+                args_s = std::runtime::mem::string_from_ptr_len(arg_ptr, arg_len as int);
+              }
+              let prc: i64 = plugins::command(&plug, head_s, args_s);
+              if prc == 1 {
+                alert = 0;
+              } else if prc == 2 {
+                alert = ALERT_PLUGIN_ERROR;
+              } else {
+                alert = 6;
+              }
             }
           } else {
             alert = 6;
@@ -7636,7 +8039,7 @@ export async fn main (argc: int, argv: u64) -> int {
       }
 
       // Search.
-      if is_byte && b == 47 { // '/'
+      if is_byte && (b == 47 || b == 6) { // '/' or Ctrl-F
         if search.active {
           search.active = false;
         }

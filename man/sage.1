@@ -159,7 +159,7 @@ Jump to tab \fIN\fR (tabs are 1\-indexed; \fB0\fR selects the last tab).
 Left\-click a tab label to switch to it.
 .SS Search
 .TP
-.B /
+.B /\fR,\fB Ctrl\-F
 Search prompt (starts incremental search; jumps to first match).
 .TP
 .B n\fR,\fB p
@@ -173,7 +173,7 @@ Cancel an in\-flight search and clear selection state.
 Enter command mode.
 .TP
 .B Ctrl\-K
-Open a "find" modal to search across the currently open file paths.
+Open a "find" modal to search across the currently open file paths (Up/Down/Tab/Shift\-Tab navigate, Enter/click jumps, Wheel scrolls, Esc closes). Results are syntax highlighted when syntax highlighting is enabled.
 .TP
 .B L
 Toggle the line number gutter.
@@ -187,7 +187,7 @@ Command mode accepts a small vim\-like subset:
 Quit.
 .TP
 .B :\fIN\fR
-Jump to line \fIN\fR (1\-indexed).
+Jump to line \fIN\fR (1\-indexed). \fB:0\fR jumps to line 1. Negative numbers count from the end (for example, \fB:-2\fR jumps to the last line minus 2).
 .TP
 .B :bn\fR,\fB :buffer\-next\fR,\fB :tn\fR,\fB :tab\-next
 Next tab.

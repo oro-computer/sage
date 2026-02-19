@@ -1,0 +1,12 @@
+module sage::plugins_test;
+
+// NOTE: The QuickJS plugin host (`sage_qjs_*`) is implemented in native C and is
+// linked only into the `sage` executable build target (via `build.slk`).
+//
+// `silk test` compiles each language-level `test` into its own standalone
+// executable without those native `[[target]].inputs`, so a true integration
+// test that invokes the plugin host currently fails at load time with an
+// undefined symbol error.
+//
+// Keep this module as a placeholder for future integration tests once the test
+// runner can link native inputs.

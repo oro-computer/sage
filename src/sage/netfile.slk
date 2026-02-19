@@ -1,0 +1,988 @@
+module sage::netfile;
+
+import std::arrays;
+import std::http;
+import std::https;
+import std::net;
+import std::runtime::fs;
+import std::runtime::mem;
+import std::runtime::posix::fs;
+import std::runtime::posix::net;
+import std::strings;
+import std::tls;
+import { memchr, mkstemp } from "./os.slk";
+import { MappedFile } from "./file.slk";
+
+let SO_RCVTIMEO: int = 20; // linux: SO_RCVTIMEO
+
+// mbedTLS SNI API (not currently exposed by `std::tls` in the shipped stdlib).
+ext mbedtls_ssl_set_hostname = fn (u64, u64) -> i32;
+
+fn ascii_lower (b: u8) -> u8 {
+  if b >= 65 && b <= 90 {
+    return b + 32;
+  }
+  return b;
+}
+
+fn has_prefix_case_insensitive (s: string, prefix: string) -> bool {
+  let sp: u64 = std::runtime::mem::string_ptr(s);
+  let sl: i64 = std::runtime::mem::string_len(s);
+  let pp: u64 = std::runtime::mem::string_ptr(prefix);
+  let pl: i64 = std::runtime::mem::string_len(prefix);
+  if sp == 0 || pp == 0 || sl < 0 || pl < 0 {
+    return false;
+  }
+  if sl < pl {
+    return false;
+  }
+
+  var i: i64 = 0;
+  while i < pl {
+    let a: u8 = ascii_lower(std::runtime::mem::load_u8(sp, i));
+    let b: u8 = ascii_lower(std::runtime::mem::load_u8(pp, i));
+    if a != b {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+export fn is_network_path (path: string) -> bool {
+  return has_prefix_case_insensitive(path, "http://") || has_prefix_case_insensitive(path, "https://") || has_prefix_case_insensitive(path, "ssh://");
+}
+
+fn parse_ipv4_literal_value (host: string) -> int? {
+  let p: u64 = std::runtime::mem::string_ptr(host);
+  let n: i64 = std::runtime::mem::string_len(host);
+  if p == 0 || n <= 0 {
+    return None;
+  }
+
+  let mut parts: int[4] = [0, 0, 0, 0];
+  var part_i: i64 = 0;
+  var value: int = 0;
+  var has_digit: bool = false;
+
+  var i: i64 = 0;
+  while i < n {
+    let b: u8 = std::runtime::mem::load_u8(p, i);
+    if b >= 48 && b <= 57 {
+      has_digit = true;
+      value = value * 10 + (((b - 48) as int) as int);
+      if value > 255 {
+        return None;
+      }
+    } else if b == 46 { // '.'
+      if !has_digit {
+        return None;
+      }
+      if part_i >= 3 {
+        return None;
+      }
+      parts[part_i as int] = value;
+      part_i = part_i + 1;
+      value = 0;
+      has_digit = false;
+    } else {
+      return None;
+    }
+    i = i + 1;
+  }
+
+  if !has_digit || part_i != 3 {
+    return None;
+  }
+  parts[3] = value;
+
+  let ip: std::net::Ipv4Addr = std::net::Ipv4Addr.from_octets(parts[0], parts[1], parts[2], parts[3]);
+  return Some(ip.value());
+}
+
+fn store_u16_be (ptr: u64, off: i64, value: int) -> void {
+  std::runtime::mem::store_u8(ptr, off + 0, ((value >> 8) & 255) as u8);
+  std::runtime::mem::store_u8(ptr, off + 1, (value & 255) as u8);
+}
+
+fn load_u16_be (ptr: u64, off: i64) -> int {
+  let hi: int = std::runtime::mem::load_u8(ptr, off + 0) as int;
+  let lo: int = std::runtime::mem::load_u8(ptr, off + 1) as int;
+  return (hi << 8) | lo;
+}
+
+fn set_recv_timeout_ms (fd: int, ms: int) -> void {
+  if fd < 0 || ms <= 0 {
+    return;
+  }
+
+  // struct timeval { long tv_sec; long tv_usec; } (linux x86_64 baseline)
+  let tv: u64 = std::runtime::mem::alloc(16);
+  if tv == 0 {
+    return;
+  }
+  let secs: u64 = (ms / 1000) as u64;
+  let usecs: u64 = ((ms % 1000) * 1000) as u64;
+  std::runtime::mem::store_u64(tv, 0, secs);
+  std::runtime::mem::store_u64(tv, 8, usecs);
+  let _ = std::runtime::posix::net::setsockopt(fd, std::runtime::posix::net::SOL_SOCKET, SO_RCVTIMEO, tv, 16);
+  std::runtime::mem::free(tv);
+}
+
+fn resolv_conf_nameserver_v4_value () -> int? {
+  let path: string = "/etc/resolv.conf";
+  let fd: int = std::runtime::posix::fs::open(path, std::runtime::posix::fs::O_RDONLY, 0) as int;
+  if fd < 0 {
+    return None;
+  }
+
+  let cap: i64 = 4096;
+  let buf: u64 = std::runtime::mem::alloc(cap);
+  if buf == 0 {
+    let _ = std::runtime::posix::fs::close(fd);
+    return None;
+  }
+
+  let nread: int = std::runtime::posix::fs::read(fd, buf, cap);
+  let _ = std::runtime::posix::fs::close(fd);
+  if nread <= 0 {
+    std::runtime::mem::free(buf);
+    return None;
+  }
+
+  let n: i64 = nread as i64;
+  var i: i64 = 0;
+  while i < n {
+    // Find start of non-ws.
+    var line_start: i64 = i;
+    while line_start < n {
+      let b: u8 = std::runtime::mem::load_u8(buf, line_start);
+      if b != 32 && b != 9 { break; }
+      line_start = line_start + 1;
+    }
+
+    if line_start < n && std::runtime::mem::load_u8(buf, line_start) != 35 { // '#'
+      // Match "nameserver" at line start.
+      let lit_ptr: u64 = std::runtime::mem::string_ptr("nameserver");
+      let lit_len: i64 = std::runtime::mem::string_len("nameserver");
+      var ok: bool = true;
+      var j: i64 = 0;
+      while j < lit_len {
+        let pos: i64 = line_start + j;
+        if pos >= n {
+          ok = false;
+          break;
+        }
+        if std::runtime::mem::load_u8(buf, pos) != std::runtime::mem::load_u8(lit_ptr, j) {
+          ok = false;
+          break;
+        }
+        j = j + 1;
+      }
+
+      if ok {
+        var k: i64 = line_start + lit_len;
+        // Skip ws to IP token.
+        while k < n {
+          let b2: u8 = std::runtime::mem::load_u8(buf, k);
+          if b2 != 32 && b2 != 9 { break; }
+          k = k + 1;
+        }
+        let ip_start: i64 = k;
+        while k < n {
+          let b3: u8 = std::runtime::mem::load_u8(buf, k);
+          if b3 == 10 || b3 == 13 || b3 == 32 || b3 == 9 || b3 == 35 {
+            break;
+          }
+          k = k + 1;
+        }
+        let ip_len: i64 = k - ip_start;
+        if ip_len > 0 {
+          let ip_s: string = std::runtime::mem::string_from_ptr_len(buf + (ip_start as u64), ip_len as int);
+          let ip_opt: int? = parse_ipv4_literal_value(ip_s);
+          std::runtime::mem::free(buf);
+          return ip_opt;
+        }
+      }
+    }
+
+    // Advance to next line.
+    while i < n && std::runtime::mem::load_u8(buf, i) != 10 {
+      i = i + 1;
+    }
+    if i < n && std::runtime::mem::load_u8(buf, i) == 10 {
+      i = i + 1;
+    }
+  }
+
+  std::runtime::mem::free(buf);
+  return None;
+}
+
+fn dns_skip_name (msg_ptr: u64, msg_len: i64, start: i64) -> i64? {
+  if msg_ptr == 0 || msg_len <= 0 || start < 0 || start >= msg_len {
+    return None;
+  }
+  var off: i64 = start;
+  while off < msg_len {
+    let b: u8 = std::runtime::mem::load_u8(msg_ptr, off);
+    if b == 0 {
+      return Some(off + 1);
+    }
+    if (b & 192) == 192 { // 0b11xxxxxx
+      if off + 1 >= msg_len {
+        return None;
+      }
+      return Some(off + 2);
+    }
+    let lab_len: i64 = (b & 63) as i64;
+    off = off + 1 + lab_len;
+    if off > msg_len {
+      return None;
+    }
+  }
+  return None;
+}
+
+fn dns_query_a_v4_value (host: string, nameserver_ip_value: int) -> int? {
+  let ns_addr: std::net::SocketAddrV4 = std::net::SocketAddrV4.from_ipv4_value(nameserver_ip_value, 53);
+  let sock_r: std::net::UdpSocketResult = std::net::UdpSocket.connect_v4(ns_addr);
+  if sock_r.is_err() {
+    return None;
+  }
+  let mut sock: std::net::UdpSocket = match (sock_r) { Ok(v) => v, Err(_) => std::net::UdpSocket.invalid() };
+
+  // Best-effort timeout to avoid hanging indefinitely.
+  set_recv_timeout_ms(sock.fd, 2000);
+
+  let msg: u64 = std::runtime::mem::alloc(512);
+  if msg == 0 {
+    sock.close();
+    return None;
+  }
+  let resp: u64 = std::runtime::mem::alloc(512);
+  if resp == 0 {
+    std::runtime::mem::free(msg);
+    sock.close();
+    return None;
+  }
+
+  // Header (12 bytes).
+  let id: int = 0x5300 | ((std::runtime::mem::string_len(host) as int) & 255);
+  store_u16_be(msg, 0, id);
+  store_u16_be(msg, 2, 0x0100); // RD
+  store_u16_be(msg, 4, 1);      // QDCOUNT
+  store_u16_be(msg, 6, 0);      // ANCOUNT
+  store_u16_be(msg, 8, 0);      // NSCOUNT
+  store_u16_be(msg, 10, 0);     // ARCOUNT
+
+  // QNAME.
+  let hp: u64 = std::runtime::mem::string_ptr(host);
+  let hn: i64 = std::runtime::mem::string_len(host);
+  if hp == 0 || hn <= 0 {
+    std::runtime::mem::free(resp);
+    std::runtime::mem::free(msg);
+    sock.close();
+    return None;
+  }
+
+  var off: i64 = 12;
+  var label_start: i64 = 0;
+  var i: i64 = 0;
+  while i <= hn {
+    let end: bool = i == hn;
+    let b: u8 = if !end { std::runtime::mem::load_u8(hp, i) } else { 46 }; // treat end as '.'
+    if end || b == 46 { // '.'
+      let lab_len: i64 = i - label_start;
+      if lab_len <= 0 || lab_len > 63 {
+        std::runtime::mem::free(resp);
+        std::runtime::mem::free(msg);
+        sock.close();
+        return None;
+      }
+      if off + 1 + lab_len >= 512 {
+        std::runtime::mem::free(resp);
+        std::runtime::mem::free(msg);
+        sock.close();
+        return None;
+      }
+      std::runtime::mem::store_u8(msg, off, (lab_len & 63) as u8);
+      off = off + 1;
+      var j: i64 = 0;
+      while j < lab_len {
+        std::runtime::mem::store_u8(msg, off + j, std::runtime::mem::load_u8(hp, label_start + j));
+        j = j + 1;
+      }
+      off = off + lab_len;
+      label_start = i + 1;
+    }
+    i = i + 1;
+  }
+
+  if off + 1 + 4 > 512 {
+    std::runtime::mem::free(resp);
+    std::runtime::mem::free(msg);
+    sock.close();
+    return None;
+  }
+  std::runtime::mem::store_u8(msg, off, 0);
+  off = off + 1;
+
+  // QTYPE=A, QCLASS=IN.
+  store_u16_be(msg, off + 0, 1);
+  store_u16_be(msg, off + 2, 1);
+  off = off + 4;
+
+  let w_r: std::net::NetIntResult = sock.write(std::arrays::ByteSlice{ ptr: msg, len: off });
+  if w_r.is_err() {
+    std::runtime::mem::free(resp);
+    std::runtime::mem::free(msg);
+    sock.close();
+    return None;
+  }
+
+  let r_r: std::net::NetIntResult = sock.read(std::arrays::ByteSlice{ ptr: resp, len: 512 });
+  if r_r.is_err() {
+    std::runtime::mem::free(resp);
+    std::runtime::mem::free(msg);
+    sock.close();
+    return None;
+  }
+  let resp_len: i64 = (std::net::NetIntResult.ok_value(r_r) ?? 0) as i64;
+
+  std::runtime::mem::free(msg);
+  sock.close();
+
+  if resp_len < 12 {
+    std::runtime::mem::free(resp);
+    return None;
+  }
+  if load_u16_be(resp, 0) != id {
+    std::runtime::mem::free(resp);
+    return None;
+  }
+  let flags: int = load_u16_be(resp, 2);
+  if ((flags >> 15) & 1) != 1 {
+    std::runtime::mem::free(resp);
+    return None;
+  }
+  if (flags & 15) != 0 {
+    std::runtime::mem::free(resp);
+    return None;
+  }
+
+  let qd: int = load_u16_be(resp, 4);
+  let an: int = load_u16_be(resp, 6);
+  let ns: int = load_u16_be(resp, 8);
+  let ar: int = load_u16_be(resp, 10);
+
+  var r_off: i64 = 12;
+  var qi: int = 0;
+  while qi < qd {
+    let next_opt: i64? = dns_skip_name(resp, resp_len, r_off);
+    if next_opt == None {
+      std::runtime::mem::free(resp);
+      return None;
+    }
+    r_off = next_opt ?? 0 as i64;
+    if r_off + 4 > resp_len {
+      std::runtime::mem::free(resp);
+      return None;
+    }
+    r_off = r_off + 4;
+    qi = qi + 1;
+  }
+
+  let total_rr: int = an + ns + ar;
+  var rri: int = 0;
+  while rri < total_rr {
+    let next2_opt: i64? = dns_skip_name(resp, resp_len, r_off);
+    if next2_opt == None {
+      std::runtime::mem::free(resp);
+      return None;
+    }
+    r_off = next2_opt ?? 0 as i64;
+    if r_off + 10 > resp_len {
+      std::runtime::mem::free(resp);
+      return None;
+    }
+    let typ: int = load_u16_be(resp, r_off + 0);
+    let cls: int = load_u16_be(resp, r_off + 2);
+    let rdlen: int = load_u16_be(resp, r_off + 8);
+    r_off = r_off + 10;
+    if r_off + (rdlen as i64) > resp_len {
+      std::runtime::mem::free(resp);
+      return None;
+    }
+    if typ == 1 && cls == 1 && rdlen == 4 {
+      let a: int = std::runtime::mem::load_u8(resp, r_off + 0) as int;
+      let b: int = std::runtime::mem::load_u8(resp, r_off + 1) as int;
+      let c: int = std::runtime::mem::load_u8(resp, r_off + 2) as int;
+      let d: int = std::runtime::mem::load_u8(resp, r_off + 3) as int;
+      std::runtime::mem::free(resp);
+      let ip: std::net::Ipv4Addr = std::net::Ipv4Addr.from_octets(a, b, c, d);
+      return Some(ip.value());
+    }
+    r_off = r_off + (rdlen as i64);
+    rri = rri + 1;
+  }
+
+  std::runtime::mem::free(resp);
+  return None;
+}
+
+fn resolve_host_ipv4_value (host: string) -> int? {
+  let lit_opt: int? = parse_ipv4_literal_value(host);
+  if lit_opt != None {
+    return lit_opt;
+  }
+
+  let mut ns_opt: int? = resolv_conf_nameserver_v4_value();
+  if ns_opt == None {
+    ns_opt = parse_ipv4_literal_value("1.1.1.1");
+  }
+  let ns: int = match (ns_opt) { Some(v) => v, None => 0 };
+  if ns == 0 {
+    return None;
+  }
+
+  let ip_opt: int? = dns_query_a_v4_value(host, ns);
+  if ip_opt != None {
+    return ip_opt;
+  }
+
+  // Fallback to 8.8.8.8 if the system resolver didn't respond.
+  let ns2_opt: int? = parse_ipv4_literal_value("8.8.8.8");
+  let ns2: int = match (ns2_opt) { Some(v) => v, None => 0 };
+  if ns2 == 0 || ns2 == ns {
+    return None;
+  }
+  return dns_query_a_v4_value(host, ns2);
+}
+
+fn http_write_request_http10_tcp (stream: &std::net::TcpStream, target: string, host: string) -> bool {
+  let mut req: std::strings::String = std::strings::String.empty();
+  if req.push_string("GET ") != None { req.drop(); return false; }
+  if req.push_string(target) != None { req.drop(); return false; }
+  if req.push_string(" HTTP/1.0\x0D\x0A") != None { req.drop(); return false; }
+  if req.push_string("Host: ") != None { req.drop(); return false; }
+  if req.push_string(host) != None { req.drop(); return false; }
+  if req.push_string("\x0D\x0A") != None { req.drop(); return false; }
+  if req.push_string("Connection: close\x0D\x0A") != None { req.drop(); return false; }
+  if req.push_string("\x0D\x0A") != None { req.drop(); return false; }
+
+  let w_err: std::net::NetFailed? = stream.write_all(std::arrays::ByteSlice{ ptr: req.ptr, len: req.len });
+  req.drop();
+  return w_err == None;
+}
+
+fn http_write_request_http10_tls (sess: &std::tls::Session, target: string, host: string) -> bool {
+  let mut req: std::strings::String = std::strings::String.empty();
+  if req.push_string("GET ") != None { req.drop(); return false; }
+  if req.push_string(target) != None { req.drop(); return false; }
+  if req.push_string(" HTTP/1.0\x0D\x0A") != None { req.drop(); return false; }
+  if req.push_string("Host: ") != None { req.drop(); return false; }
+  if req.push_string(host) != None { req.drop(); return false; }
+  if req.push_string("\x0D\x0A") != None { req.drop(); return false; }
+  if req.push_string("Connection: close\x0D\x0A") != None { req.drop(); return false; }
+  if req.push_string("\x0D\x0A") != None { req.drop(); return false; }
+
+  let w_err: std::tls::TlsFailed? = sess.write_all(std::arrays::ByteSlice{ ptr: req.ptr, len: req.len });
+  req.drop();
+  return w_err == None;
+}
+
+fn tls_set_hostname (sess: &std::tls::Session, hostname: string) -> bool {
+  // Access `std::tls::Session.ssl` directly (current hosted stdlib layout).
+  if sess.ssl == 0 {
+    return false;
+  }
+
+  let p: u64 = std::runtime::mem::string_ptr(hostname);
+  let n: i64 = std::runtime::mem::string_len(hostname);
+  if p == 0 || n <= 0 || n > 1024 {
+    return false;
+  }
+
+  // Reject embedded NULs (API expects a C string).
+  var i: i64 = 0;
+  while i < n {
+    if std::runtime::mem::load_u8(p, i) == 0 {
+      return false;
+    }
+    i = i + 1;
+  }
+
+  // NUL-terminated copy.
+  let cstr: u64 = std::runtime::mem::alloc(n + 1);
+  if cstr == 0 {
+    return false;
+  }
+  i = 0;
+  while i < n {
+    std::runtime::mem::store_u8(cstr, i, std::runtime::mem::load_u8(p, i));
+    i = i + 1;
+  }
+  std::runtime::mem::store_u8(cstr, n, 0);
+
+  let rc: i32 = mbedtls_ssl_set_hostname(sess.ssl, cstr);
+  std::runtime::mem::free(cstr);
+  return rc == 0;
+}
+
+fn tls_handshake_client (sess: &std::tls::Session) -> bool {
+  // Mirror `std::https`'s handshake loop: retry on WOULD_BLOCK.
+  while true {
+    let step_r: std::tls::TlsIntResult = sess.handshake_step();
+    if step_r.is_ok() {
+      return true;
+    }
+    if step_r.is_err() {
+      let err: std::tls::TlsFailed = std::tls::TlsIntResult.err_value(step_r) ?? std::tls::TlsFailed{ code: 0 };
+      let code: int = err.code;
+      if code == std::tls::ERR_WOULD_BLOCK_READ || code == std::tls::ERR_WOULD_BLOCK_WRITE {
+        continue;
+      }
+      return false;
+    }
+  }
+  return false;
+}
+
+fn tmp_template_write (p: u64) -> void {
+  // "/tmp/sageXXXXXX\0"
+  std::runtime::mem::store_u8(p, 0, 47);  // /
+  std::runtime::mem::store_u8(p, 1, 116); // t
+  std::runtime::mem::store_u8(p, 2, 109); // m
+  std::runtime::mem::store_u8(p, 3, 112); // p
+  std::runtime::mem::store_u8(p, 4, 47);  // /
+  std::runtime::mem::store_u8(p, 5, 115); // s
+  std::runtime::mem::store_u8(p, 6, 97);  // a
+  std::runtime::mem::store_u8(p, 7, 103); // g
+  std::runtime::mem::store_u8(p, 8, 101); // e
+  std::runtime::mem::store_u8(p, 9, 88);  // X
+  std::runtime::mem::store_u8(p, 10, 88);
+  std::runtime::mem::store_u8(p, 11, 88);
+  std::runtime::mem::store_u8(p, 12, 88);
+  std::runtime::mem::store_u8(p, 13, 88);
+  std::runtime::mem::store_u8(p, 14, 88);
+  std::runtime::mem::store_u8(p, 15, 0);
+}
+
+fn cstr_len_max (cstr: u64, max: i64) -> i64 {
+  if cstr == 0 || max <= 0 {
+    return 0;
+  }
+  var i: i64 = 0;
+  while i < max {
+    if std::runtime::mem::load_u8(cstr, i) == 0 {
+      return i;
+    }
+    i = i + 1;
+  }
+  return max;
+}
+
+fn map_fd_readonly (fd: int, len: i64) -> MappedFile? {
+  if len <= 0 {
+    let _ = std::runtime::posix::fs::close(fd);
+    return Some(MappedFile{ ptr: 0, len: 0 });
+  }
+
+  let ptr_r = std::runtime::fs::mmap_readonly(fd, len, 0);
+  let _ = std::runtime::posix::fs::close(fd);
+  if ptr_r.is_err() {
+    return None;
+  }
+  let ptr: u64 = match (ptr_r) { Ok(v) => v, Err(_) => 0 };
+  if ptr == 0 {
+    std::runtime::fs::munmap(ptr, len);
+    return None;
+  }
+  return Some(MappedFile{ ptr: ptr, len: len });
+}
+
+fn spool_bytes_to_tmp_map (bytes: string, allow_binary: bool) -> MappedFile? {
+  let data_ptr: u64 = std::runtime::mem::string_ptr(bytes);
+  let data_len: i64 = std::runtime::mem::string_len(bytes);
+  if data_ptr == 0 || data_len < 0 {
+    return None;
+  }
+  if !allow_binary {
+    let scan: i64 = if data_len < 1024 { data_len } else { 1024 };
+    if scan > 0 && memchr(data_ptr, 0, scan) != 0 {
+      return None;
+    }
+  }
+
+  let tmpl: u64 = std::runtime::mem::alloc(16);
+  if tmpl == 0 {
+    return None;
+  }
+  tmp_template_write(tmpl);
+
+  let fd: int = mkstemp(tmpl) as int;
+  if fd < 0 {
+    std::runtime::mem::free(tmpl);
+    return None;
+  }
+
+  let nlen: i64 = cstr_len_max(tmpl, 256);
+  let path: string = std::runtime::mem::string_from_ptr_len(tmpl, nlen as int);
+  let _ = std::runtime::posix::fs::unlink(path);
+  std::runtime::mem::free(tmpl);
+
+  // Write all bytes.
+  var off: i64 = 0;
+  while off < data_len {
+    let w: int = std::runtime::posix::fs::write(fd, data_ptr + (off as u64), data_len - off);
+    if w <= 0 {
+      let _ = std::runtime::posix::fs::close(fd);
+      return None;
+    }
+    off = off + (w as i64);
+  }
+
+  return map_fd_readonly(fd, data_len);
+}
+
+let SCHEME_HTTP: int = 0;
+let SCHEME_HTTPS: int = 1;
+
+struct ParsedUrl {
+  scheme: int,
+  host: string,
+  port: int,
+  target: std::strings::String,
+  host_header: std::strings::String,
+}
+
+fn push_decimal_port (mut out: &std::strings::String, port: int) -> bool {
+  // Decimal u16-ish port.
+  var tmp: u8[8] = [0, 0, 0, 0, 0, 0, 0, 0];
+  var v: int = port;
+  if v < 0 { v = 0; }
+  if v > 65535 { v = 65535; }
+
+  var tlen: i64 = 0;
+  if v == 0 {
+    tmp[0] = 48;
+    tlen = 1;
+  } else {
+    while v > 0 && tlen < 8 {
+      tmp[tlen as int] = (48 + (v % 10)) as u8;
+      v = v / 10;
+      tlen = tlen + 1;
+    }
+    // reverse
+    var i: i64 = 0;
+    while i < (tlen / 2) {
+      let a: u8 = tmp[i as int];
+      tmp[i as int] = tmp[(tlen - 1 - i) as int];
+      tmp[(tlen - 1 - i) as int] = a;
+      i = i + 1;
+    }
+  }
+
+  var j: i64 = 0;
+  while j < tlen {
+    if out.push_u8(tmp[j as int]) != None {
+      return false;
+    }
+    j = j + 1;
+  }
+  return true;
+}
+
+fn parse_http_url (input: string) -> ParsedUrl? {
+  let p: u64 = std::runtime::mem::string_ptr(input);
+  let n: i64 = std::runtime::mem::string_len(input);
+  if p == 0 || n <= 0 {
+    return None;
+  }
+
+  var scheme: int = -1;
+  var off: i64 = 0;
+  if has_prefix_case_insensitive(input, "http://") {
+    scheme = SCHEME_HTTP;
+    off = 7;
+  } else if has_prefix_case_insensitive(input, "https://") {
+    scheme = SCHEME_HTTPS;
+    off = 8;
+  } else {
+    return None;
+  }
+  if off >= n {
+    return None;
+  }
+
+  // authority ends at '/', '?', '#', or end.
+  var auth_end: i64 = off;
+  while auth_end < n {
+    let b: u8 = std::runtime::mem::load_u8(p, auth_end);
+    if b == 47 || b == 63 || b == 35 { // '/','?','#'
+      break;
+    }
+    auth_end = auth_end + 1;
+  }
+  if auth_end <= off {
+    return None;
+  }
+
+  // Strip userinfo (keep substring after last '@').
+  var host_start: i64 = off;
+  var scan: i64 = off;
+  while scan < auth_end {
+    if std::runtime::mem::load_u8(p, scan) == 64 { // '@'
+      host_start = scan + 1;
+    }
+    scan = scan + 1;
+  }
+  if host_start >= auth_end {
+    return None;
+  }
+
+  // Reject IPv6 bracket form for now.
+  if std::runtime::mem::load_u8(p, host_start) == 91 { // '['
+    return None;
+  }
+
+  var port: int = if scheme == SCHEME_HTTPS { 443 } else { 80 };
+  var host_end: i64 = auth_end;
+
+  // Find last ':' in the host:port segment.
+  var colon_pos: i64 = -1;
+  var k: i64 = host_start;
+  while k < auth_end {
+    if std::runtime::mem::load_u8(p, k) == 58 { // ':'
+      colon_pos = k;
+    }
+    k = k + 1;
+  }
+
+  if colon_pos >= 0 {
+    host_end = colon_pos;
+    let port_start: i64 = colon_pos + 1;
+    if port_start >= auth_end {
+      return None;
+    }
+    var pv: int = 0;
+    var m: i64 = port_start;
+    while m < auth_end {
+      let b: u8 = std::runtime::mem::load_u8(p, m);
+      if b < 48 || b > 57 {
+        return None;
+      }
+      pv = pv * 10 + (((b - 48) as int) as int);
+      if pv > 65535 {
+        return None;
+      }
+      m = m + 1;
+    }
+    port = pv;
+  }
+
+  if host_end <= host_start {
+    return None;
+  }
+  let host: string = std::runtime::mem::string_from_ptr_len(p + (host_start as u64), (host_end - host_start) as int);
+
+  // target: path + optional query, excluding fragment.
+  var frag: i64 = auth_end;
+  while frag < n {
+    if std::runtime::mem::load_u8(p, frag) == 35 { // '#'
+      break;
+    }
+    frag = frag + 1;
+  }
+  let target_end: i64 = frag;
+
+  let mut target: std::strings::String = std::strings::String.empty();
+  if auth_end >= n || std::runtime::mem::load_u8(p, auth_end) == 35 {
+    if target.push_string("/") != None { target.drop(); return None; }
+  } else if std::runtime::mem::load_u8(p, auth_end) == 47 { // '/'
+    let sub: string = std::runtime::mem::string_from_ptr_len(p + (auth_end as u64), (target_end - auth_end) as int);
+    if target.push_string(sub) != None { target.drop(); return None; }
+  } else if std::runtime::mem::load_u8(p, auth_end) == 63 { // '?'
+    if target.push_string("/") != None { target.drop(); return None; }
+    let sub2: string = std::runtime::mem::string_from_ptr_len(p + (auth_end as u64), (target_end - auth_end) as int);
+    if target.push_string(sub2) != None { target.drop(); return None; }
+  } else {
+    if target.push_string("/") != None { target.drop(); return None; }
+  }
+
+  // host header: host[:port] if non-default
+  let mut host_header: std::strings::String = std::strings::String.empty();
+  if host_header.push_string(host) != None { target.drop(); host_header.drop(); return None; }
+  let default_port: bool = (scheme == SCHEME_HTTP && port == 80) || (scheme == SCHEME_HTTPS && port == 443);
+  if !default_port {
+    if host_header.push_u8(58) != None { target.drop(); host_header.drop(); return None; }
+    if !push_decimal_port(mut host_header, port) { target.drop(); host_header.drop(); return None; }
+  }
+
+  return Some(ParsedUrl{ scheme: scheme, host: host, port: port, target: target, host_header: host_header });
+}
+
+export fn map_url (input: string, allow_binary: bool) -> MappedFile? {
+  let parts_opt: ParsedUrl? = parse_http_url(input);
+  if parts_opt == None {
+    return None;
+  }
+  let mut parts: ParsedUrl = parts_opt ?? ParsedUrl{
+    scheme: -1,
+    host: "",
+    port: 0,
+    target: std::strings::String.empty(),
+    host_header: std::strings::String.empty(),
+  };
+
+  let ip_opt: int? = resolve_host_ipv4_value(parts.host);
+  if ip_opt == None {
+    parts.target.drop();
+    parts.host_header.drop();
+    return None;
+  }
+  let ip_value: int = match (ip_opt) { Some(v) => v, None => 0 };
+  if ip_value == 0 {
+    parts.target.drop();
+    parts.host_header.drop();
+    return None;
+  }
+
+  let addr: std::net::SocketAddrV4 = std::net::SocketAddrV4.from_ipv4_value(ip_value, parts.port);
+
+  if parts.scheme == SCHEME_HTTP {
+    let stream_r: std::net::TcpStreamResult = std::net::TcpStream.connect(addr);
+    if stream_r.is_err() {
+      parts.target.drop();
+      parts.host_header.drop();
+      return None;
+    }
+    let stream: std::net::TcpStream = match (stream_r) { Ok(v) => v, Err(_) => std::net::TcpStream.invalid() };
+    let mut conn: std::http::Connection = std::http::Connection.from_stream(stream);
+
+    let ok_w: bool = http_write_request_http10_tcp(&conn.stream, parts.target.as_string(), parts.host_header.as_string());
+    if !ok_w {
+      conn.close();
+      parts.target.drop();
+      parts.host_header.drop();
+      return None;
+    }
+
+    let resp_r: std::http::ResponseResult = conn.read_response();
+    if resp_r.is_err() {
+      conn.close();
+      parts.target.drop();
+      parts.host_header.drop();
+      return None;
+    }
+    let mut resp: std::http::Response = match (resp_r) { Ok(v) => v, Err(_) => std::http::Response{ bytes_ptr: 0, bytes_len: 0, bytes_cap: 0, header_end: 0, version_off: 0, version_len: 0, status_code: 0, reason_off: 0, reason_len: 0, body_off: 0, body_len: 0 } };
+
+    if resp.status_code() < 200 || resp.status_code() >= 300 {
+      resp.drop();
+      conn.close();
+      parts.target.drop();
+      parts.host_header.drop();
+      return None;
+    }
+
+    let body: string = resp.body();
+    let mapped_opt: MappedFile? = spool_bytes_to_tmp_map(body, allow_binary);
+    resp.drop();
+    conn.close();
+    parts.target.drop();
+    parts.host_header.drop();
+    return mapped_opt;
+  }
+
+  if parts.scheme == SCHEME_HTTPS {
+    // Manual connect so we can set SNI. `std::https::Connection.connect` takes
+    // only an IP address and cannot set `mbedtls_ssl_set_hostname`, so many
+    // modern servers fail the handshake (including example.com).
+    let stream_r: std::net::TcpStreamResult = std::net::TcpStream.connect(addr);
+    if stream_r.is_err() {
+      parts.target.drop();
+      parts.host_header.drop();
+      return None;
+    }
+    let stream: std::net::TcpStream = match (stream_r) { Ok(v) => v, Err(_) => std::net::TcpStream.invalid() };
+
+    let sess_r: std::tls::SessionResult = std::tls::Session.client();
+    if sess_r.is_err() {
+      let mut s: std::net::TcpStream = stream;
+      let _ = s.close();
+      parts.target.drop();
+      parts.host_header.drop();
+      return None;
+    }
+    let sess: std::tls::Session = match (sess_r) { Ok(v) => v, Err(_) => std::tls::Session.invalid() };
+
+    if !tls_set_hostname(&sess, parts.host) {
+      let mut s: std::net::TcpStream = stream;
+      let _ = s.close();
+      let mut ss: std::tls::Session = sess;
+      ss.drop();
+      parts.target.drop();
+      parts.host_header.drop();
+      return None;
+    }
+
+    sess.set_bio_fd(stream.fd);
+    if !tls_handshake_client(&sess) {
+      let mut s: std::net::TcpStream = stream;
+      let _ = s.close();
+      let mut ss: std::tls::Session = sess;
+      ss.drop();
+      parts.target.drop();
+      parts.host_header.drop();
+      return None;
+    }
+
+    let mut conn2: std::https::Connection = std::https::Connection{
+      stream: stream,
+      session: sess,
+      closed: false,
+      max_header_bytes: std::http::DEFAULT_MAX_HEADER_BYTES,
+      buf_ptr: 0,
+      buf_len: 0,
+      buf_cap: 0,
+    };
+
+    let ok_w2: bool = http_write_request_http10_tls(&conn2.session, parts.target.as_string(), parts.host_header.as_string());
+    if !ok_w2 {
+      conn2.close();
+      parts.target.drop();
+      parts.host_header.drop();
+      return None;
+    }
+
+    let resp_r2: std::http::ResponseResult = conn2.read_response();
+    if resp_r2.is_err() {
+      conn2.close();
+      parts.target.drop();
+      parts.host_header.drop();
+      return None;
+    }
+    let mut resp2: std::http::Response = match (resp_r2) { Ok(v) => v, Err(_) => std::http::Response{ bytes_ptr: 0, bytes_len: 0, bytes_cap: 0, header_end: 0, version_off: 0, version_len: 0, status_code: 0, reason_off: 0, reason_len: 0, body_off: 0, body_len: 0 } };
+
+    if resp2.status_code() < 200 || resp2.status_code() >= 300 {
+      resp2.drop();
+      conn2.close();
+      parts.target.drop();
+      parts.host_header.drop();
+      return None;
+    }
+
+    let body2: string = resp2.body();
+    let mapped_opt2: MappedFile? = spool_bytes_to_tmp_map(body2, allow_binary);
+    resp2.drop();
+    conn2.close();
+    parts.target.drop();
+    parts.host_header.drop();
+    return mapped_opt2;
+  }
+
+  parts.target.drop();
+  parts.host_header.drop();
+  return None;
+}

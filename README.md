@@ -54,11 +54,12 @@ cat <path> | ./build/bin/sage
 - `Shift-Tab` — previous tab
 - `gg` / `Home` — top
 - `G` / `End` — bottom
-- `/` — search (starts searching; jumps to first match when found)
+- `/` / `Ctrl-F` — search (starts searching; jumps to first match when found)
+- `Ctrl-K` — find across open files (Up/Down/Tab/Shift-Tab navigate, Enter/click jumps, Wheel scrolls, Esc closes)
 - `DoubleClick` — set query to clicked word
 - `n` — next match
 - `p` — previous match
-- `:` — command mode (`:<n>` goto line, `:q` quit, `:bn`/`:bp` next/prev tab, `:tab <n>` go to tab `<n>`; tabs are 1-indexed and `0` jumps to the last tab)
+- `:` — command mode (`:<n>` goto line, `:0` top, negative numbers count from end; `:q` quit; `:bn`/`:bp` next/prev tab; `:tab <n>` go to tab `<n>`; tabs are 1-indexed and `0` jumps to the last tab)
 - `L` — toggle line-number gutter
 - `Esc` — cancel search / cancel pending goto / clear selection
 - `?` / `h` — help
@@ -127,8 +128,44 @@ Disable plugins (safe mode): `SAGE_NO_PLUGINS=1`, `--no-plugins`, or `.sagerc` `
 
 Plugin diagnostics are written to `$SAGE_PLUGIN_LOG` (if set), else
 `$XDG_CACHE_HOME/sage/plugins.log`, else `$HOME/.cache/sage/plugins.log`.
+If the log file cannot be opened, diagnostics are suppressed by default; set `SAGE_PLUGIN_LOG_STDERR=1` to force stderr (debug only; may corrupt the TUI).
 
-For robustness, plugin execution is bounded (timeouts + memory/stack limits). If a plugin hits a timeout, `sage` disables plugins for the rest of the session.
+For robustness, plugin execution is bounded (timeouts + memory/stack limits). Each plugin runs in its own QuickJS runtime/context; if a plugin hits a timeout, `sage` disables only that plugin for the rest of the session.
 
-Plugins run in an embedded QuickJS runtime and receive events via a global `sage`
-object. See `examples/plugins/00-log-events.js`.
+Plugins are evaluated as ES modules (ESM), so `import ... from ...` works.
+
+- Built-in modules:
+  - `sage:fs` (read open tabs + plugin data dir; bounded reads/writes)
+  - `sage:path` (minimal POSIX-y path helpers)
+  - `sage:process` (`pid`, `ppid`, `cwd()`, `exec(...)`)
+  - `sage:env` (`get/set/unset`)
+  - `sage:navigator` (browser-like `navigator`)
+  - `sage:performance` (`performance.now()` + `performance.timeOrigin`)
+  - `sage:crypto` (`crypto.getRandomValues(...)` + `crypto.randomUUID()`)
+  - `sage:url` (WHATWG-style `URL` + `URLSearchParams` + `URL.parse`/`URL.canParse`)
+  - `sage:core/dom` (`DOMException` + `structuredClone`)
+  - `sage:core/web` (host-free WHATWG-ish web primitives: `Headers`/`Request`/`Response`/`FormData`/`Blob`/`ReadableStream`/`AbortController`/`AbortSignal`/`TextEncoder`/`TextDecoder`)
+  - `sage:fetch` (WHATWG-ish `fetch` backed by the native host; extra options: `timeoutMs`/`maxBytes`/`followRedirects`)
+- Relative imports are allowed for filesystem modules under the plugin’s directory tree.
+  Bare imports are rejected. Top-level await is not supported.
+
+The JS bootstrap extends `globalThis` (browser-like):
+
+- `EventTarget`, `Event`, `CustomEvent`, `MessageEvent`
+- `addEventListener/removeEventListener/dispatchEvent` (Event objects)
+- `on/once/off` (payload-only helpers: `CustomEvent.detail` / `MessageEvent.data`)
+- `queueMicrotask(fn)`
+- `isSageRuntime` (stable runtime check getter)
+- `DOMException` and `structuredClone`
+- `console` (level-gated by `SAGE_CONSOLE_LEVEL`: `silent|error|warn|info|verbose|debug`)
+- `command(name, fn)` register a custom `:<name>` command (handlers may be async)
+- `exec(cmd)` enqueue a command for the host to execute (`cmd` may include a leading `:`)
+- `navigator` (browser-like object; also available as `sage:navigator`)
+- `performance` (also available as `sage:performance`)
+- `crypto` (also available as `sage:crypto`)
+- `URL`, `URLSearchParams` (WHATWG-style; also available as `sage:url`)
+- `fetch`, `Headers`, `Request`, `Response`, `FormData`, `Blob`, `ReadableStream`, `AbortController`, `AbortSignal`, `TextEncoder`, `TextDecoder`
+
+Host events are delivered as `CustomEvent`s; the payload is in `ev.detail` (or passed directly to `on/once`).
+
+See `examples/plugins/README.md` for a curated set of plugins demonstrating the API and built-in modules.
