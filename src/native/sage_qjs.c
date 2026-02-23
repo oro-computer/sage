@@ -12,6 +12,7 @@
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #ifdef __linux__
@@ -21,9 +22,19 @@
 #include <time.h>
 #include <unistd.h>
 
-#include <curl/curl.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <netinet/in.h>
+
+#include <mbedtls/error.h>
+#include <mbedtls/net_sockets.h>
+#include <mbedtls/ssl.h>
 
 #include "quickjs.h"
+
+// libsodium symbols (already linked via Silk stdlib).
+extern int sodium_init(void);
+extern void randombytes_buf(void *buf, size_t size);
 
 typedef struct SageQjs SageQjs;
 
@@ -65,7 +76,9 @@ typedef struct SageQjsFetch {
   // Request.
   char *req_url;
   char *req_method;
-  struct curl_slist *req_headers;
+  SageQjsHeaderPair *req_headers;
+  size_t req_headers_len;
+  size_t req_headers_cap;
   uint8_t *req_body;
   size_t req_body_len;
   uint32_t timeout_ms;
@@ -90,6 +103,15 @@ typedef struct SageQjsFetch {
   JSValue reject_fn;
 } SageQjsFetch;
 
+typedef struct SageQjsTimer {
+  uint64_t id;
+  uint64_t due_ns;
+  uint64_t interval_ns;
+  JSValue fn;
+  JSValue *args;
+  int argc;
+} SageQjsTimer;
+
 typedef struct SageQjsPlugin {
   SageQjs *host;
   JSRuntime *rt;
@@ -103,6 +125,9 @@ typedef struct SageQjsPlugin {
   SageQjsFetch **fetches;
   size_t fetches_len;
   size_t fetches_cap;
+  SageQjsTimer *timers;
+  size_t timers_len;
+  size_t timers_cap;
   char *fs_data_dir;
   char *path;
   uint32_t load_timeout_ms;
@@ -124,6 +149,7 @@ struct SageQjs {
   size_t plugins_cap;
 
   uint64_t next_fetch_id;
+  uint64_t next_timer_id;
 
   char **exec_cmds;
   size_t exec_cmds_len;
@@ -174,10 +200,12 @@ static JSModuleDef *sage_qjs_module_loader(JSContext *ctx,
 
 static void sage_qjs_proc_free(JSContext *ctx, SageQjsProc *pr);
 static void sage_qjs_fetch_free(JSContext *ctx, SageQjsFetch *f);
+static void sage_qjs_timer_free(JSContext *ctx, SageQjsTimer *t);
 
-static pthread_once_t sage_qjs_curl_once = PTHREAD_ONCE_INIT;
-static void sage_qjs_curl_global_init_once(void) {
-  (void)curl_global_init(CURL_GLOBAL_DEFAULT);
+static pthread_once_t sage_qjs_sodium_once = PTHREAD_ONCE_INIT;
+static int sage_qjs_sodium_init_rc = -1;
+static void sage_qjs_sodium_init_once(void) {
+  sage_qjs_sodium_init_rc = sodium_init();
 }
 
 static uint64_t sage_qjs_now_ns(void) {
@@ -186,6 +214,19 @@ static uint64_t sage_qjs_now_ns(void) {
     return 0;
   }
   return ((uint64_t)ts.tv_sec * 1000000000ull) + (uint64_t)ts.tv_nsec;
+}
+
+static int sage_qjs_unix_now_ms(uint64_t *out_ms) {
+  if (!out_ms) {
+    return -1;
+  }
+  struct timespec ts;
+  if (clock_gettime(CLOCK_REALTIME, &ts) != 0) {
+    return -1;
+  }
+  uint64_t ms = ((uint64_t)ts.tv_sec * 1000ull) + ((uint64_t)ts.tv_nsec / 1000000ull);
+  *out_ms = ms;
+  return 0;
 }
 
 static int sage_qjs_read_fd_all_exact(int fd, uint8_t *buf, size_t len) {
@@ -212,6 +253,15 @@ static int sage_qjs_read_fd_all_exact(int fd, uint8_t *buf, size_t len) {
 static int sage_qjs_random_bytes(uint8_t *buf, size_t len) {
   if (!buf && len != 0) {
     return -1;
+  }
+  if (len == 0) {
+    return 0;
+  }
+
+  pthread_once(&sage_qjs_sodium_once, sage_qjs_sodium_init_once);
+  if (sage_qjs_sodium_init_rc >= 0) {
+    randombytes_buf(buf, len);
+    return 0;
   }
 
   size_t off = 0;
@@ -245,6 +295,20 @@ static int sage_qjs_random_bytes(uint8_t *buf, size_t len) {
   int rc = sage_qjs_read_fd_all_exact(fd, buf + off, len - off);
   close(fd);
   return rc;
+}
+
+static void sage_qjs_uuid_format(char out[37], const uint8_t bytes[16]) {
+  static const char HEX[] = "0123456789abcdef";
+  size_t pos = 0;
+  for (size_t i = 0; i < 16; i++) {
+    if (i == 4 || i == 6 || i == 8 || i == 10) {
+      out[pos++] = '-';
+    }
+    uint8_t b = bytes[i];
+    out[pos++] = HEX[(b >> 4) & 0x0f];
+    out[pos++] = HEX[b & 0x0f];
+  }
+  out[36] = '\0';
 }
 
 static char *sage_qjs_realpath_owned(const char *path) {
@@ -1422,6 +1486,91 @@ static JSValue js_sage_crypto_random_bytes(JSContext *ctx, JSValueConst this_val
   return ab;
 }
 
+static JSValue js_sage_uuid_v4(JSContext *ctx, JSValueConst this_val, int argc,
+                               JSValueConst *argv) {
+  (void)this_val;
+  (void)argc;
+  (void)argv;
+  SageQjsPlugin *p = (SageQjsPlugin *)JS_GetContextOpaque(ctx);
+  SageQjs *q = p ? p->host : NULL;
+  if (!q || q->disabled) {
+    return JS_ThrowInternalError(ctx, "__sage_uuid_v4: plugins disabled");
+  }
+
+  uint8_t b[16];
+  if (sage_qjs_random_bytes(b, sizeof(b)) != 0) {
+    return JS_ThrowInternalError(ctx, "__sage_uuid_v4: failed");
+  }
+
+  // RFC 4122 v4: set version and variant bits.
+  b[6] = (uint8_t)((b[6] & 0x0f) | 0x40);
+  b[8] = (uint8_t)((b[8] & 0x3f) | 0x80);
+
+  char s[37];
+  sage_qjs_uuid_format(s, b);
+  return JS_NewStringLen(ctx, s, 36);
+}
+
+static JSValue js_sage_uuid_v7(JSContext *ctx, JSValueConst this_val, int argc,
+                               JSValueConst *argv) {
+  (void)this_val;
+  SageQjsPlugin *p = (SageQjsPlugin *)JS_GetContextOpaque(ctx);
+  SageQjs *q = p ? p->host : NULL;
+  if (!q || q->disabled) {
+    return JS_ThrowInternalError(ctx, "__sage_uuid_v7: plugins disabled");
+  }
+
+  uint64_t unix_ms = 0;
+  if (argc >= 1 && !JS_IsUndefined(argv[0]) && !JS_IsNull(argv[0])) {
+    int64_t ms64 = 0;
+    if (JS_ToInt64(ctx, &ms64, argv[0]) != 0) {
+      return JS_EXCEPTION;
+    }
+    if (ms64 < 0) {
+      return JS_ThrowRangeError(ctx, "__sage_uuid_v7: unixMs must be >= 0");
+    }
+    unix_ms = (uint64_t)ms64;
+  } else {
+    if (sage_qjs_unix_now_ms(&unix_ms) != 0) {
+      return JS_ThrowInternalError(ctx, "__sage_uuid_v7: clock_gettime failed");
+    }
+  }
+
+  // UUID v7 stores a 48-bit Unix timestamp in milliseconds.
+  if (unix_ms > 0xffffffffffffull) {
+    return JS_ThrowRangeError(ctx, "__sage_uuid_v7: unixMs out of range");
+  }
+
+  uint8_t b[16];
+  b[0] = (uint8_t)((unix_ms >> 40) & 0xff);
+  b[1] = (uint8_t)((unix_ms >> 32) & 0xff);
+  b[2] = (uint8_t)((unix_ms >> 24) & 0xff);
+  b[3] = (uint8_t)((unix_ms >> 16) & 0xff);
+  b[4] = (uint8_t)((unix_ms >> 8) & 0xff);
+  b[5] = (uint8_t)(unix_ms & 0xff);
+
+  uint8_t rand[10];
+  if (sage_qjs_random_bytes(rand, sizeof(rand)) != 0) {
+    return JS_ThrowInternalError(ctx, "__sage_uuid_v7: failed");
+  }
+
+  uint16_t rand_a = (uint16_t)(((uint16_t)rand[0] << 8) | (uint16_t)rand[1]);
+  rand_a &= 0x0fffull;
+
+  // Byte 6: version (7) in high nibble, then high 4 bits of rand_a.
+  b[6] = (uint8_t)(0x70 | ((rand_a >> 8) & 0x0f));
+  // Byte 7: low 8 bits of rand_a.
+  b[7] = (uint8_t)(rand_a & 0xff);
+
+  // Bytes 8..15: rand_b (62 bits) with RFC4122 variant.
+  memcpy(b + 8, rand + 2, 8);
+  b[8] = (uint8_t)((b[8] & 0x3f) | 0x80);
+
+  char s[37];
+  sage_qjs_uuid_format(s, b);
+  return JS_NewStringLen(ctx, s, 36);
+}
+
 static JSValue js_sage_performance_now(JSContext *ctx, JSValueConst this_val,
                                        int argc, JSValueConst *argv) {
   (void)this_val;
@@ -1596,6 +1745,70 @@ static int sage_qjs_plugin_fetches_push(SageQjsPlugin *p, SageQjsFetch *f) {
   return 0;
 }
 
+static int sage_qjs_plugin_timers_push(SageQjsPlugin *p, const SageQjsTimer *src) {
+  if (!p || !src) {
+    return -1;
+  }
+  if (p->timers_len >= p->timers_cap) {
+    size_t new_cap = p->timers_cap ? (p->timers_cap * 2) : 8;
+    SageQjsTimer *new_ptr =
+        (SageQjsTimer *)realloc(p->timers, new_cap * sizeof(SageQjsTimer));
+    if (!new_ptr) {
+      return -1;
+    }
+    p->timers = new_ptr;
+    p->timers_cap = new_cap;
+  }
+  p->timers[p->timers_len++] = *src;
+  return 0;
+}
+
+static void sage_qjs_fetch_req_headers_clear(SageQjsFetch *f) {
+  if (!f || !f->req_headers) {
+    return;
+  }
+  for (size_t i = 0; i < f->req_headers_len; i++) {
+    free(f->req_headers[i].name);
+    free(f->req_headers[i].value);
+    f->req_headers[i].name = NULL;
+    f->req_headers[i].value = NULL;
+  }
+  free(f->req_headers);
+  f->req_headers = NULL;
+  f->req_headers_len = 0;
+  f->req_headers_cap = 0;
+}
+
+static int sage_qjs_fetch_req_headers_push(SageQjsFetch *f, const char *name,
+                                           const char *value) {
+  if (!f || !name || !*name || !value) {
+    return -1;
+  }
+  if (f->req_headers_len >= f->req_headers_cap) {
+    size_t new_cap = f->req_headers_cap ? (f->req_headers_cap * 2) : 16;
+    SageQjsHeaderPair *new_ptr = (SageQjsHeaderPair *)realloc(
+        f->req_headers, new_cap * sizeof(SageQjsHeaderPair));
+    if (!new_ptr) {
+      return -1;
+    }
+    f->req_headers = new_ptr;
+    f->req_headers_cap = new_cap;
+  }
+  char *n = strdup(name);
+  if (!n) {
+    return -1;
+  }
+  char *v = strdup(value);
+  if (!v) {
+    free(n);
+    return -1;
+  }
+  SageQjsHeaderPair *p = &f->req_headers[f->req_headers_len++];
+  p->name = n;
+  p->value = v;
+  return 0;
+}
+
 static void sage_qjs_fetch_headers_clear(SageQjsFetch *f) {
   if (!f || !f->resp_headers) {
     return;
@@ -1662,107 +1875,1319 @@ static char *sage_qjs_trim_ws_inplace(char *s) {
   return s;
 }
 
-static size_t sage_qjs_curl_write_cb(char *ptr, size_t size, size_t nmemb,
-                                     void *userdata) {
-  SageQjsFetch *f = (SageQjsFetch *)userdata;
-  if (!f || !ptr) {
-    return 0;
+// -----------------------------------------------------------------------------
+// HTTP/HTTPS fetch (no libcurl).
+
+#define SAGE_QJS_FETCH_MAX_REDIRECTS 10
+#define SAGE_QJS_FETCH_MAX_HEADER_BYTES (256 * 1024)
+#define SAGE_QJS_IO_WANT_READ (-2)
+#define SAGE_QJS_IO_WANT_WRITE (-3)
+
+typedef struct SageQjsHttpUrl {
+  int scheme; // 0=http, 1=https
+  char *host;
+  int port;
+  char *host_header;
+  char *target;
+} SageQjsHttpUrl;
+
+static void sage_qjs_http_url_free(SageQjsHttpUrl *u) {
+  if (!u) {
+    return;
   }
-  if (atomic_load_explicit(&f->cancelled, memory_order_relaxed)) {
-    return 0;
-  }
-  size_t n = size * nmemb;
-  if (n == 0) {
-    return 0;
-  }
-  if (sage_qjs_proc_buf_append(&f->resp_body, &f->resp_body_len, &f->resp_body_cap,
-                               (const uint8_t *)ptr, n, f->max_bytes,
-                               &f->truncated) != 0) {
-    f->truncated = 1;
-    return 0;
-  }
-  if (f->truncated) {
-    return 0;
-  }
-  return n;
+  free(u->host);
+  u->host = NULL;
+  free(u->host_header);
+  u->host_header = NULL;
+  free(u->target);
+  u->target = NULL;
+  u->scheme = 0;
+  u->port = 0;
 }
 
-static size_t sage_qjs_curl_header_cb(char *buffer, size_t size, size_t nmemb,
-                                      void *userdata) {
-  SageQjsFetch *f = (SageQjsFetch *)userdata;
-  if (!f || !buffer) {
+static int sage_qjs_http_has_prefix_ci(const char *s, const char *prefix) {
+  if (!s || !prefix) {
     return 0;
   }
-  if (atomic_load_explicit(&f->cancelled, memory_order_relaxed)) {
+  for (size_t i = 0; prefix[i]; i++) {
+    unsigned char a = (unsigned char)s[i];
+    unsigned char b = (unsigned char)prefix[i];
+    if (!a) {
+      return 0;
+    }
+    if (sage_qjs_ascii_lower(a) != sage_qjs_ascii_lower(b)) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+static int sage_qjs_http_url_parse(const char *input, SageQjsHttpUrl *out) {
+  if (!input || !out) {
+    return -1;
+  }
+  memset(out, 0, sizeof(*out));
+
+  int scheme = -1;
+  size_t off = 0;
+  if (sage_qjs_http_has_prefix_ci(input, "http://")) {
+    scheme = 0;
+    off = 7;
+  } else if (sage_qjs_http_has_prefix_ci(input, "https://")) {
+    scheme = 1;
+    off = 8;
+  } else {
+    return -1;
+  }
+
+  const char *p = input + off;
+  if (!*p) {
+    return -1;
+  }
+
+  // authority ends at '/', '?', '#', or end.
+  const char *auth_end = p;
+  while (*auth_end && *auth_end != '/' && *auth_end != '?' && *auth_end != '#') {
+    auth_end++;
+  }
+  if (auth_end <= p) {
+    return -1;
+  }
+
+  // Strip userinfo: keep substring after last '@'.
+  const char *host_start = p;
+  for (const char *s = p; s < auth_end; s++) {
+    if (*s == '@') {
+      host_start = s + 1;
+    }
+  }
+  if (host_start >= auth_end) {
+    return -1;
+  }
+
+  // Reject bracketed IPv6 for now (Sage connects via IPv4 today).
+  if (*host_start == '[') {
+    return -1;
+  }
+
+  int port = scheme == 1 ? 443 : 80;
+  const char *host_end = auth_end;
+
+  // Find last ':' in host:port.
+  const char *colon = NULL;
+  for (const char *s = host_start; s < auth_end; s++) {
+    if (*s == ':') {
+      colon = s;
+    }
+  }
+  if (colon) {
+    host_end = colon;
+    const char *port_start = colon + 1;
+    if (port_start >= auth_end) {
+      return -1;
+    }
+    int pv = 0;
+    for (const char *s = port_start; s < auth_end; s++) {
+      if (*s < '0' || *s > '9') {
+        return -1;
+      }
+      pv = (pv * 10) + (*s - '0');
+      if (pv > 65535) {
+        return -1;
+      }
+    }
+    port = pv;
+  }
+  if (host_end <= host_start) {
+    return -1;
+  }
+
+  size_t host_len = (size_t)(host_end - host_start);
+  char *host = (char *)malloc(host_len + 1);
+  if (!host) {
+    return -1;
+  }
+  memcpy(host, host_start, host_len);
+  host[host_len] = '\0';
+
+  // target: path + optional query, excluding fragment.
+  const char *frag = auth_end;
+  while (*frag && *frag != '#') {
+    frag++;
+  }
+  const char *target_end = frag;
+
+  char *target = NULL;
+  if (*auth_end == '\0' || *auth_end == '#') {
+    target = strdup("/");
+  } else if (*auth_end == '/') {
+    size_t n = (size_t)(target_end - auth_end);
+    target = (char *)malloc(n + 1);
+    if (target) {
+      memcpy(target, auth_end, n);
+      target[n] = '\0';
+    }
+  } else if (*auth_end == '?') {
+    // "/?<query>"
+    size_t n = (size_t)(target_end - auth_end);
+    target = (char *)malloc(n + 2);
+    if (target) {
+      target[0] = '/';
+      memcpy(target + 1, auth_end, n);
+      target[n + 1] = '\0';
+    }
+  } else {
+    target = strdup("/");
+  }
+  if (!target) {
+    free(host);
+    return -1;
+  }
+
+  // host header: host[:port] if non-default.
+  int default_port = (scheme == 0 && port == 80) || (scheme == 1 && port == 443);
+  char port_buf[16];
+  port_buf[0] = '\0';
+  if (!default_port) {
+    snprintf(port_buf, sizeof(port_buf), ":%d", port);
+  }
+  size_t host_header_len = host_len + strlen(port_buf);
+  char *host_header = (char *)malloc(host_header_len + 1);
+  if (!host_header) {
+    free(host);
+    free(target);
+    return -1;
+  }
+  memcpy(host_header, host, host_len);
+  memcpy(host_header + host_len, port_buf, strlen(port_buf));
+  host_header[host_header_len] = '\0';
+
+  out->scheme = scheme;
+  out->host = host;
+  out->port = port;
+  out->host_header = host_header;
+  out->target = target;
+  return 0;
+}
+
+static ssize_t sage_qjs_http_find_header_end(const uint8_t *buf, size_t len) {
+  if (!buf || len < 4) {
+    return -1;
+  }
+  for (size_t i = 0; i + 3 < len; i++) {
+    if (buf[i + 0] == '\r' && buf[i + 1] == '\n' && buf[i + 2] == '\r' &&
+        buf[i + 3] == '\n') {
+      return (ssize_t)(i + 4);
+    }
+  }
+  return -1;
+}
+
+static int sage_qjs_poll_deadline(int fd, short events, uint64_t deadline_ns,
+                                  SageQjsFetch *f) {
+  if (fd < 0) {
+    return -1;
+  }
+  while (true) {
+    if (f && atomic_load_explicit(&f->cancelled, memory_order_relaxed)) {
+      return -2;
+    }
+    uint64_t now = sage_qjs_now_ns();
+    if (now == 0) {
+      return -1;
+    }
+    if (now >= deadline_ns) {
+      return -3;
+    }
+    uint64_t rem_ns = deadline_ns - now;
+    int timeout_ms = (int)((rem_ns + 999999ull) / 1000000ull);
+    if (timeout_ms < 0) {
+      timeout_ms = 0;
+    }
+    struct pollfd pfd;
+    memset(&pfd, 0, sizeof(pfd));
+    pfd.fd = fd;
+    pfd.events = events;
+    int rc = poll(&pfd, 1, timeout_ms);
+    if (rc > 0) {
+      return 0;
+    }
+    if (rc == 0) {
+      continue;
+    }
+    if (errno == EINTR) {
+      continue;
+    }
+    return -1;
+  }
+}
+
+static int sage_qjs_tcp_connect_host(const char *host, int port,
+                                     uint64_t deadline_ns, SageQjsFetch *f) {
+  if (!host || !*host || port <= 0 || port > 65535) {
+    return -1;
+  }
+  char port_s[16];
+  snprintf(port_s, sizeof(port_s), "%d", port);
+
+  struct addrinfo hints;
+  memset(&hints, 0, sizeof(hints));
+  hints.ai_socktype = SOCK_STREAM;
+  hints.ai_family = AF_UNSPEC;
+  hints.ai_flags = AI_ADDRCONFIG;
+
+  struct addrinfo *res = NULL;
+  int gai_rc = getaddrinfo(host, port_s, &hints, &res);
+  if (gai_rc != 0) {
+    return -1;
+  }
+
+  int fd = -1;
+  for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
+    if (f && atomic_load_explicit(&f->cancelled, memory_order_relaxed)) {
+      fd = -2;
+      break;
+    }
+    int s = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+    if (s < 0) {
+      continue;
+    }
+    if (sage_qjs_fd_set_nonblock(s) != 0) {
+      close(s);
+      continue;
+    }
+
+    int rc = connect(s, ai->ai_addr, ai->ai_addrlen);
+    if (rc == 0) {
+      fd = s;
+      break;
+    }
+    if (rc != 0 && errno != EINPROGRESS) {
+      close(s);
+      continue;
+    }
+
+    // Wait for connect.
+    uint64_t now = sage_qjs_now_ns();
+    uint64_t connect_deadline = deadline_ns;
+    // Cap connect to ~10s so DNS/connect failures don't burn the whole budget.
+    uint64_t cap = now + (uint64_t)10000ull * 1000000ull;
+    if (connect_deadline > cap) {
+      connect_deadline = cap;
+    }
+    int prc = sage_qjs_poll_deadline(s, POLLOUT, connect_deadline, f);
+    if (prc != 0) {
+      close(s);
+      if (prc == -2) {
+        fd = -2;
+        break;
+      }
+      continue;
+    }
+    int soerr = 0;
+    socklen_t slen = sizeof(soerr);
+    if (getsockopt(s, SOL_SOCKET, SO_ERROR, &soerr, &slen) != 0 || soerr != 0) {
+      close(s);
+      continue;
+    }
+    fd = s;
+    break;
+  }
+
+  freeaddrinfo(res);
+  return fd;
+}
+
+typedef struct SageQjsConn {
+  int fd;
+  int is_tls;
+  mbedtls_ssl_context ssl;
+  mbedtls_ssl_config conf;
+} SageQjsConn;
+
+static void sage_qjs_conn_init(SageQjsConn *c) {
+  if (!c) {
+    return;
+  }
+  memset(c, 0, sizeof(*c));
+  c->fd = -1;
+  c->is_tls = 0;
+  mbedtls_ssl_init(&c->ssl);
+  mbedtls_ssl_config_init(&c->conf);
+}
+
+static void sage_qjs_conn_close(SageQjsConn *c) {
+  if (!c) {
+    return;
+  }
+  if (c->is_tls) {
+    (void)mbedtls_ssl_close_notify(&c->ssl);
+  }
+  mbedtls_ssl_free(&c->ssl);
+  mbedtls_ssl_config_free(&c->conf);
+  c->is_tls = 0;
+  if (c->fd >= 0) {
+    close(c->fd);
+    c->fd = -1;
+  }
+}
+
+static int sage_qjs_mbedtls_rng(void *ctx, unsigned char *buf, size_t len) {
+  (void)ctx;
+  return sage_qjs_random_bytes((uint8_t *)buf, len) == 0 ? 0 : -1;
+}
+
+static int sage_qjs_mbedtls_send(void *ctx, const unsigned char *buf, size_t len) {
+  if (!ctx || !buf) {
+    return MBEDTLS_ERR_NET_SEND_FAILED;
+  }
+  int fd = *(int *)ctx;
+  ssize_t rc = send(fd, buf, len, MSG_NOSIGNAL);
+  if (rc >= 0) {
+    return (int)rc;
+  }
+  if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+    return MBEDTLS_ERR_SSL_WANT_WRITE;
+  }
+  return MBEDTLS_ERR_NET_SEND_FAILED;
+}
+
+static int sage_qjs_mbedtls_recv(void *ctx, unsigned char *buf, size_t len) {
+  if (!ctx || !buf) {
+    return MBEDTLS_ERR_NET_RECV_FAILED;
+  }
+  int fd = *(int *)ctx;
+  ssize_t rc = recv(fd, buf, len, 0);
+  if (rc > 0) {
+    return (int)rc;
+  }
+  if (rc == 0) {
     return 0;
   }
-  size_t n = size * nmemb;
+  if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+    return MBEDTLS_ERR_SSL_WANT_READ;
+  }
+  return MBEDTLS_ERR_NET_RECV_FAILED;
+}
+
+static int sage_qjs_conn_start_tls(SageQjsConn *c, const char *hostname,
+                                  uint64_t deadline_ns, SageQjsFetch *f) {
+  if (!c || c->fd < 0 || !hostname || !*hostname) {
+    return -1;
+  }
+
+  int rc = mbedtls_ssl_config_defaults(
+      &c->conf, MBEDTLS_SSL_IS_CLIENT, MBEDTLS_SSL_TRANSPORT_STREAM,
+      MBEDTLS_SSL_PRESET_DEFAULT);
+  if (rc != 0) {
+    return -1;
+  }
+  mbedtls_ssl_conf_authmode(&c->conf, MBEDTLS_SSL_VERIFY_NONE);
+  mbedtls_ssl_conf_rng(&c->conf, sage_qjs_mbedtls_rng, NULL);
+
+  rc = mbedtls_ssl_setup(&c->ssl, &c->conf);
+  if (rc != 0) {
+    return -1;
+  }
+  (void)mbedtls_ssl_set_hostname(&c->ssl, hostname);
+  mbedtls_ssl_set_bio(&c->ssl, &c->fd, sage_qjs_mbedtls_send, sage_qjs_mbedtls_recv,
+                      NULL);
+
+  while (true) {
+    if (f && atomic_load_explicit(&f->cancelled, memory_order_relaxed)) {
+      return -2;
+    }
+    rc = mbedtls_ssl_handshake(&c->ssl);
+    if (rc == 0) {
+      c->is_tls = 1;
+      return 0;
+    }
+    if (rc == MBEDTLS_ERR_SSL_WANT_READ) {
+      int prc = sage_qjs_poll_deadline(c->fd, POLLIN, deadline_ns, f);
+      if (prc != 0) {
+        return prc == -2 ? -2 : -1;
+      }
+      continue;
+    }
+    if (rc == MBEDTLS_ERR_SSL_WANT_WRITE) {
+      int prc = sage_qjs_poll_deadline(c->fd, POLLOUT, deadline_ns, f);
+      if (prc != 0) {
+        return prc == -2 ? -2 : -1;
+      }
+      continue;
+    }
+    return -1;
+  }
+}
+
+static ssize_t sage_qjs_conn_write(SageQjsConn *c, const uint8_t *buf, size_t len) {
+  if (!c || c->fd < 0 || (!buf && len != 0)) {
+    return -1;
+  }
+  if (len == 0) {
+    return 0;
+  }
+  if (c->is_tls) {
+    int rc = mbedtls_ssl_write(&c->ssl, buf, len);
+    if (rc > 0) {
+      return rc;
+    }
+    if (rc == MBEDTLS_ERR_SSL_WANT_READ) {
+      return SAGE_QJS_IO_WANT_READ;
+    }
+    if (rc == MBEDTLS_ERR_SSL_WANT_WRITE) {
+      return SAGE_QJS_IO_WANT_WRITE;
+    }
+    return -1;
+  }
+
+  ssize_t rc = send(c->fd, buf, len, MSG_NOSIGNAL);
+  if (rc >= 0) {
+    return rc;
+  }
+  if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+    return SAGE_QJS_IO_WANT_WRITE;
+  }
+  return -1;
+}
+
+static ssize_t sage_qjs_conn_read(SageQjsConn *c, uint8_t *buf, size_t len) {
+  if (!c || c->fd < 0 || (!buf && len != 0)) {
+    return -1;
+  }
+  if (len == 0) {
+    return 0;
+  }
+  if (c->is_tls) {
+    int rc = mbedtls_ssl_read(&c->ssl, buf, len);
+    if (rc > 0) {
+      return rc;
+    }
+    if (rc == 0) {
+      return 0;
+    }
+    if (rc == MBEDTLS_ERR_SSL_WANT_READ) {
+      return SAGE_QJS_IO_WANT_READ;
+    }
+    if (rc == MBEDTLS_ERR_SSL_WANT_WRITE) {
+      return SAGE_QJS_IO_WANT_WRITE;
+    }
+    return -1;
+  }
+
+  ssize_t rc = recv(c->fd, buf, len, 0);
+  if (rc >= 0) {
+    return rc;
+  }
+  if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+    return SAGE_QJS_IO_WANT_READ;
+  }
+  return -1;
+}
+
+static int sage_qjs_fetch_req_header_present(SageQjsFetch *f, const char *name) {
+  if (!f || !name || !*name) {
+    return 0;
+  }
+  for (size_t i = 0; i < f->req_headers_len; i++) {
+    const char *k = f->req_headers[i].name;
+    if (k && sage_qjs_streq_ci(k, name)) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int sage_qjs_buf_append_limit(uint8_t **buf, size_t *len, size_t *cap,
+                                     const void *src, size_t n, size_t max_total,
+                                     int *truncated) {
   if (n == 0) {
     return 0;
   }
-  char *line = (char *)malloc(n + 1);
-  if (!line) {
+  return sage_qjs_proc_buf_append(buf, len, cap, (const uint8_t *)src, n, max_total,
+                                  truncated);
+}
+
+static int sage_qjs_buf_append_cstr_limit(uint8_t **buf, size_t *len, size_t *cap,
+                                          const char *s, size_t max_total,
+                                          int *truncated) {
+  if (!s) {
     return 0;
   }
-  memcpy(line, buffer, n);
-  line[n] = '\0';
+  return sage_qjs_buf_append_limit(buf, len, cap, s, strlen(s), max_total, truncated);
+}
 
-  // Strip CRLF.
-  while (n > 0 && (line[n - 1] == '\r' || line[n - 1] == '\n')) {
-    line[n - 1] = '\0';
-    n--;
-  }
-  if (n == 0) {
-    free(line);
-    return size * nmemb;
+static int sage_qjs_buf_append_u64_dec_limit(uint8_t **buf, size_t *len, size_t *cap,
+                                             uint64_t v, size_t max_total,
+                                             int *truncated) {
+  char tmp[32];
+  snprintf(tmp, sizeof(tmp), "%" PRIu64, v);
+  return sage_qjs_buf_append_cstr_limit(buf, len, cap, tmp, max_total, truncated);
+}
+
+static int sage_qjs_http_build_request(SageQjsFetch *f, const SageQjsHttpUrl *u,
+                                       const char *method, const uint8_t *body,
+                                       size_t body_len, uint8_t **out,
+                                       size_t *out_len) {
+  if (!f || !u || !method || !out || !out_len) {
+    return -1;
   }
 
-  // New response block (redirects): clear previously captured headers.
-  if (strncmp(line, "HTTP/", 5) == 0) {
-    sage_qjs_fetch_headers_clear(f);
-    free(f->status_text);
-    f->status_text = NULL;
-    char *sp1 = strchr(line, ' ');
-    if (sp1) {
-      char *sp2 = strchr(sp1 + 1, ' ');
-      if (sp2 && sp2[1]) {
-        char *reason = sage_qjs_trim_ws_inplace(sp2 + 1);
-        if (reason && *reason) {
-          f->status_text = strdup(reason);
+  uint8_t *buf = NULL;
+  size_t len = 0;
+  size_t cap = 0;
+  int truncated = 0;
+  size_t max_total = 1024 * 1024;
+  if (body && body_len > 0) {
+    if (max_total > SIZE_MAX - body_len) {
+      return -1;
+    }
+    max_total += body_len;
+  }
+
+  (void)sage_qjs_buf_append_cstr_limit(&buf, &len, &cap, method, max_total, &truncated);
+  (void)sage_qjs_buf_append_cstr_limit(&buf, &len, &cap, " ", max_total, &truncated);
+  (void)sage_qjs_buf_append_cstr_limit(&buf, &len, &cap, u->target ? u->target : "/", max_total,
+                                       &truncated);
+  (void)sage_qjs_buf_append_cstr_limit(&buf, &len, &cap, " HTTP/1.1\r\n", max_total,
+                                       &truncated);
+
+  // We always send a Host header derived from the request URL.
+  (void)sage_qjs_buf_append_cstr_limit(&buf, &len, &cap, "Host: ", max_total, &truncated);
+  (void)sage_qjs_buf_append_cstr_limit(&buf, &len, &cap, u->host_header ? u->host_header : "",
+                                       max_total, &truncated);
+  (void)sage_qjs_buf_append_cstr_limit(&buf, &len, &cap, "\r\n", max_total, &truncated);
+
+  if (!sage_qjs_fetch_req_header_present(f, "user-agent")) {
+    (void)sage_qjs_buf_append_cstr_limit(&buf, &len, &cap,
+                                         "User-Agent: sage-fetch/0.1\r\n",
+                                         max_total, &truncated);
+  }
+  if (!sage_qjs_fetch_req_header_present(f, "accept")) {
+    (void)sage_qjs_buf_append_cstr_limit(&buf, &len, &cap, "Accept: */*\r\n", max_total,
+                                         &truncated);
+  }
+  if (!sage_qjs_fetch_req_header_present(f, "accept-encoding")) {
+    (void)sage_qjs_buf_append_cstr_limit(&buf, &len, &cap,
+                                         "Accept-Encoding: identity\r\n",
+                                         max_total, &truncated);
+  }
+  if (!sage_qjs_fetch_req_header_present(f, "connection")) {
+    (void)sage_qjs_buf_append_cstr_limit(&buf, &len, &cap, "Connection: close\r\n",
+                                         max_total, &truncated);
+  }
+
+  // User headers (skip hop-by-hop / derived headers).
+  for (size_t i = 0; i < f->req_headers_len; i++) {
+    const char *k = f->req_headers[i].name;
+    const char *v = f->req_headers[i].value ? f->req_headers[i].value : "";
+    if (!k || !*k) {
+      continue;
+    }
+    if (sage_qjs_streq_ci(k, "host") || sage_qjs_streq_ci(k, "content-length")) {
+      continue;
+    }
+    (void)sage_qjs_buf_append_cstr_limit(&buf, &len, &cap, k, max_total, &truncated);
+    (void)sage_qjs_buf_append_cstr_limit(&buf, &len, &cap, ": ", max_total, &truncated);
+    (void)sage_qjs_buf_append_cstr_limit(&buf, &len, &cap, v, max_total, &truncated);
+    (void)sage_qjs_buf_append_cstr_limit(&buf, &len, &cap, "\r\n", max_total, &truncated);
+  }
+
+  if (body && body_len > 0) {
+    (void)sage_qjs_buf_append_cstr_limit(&buf, &len, &cap, "Content-Length: ", max_total,
+                                         &truncated);
+    (void)sage_qjs_buf_append_u64_dec_limit(&buf, &len, &cap, (uint64_t)body_len, max_total,
+                                            &truncated);
+    (void)sage_qjs_buf_append_cstr_limit(&buf, &len, &cap, "\r\n", max_total, &truncated);
+  }
+
+  (void)sage_qjs_buf_append_cstr_limit(&buf, &len, &cap, "\r\n", max_total, &truncated);
+  if (body && body_len > 0) {
+    (void)sage_qjs_buf_append_limit(&buf, &len, &cap, body, body_len, max_total, &truncated);
+  }
+
+  if (truncated || !buf) {
+    free(buf);
+    return -1;
+  }
+
+  *out = buf;
+  *out_len = len;
+  return 0;
+}
+
+static int sage_qjs_http_parse_response_headers(SageQjsFetch *f, const uint8_t *hdr,
+                                                size_t hdr_len, int64_t *out_cl,
+                                                int *out_chunked, char **out_loc) {
+  if (!f || !hdr || hdr_len == 0) {
+    return -1;
+  }
+  if (out_cl) {
+    *out_cl = -1;
+  }
+  if (out_chunked) {
+    *out_chunked = 0;
+  }
+  if (out_loc) {
+    *out_loc = NULL;
+  }
+
+  char *tmp = (char *)malloc(hdr_len + 1);
+  if (!tmp) {
+    return -1;
+  }
+  memcpy(tmp, hdr, hdr_len);
+  tmp[hdr_len] = '\0';
+
+  // Split lines in-place.
+  char *line = tmp;
+  char *eol = strstr(line, "\r\n");
+  if (!eol) {
+    free(tmp);
+    return -1;
+  }
+  *eol = '\0';
+
+  // Status line: HTTP/1.1 200 OK
+  if (strncmp(line, "HTTP/", 5) != 0) {
+    free(tmp);
+    return -1;
+  }
+  char *sp1 = strchr(line, ' ');
+  if (!sp1) {
+    free(tmp);
+    return -1;
+  }
+  while (*sp1 == ' ') sp1++;
+  char *sp2 = strchr(sp1, ' ');
+  char *code_end = sp2 ? sp2 : (sp1 + strlen(sp1));
+  long status = strtol(sp1, &code_end, 10);
+  if (status <= 0) {
+    free(tmp);
+    return -1;
+  }
+  f->status = status;
+  free(f->status_text);
+  f->status_text = NULL;
+  if (sp2 && sp2[1]) {
+    char *reason = sage_qjs_trim_ws_inplace(sp2 + 1);
+    if (reason && *reason) {
+      f->status_text = strdup(reason);
+    }
+  }
+
+  // Headers.
+  char *cur = eol + 2;
+  while (cur < tmp + hdr_len) {
+    char *next = strstr(cur, "\r\n");
+    if (!next) {
+      break;
+    }
+    if (next == cur) {
+      break;
+    }
+    *next = '\0';
+
+    char *colon = strchr(cur, ':');
+    if (colon) {
+      *colon = '\0';
+      char *name = sage_qjs_trim_ws_inplace(cur);
+      char *value = sage_qjs_trim_ws_inplace(colon + 1);
+      if (name && *name) {
+        (void)sage_qjs_fetch_headers_push(f, name, value ? value : "");
+
+        if (out_cl && sage_qjs_streq_ci(name, "content-length")) {
+          char *endp = NULL;
+          long long v = strtoll(value ? value : "", &endp, 10);
+          if (endp && endp != (value ? value : "") && v >= 0) {
+            *out_cl = (int64_t)v;
+          }
+        }
+        if (out_chunked && sage_qjs_streq_ci(name, "transfer-encoding")) {
+          if (value && (strstr(value, "chunked") || strstr(value, "Chunked") ||
+                        strstr(value, "CHUNKED"))) {
+            *out_chunked = 1;
+          }
+        }
+        if (out_loc && !*out_loc && sage_qjs_streq_ci(name, "location")) {
+          if (value && *value) {
+            *out_loc = strdup(value);
+          }
         }
       }
     }
-    free(line);
-    return size * nmemb;
+
+    cur = next + 2;
   }
 
-  char *colon = strchr(line, ':');
-  if (!colon) {
-    free(line);
-    return size * nmemb;
-  }
-  *colon = '\0';
-  char *name = sage_qjs_trim_ws_inplace(line);
-  char *value = sage_qjs_trim_ws_inplace(colon + 1);
-  if (name && *name) {
-    (void)sage_qjs_fetch_headers_push(f, name, value ? value : "");
-  }
-  free(line);
-  return size * nmemb;
+  free(tmp);
+  return 0;
 }
 
-static int sage_qjs_curl_xferinfo(void *clientp, curl_off_t dltotal,
-                                  curl_off_t dlnow, curl_off_t ultotal,
-                                  curl_off_t ulnow) {
-  (void)dltotal;
-  (void)dlnow;
-  (void)ultotal;
-  (void)ulnow;
-  SageQjsFetch *f = (SageQjsFetch *)clientp;
-  if (!f) {
-    return 0;
+static int sage_qjs_conn_write_all(SageQjsConn *c, const uint8_t *buf, size_t len,
+                                  uint64_t deadline_ns, SageQjsFetch *f) {
+  if (!c || (!buf && len != 0)) {
+    return -1;
   }
-  return atomic_load_explicit(&f->cancelled, memory_order_relaxed) ? 1 : 0;
+  size_t off = 0;
+  while (off < len) {
+    if (f && atomic_load_explicit(&f->cancelled, memory_order_relaxed)) {
+      return -2;
+    }
+    ssize_t rc = sage_qjs_conn_write(c, buf + off, len - off);
+    if (rc > 0) {
+      off += (size_t)rc;
+      continue;
+    }
+    if (rc == SAGE_QJS_IO_WANT_READ) {
+      int prc = sage_qjs_poll_deadline(c->fd, POLLIN, deadline_ns, f);
+      if (prc != 0) {
+        return prc == -2 ? -2 : -1;
+      }
+      continue;
+    }
+    if (rc == SAGE_QJS_IO_WANT_WRITE) {
+      int prc = sage_qjs_poll_deadline(c->fd, POLLOUT, deadline_ns, f);
+      if (prc != 0) {
+        return prc == -2 ? -2 : -1;
+      }
+      continue;
+    }
+    return -1;
+  }
+  return 0;
+}
+
+static int sage_qjs_http_read_headers(SageQjsFetch *f, SageQjsConn *c,
+                                      uint64_t deadline_ns, uint8_t **out_buf,
+                                      size_t *out_len, size_t *out_hdr_end) {
+  if (!f || !c || c->fd < 0 || !out_buf || !out_len || !out_hdr_end) {
+    return -1;
+  }
+  *out_buf = NULL;
+  *out_len = 0;
+  *out_hdr_end = 0;
+
+  uint8_t *buf = NULL;
+  size_t len = 0;
+  size_t cap = 0;
+
+  while (true) {
+    if (atomic_load_explicit(&f->cancelled, memory_order_relaxed)) {
+      free(buf);
+      return -2;
+    }
+    ssize_t end = sage_qjs_http_find_header_end(buf, len);
+    if (end >= 0) {
+      *out_buf = buf;
+      *out_len = len;
+      *out_hdr_end = (size_t)end;
+      return 0;
+    }
+    if (len >= SAGE_QJS_FETCH_MAX_HEADER_BYTES) {
+      free(buf);
+      return -1;
+    }
+
+    uint8_t tmp[4096];
+    ssize_t rc = sage_qjs_conn_read(c, tmp, sizeof(tmp));
+    if (rc > 0) {
+      if (sage_qjs_proc_buf_append(&buf, &len, &cap, tmp, (size_t)rc,
+                                   SAGE_QJS_FETCH_MAX_HEADER_BYTES, NULL) != 0) {
+        free(buf);
+        return -1;
+      }
+      continue;
+    }
+    if (rc == 0) {
+      free(buf);
+      return -1;
+    }
+    if (rc == SAGE_QJS_IO_WANT_READ) {
+      int prc = sage_qjs_poll_deadline(c->fd, POLLIN, deadline_ns, f);
+      if (prc != 0) {
+        free(buf);
+        return prc == -2 ? -2 : -1;
+      }
+      continue;
+    }
+    if (rc == SAGE_QJS_IO_WANT_WRITE) {
+      int prc = sage_qjs_poll_deadline(c->fd, POLLOUT, deadline_ns, f);
+      if (prc != 0) {
+        free(buf);
+        return prc == -2 ? -2 : -1;
+      }
+      continue;
+    }
+    free(buf);
+    return -1;
+  }
+}
+
+static int sage_qjs_http_read_body_to_eof(SageQjsFetch *f, SageQjsConn *c,
+                                         uint64_t deadline_ns, const uint8_t *init,
+                                         size_t init_len) {
+  if (init && init_len > 0) {
+    if (sage_qjs_proc_buf_append(&f->resp_body, &f->resp_body_len, &f->resp_body_cap,
+                                 init, init_len, f->max_bytes, &f->truncated) != 0) {
+      f->truncated = 1;
+      return -1;
+    }
+    if (f->truncated) {
+      return -1;
+    }
+  }
+
+  uint8_t tmp[4096];
+  while (true) {
+    if (atomic_load_explicit(&f->cancelled, memory_order_relaxed)) {
+      return -2;
+    }
+    ssize_t rc = sage_qjs_conn_read(c, tmp, sizeof(tmp));
+    if (rc > 0) {
+      if (sage_qjs_proc_buf_append(&f->resp_body, &f->resp_body_len, &f->resp_body_cap,
+                                   tmp, (size_t)rc, f->max_bytes, &f->truncated) != 0) {
+        f->truncated = 1;
+        return -1;
+      }
+      if (f->truncated) {
+        return -1;
+      }
+      continue;
+    }
+    if (rc == 0) {
+      return 0;
+    }
+    if (rc == SAGE_QJS_IO_WANT_READ) {
+      int prc = sage_qjs_poll_deadline(c->fd, POLLIN, deadline_ns, f);
+      if (prc != 0) {
+        return prc == -2 ? -2 : -1;
+      }
+      continue;
+    }
+    if (rc == SAGE_QJS_IO_WANT_WRITE) {
+      int prc = sage_qjs_poll_deadline(c->fd, POLLOUT, deadline_ns, f);
+      if (prc != 0) {
+        return prc == -2 ? -2 : -1;
+      }
+      continue;
+    }
+    return -1;
+  }
+}
+
+static int sage_qjs_http_read_body_len(SageQjsFetch *f, SageQjsConn *c,
+                                      uint64_t deadline_ns, uint64_t want,
+                                      const uint8_t *init, size_t init_len) {
+  uint64_t got = 0;
+  if (init && init_len > 0) {
+    size_t take = init_len;
+    if (take > want) {
+      take = (size_t)want;
+    }
+    if (take > 0) {
+      if (sage_qjs_proc_buf_append(&f->resp_body, &f->resp_body_len, &f->resp_body_cap,
+                                   init, take, f->max_bytes, &f->truncated) != 0) {
+        f->truncated = 1;
+        return -1;
+      }
+      if (f->truncated) {
+        return -1;
+      }
+      got += (uint64_t)take;
+    }
+  }
+
+  uint8_t tmp[4096];
+  while (got < want) {
+    if (atomic_load_explicit(&f->cancelled, memory_order_relaxed)) {
+      return -2;
+    }
+    size_t need = (size_t)(want - got);
+    if (need > sizeof(tmp)) {
+      need = sizeof(tmp);
+    }
+    ssize_t rc = sage_qjs_conn_read(c, tmp, need);
+    if (rc > 0) {
+      if (sage_qjs_proc_buf_append(&f->resp_body, &f->resp_body_len, &f->resp_body_cap,
+                                   tmp, (size_t)rc, f->max_bytes, &f->truncated) != 0) {
+        f->truncated = 1;
+        return -1;
+      }
+      if (f->truncated) {
+        return -1;
+      }
+      got += (uint64_t)rc;
+      continue;
+    }
+    if (rc == 0) {
+      return -1;
+    }
+    if (rc == SAGE_QJS_IO_WANT_READ) {
+      int prc = sage_qjs_poll_deadline(c->fd, POLLIN, deadline_ns, f);
+      if (prc != 0) {
+        return prc == -2 ? -2 : -1;
+      }
+      continue;
+    }
+    if (rc == SAGE_QJS_IO_WANT_WRITE) {
+      int prc = sage_qjs_poll_deadline(c->fd, POLLOUT, deadline_ns, f);
+      if (prc != 0) {
+        return prc == -2 ? -2 : -1;
+      }
+      continue;
+    }
+    return -1;
+  }
+  return 0;
+}
+
+static int sage_qjs_http_chunk_parse_hex(const uint8_t *p, size_t n, uint64_t *out) {
+  if (!p || n == 0 || !out) {
+    return -1;
+  }
+  uint64_t v = 0;
+  int saw_digit = 0;
+  size_t i = 0;
+  while (i < n) {
+    uint8_t c = p[i];
+    if (c == ';' || c == '\r' || c == '\n') {
+      break;
+    }
+    int d = -1;
+    if (c >= '0' && c <= '9') d = (int)(c - '0');
+    else if (c >= 'a' && c <= 'f') d = (int)(c - 'a' + 10);
+    else if (c >= 'A' && c <= 'F') d = (int)(c - 'A' + 10);
+    else return -1;
+    saw_digit = 1;
+    if (v > (UINT64_MAX >> 4)) {
+      return -1;
+    }
+    v = (v << 4) | (uint64_t)d;
+    i++;
+  }
+  if (!saw_digit) {
+    return -1;
+  }
+  *out = v;
+  return 0;
+}
+
+static int sage_qjs_http_read_body_chunked(SageQjsFetch *f, SageQjsConn *c,
+                                          uint64_t deadline_ns, const uint8_t *init,
+                                          size_t init_len) {
+  uint8_t *in = NULL;
+  size_t in_len = 0;
+  size_t in_cap = 0;
+  if (init && init_len > 0) {
+    int truncated = 0;
+    if (sage_qjs_proc_buf_append(&in, &in_len, &in_cap, init, init_len,
+                                 SAGE_QJS_FETCH_MAX_HEADER_BYTES, &truncated) != 0) {
+      free(in);
+      return -1;
+    }
+    if (truncated) {
+      free(in);
+      return -1;
+    }
+  }
+
+  while (true) {
+    if (atomic_load_explicit(&f->cancelled, memory_order_relaxed)) {
+      free(in);
+      return -2;
+    }
+
+    // Ensure we have a chunk size line.
+    size_t line_end = 0;
+    int have_line = 0;
+    for (size_t i = 0; i + 1 < in_len; i++) {
+      if (in[i] == '\r' && in[i + 1] == '\n') {
+        line_end = i;
+        have_line = 1;
+        break;
+      }
+    }
+    if (!have_line) {
+      uint8_t tmp[4096];
+      ssize_t rc = sage_qjs_conn_read(c, tmp, sizeof(tmp));
+      if (rc > 0) {
+        int truncated = 0;
+        if (sage_qjs_proc_buf_append(&in, &in_len, &in_cap, tmp, (size_t)rc,
+                                     SAGE_QJS_FETCH_MAX_HEADER_BYTES,
+                                     &truncated) != 0) {
+          free(in);
+          return -1;
+        }
+        if (truncated) {
+          free(in);
+          return -1;
+        }
+        continue;
+      }
+      if (rc == 0) {
+        free(in);
+        return -1;
+      }
+      if (rc == SAGE_QJS_IO_WANT_READ) {
+        int prc = sage_qjs_poll_deadline(c->fd, POLLIN, deadline_ns, f);
+        if (prc != 0) {
+          free(in);
+          return prc == -2 ? -2 : -1;
+        }
+        continue;
+      }
+      if (rc == SAGE_QJS_IO_WANT_WRITE) {
+        int prc = sage_qjs_poll_deadline(c->fd, POLLOUT, deadline_ns, f);
+        if (prc != 0) {
+          free(in);
+          return prc == -2 ? -2 : -1;
+        }
+        continue;
+      }
+      free(in);
+      return -1;
+    }
+
+    uint64_t chunk_len = 0;
+    if (sage_qjs_http_chunk_parse_hex(in, line_end, &chunk_len) != 0) {
+      free(in);
+      return -1;
+    }
+
+    // Consume "<hex>\r\n"
+    size_t consume = line_end + 2;
+    memmove(in, in + consume, in_len - consume);
+    in_len -= consume;
+
+    if (chunk_len == 0) {
+      // End. Best-effort drain trailers already received (avoid abortive close).
+      // Trailer section ends with CRLFCRLF, but the empty-trailer case is just CRLF.
+      while (true) {
+        if (atomic_load_explicit(&f->cancelled, memory_order_relaxed)) {
+          free(in);
+          return -2;
+        }
+        if (in_len >= 2 && in[0] == '\r' && in[1] == '\n') {
+          memmove(in, in + 2, in_len - 2);
+          in_len -= 2;
+          break;
+        }
+        if (sage_qjs_http_find_header_end(in, in_len) >= 0) {
+          break;
+        }
+        uint8_t tmp[4096];
+        ssize_t rc = sage_qjs_conn_read(c, tmp, sizeof(tmp));
+        if (rc > 0) {
+          int truncated = 0;
+          if (sage_qjs_proc_buf_append(&in, &in_len, &in_cap, tmp, (size_t)rc,
+                                       SAGE_QJS_FETCH_MAX_HEADER_BYTES,
+                                       &truncated) != 0) {
+            break;
+          }
+          if (truncated) {
+            break;
+          }
+          continue;
+        }
+        break;
+      }
+      free(in);
+      return 0;
+    }
+
+    if ((uint64_t)f->resp_body_len > (uint64_t)f->max_bytes ||
+        chunk_len > (uint64_t)f->max_bytes - (uint64_t)f->resp_body_len) {
+      f->truncated = 1;
+      free(in);
+      return -1;
+    }
+
+    // Stream chunk bytes into resp_body without buffering the whole chunk in `in`.
+    uint64_t remaining = chunk_len;
+    if (in_len > 0) {
+      size_t take = in_len;
+      if ((uint64_t)take > remaining) {
+        take = (size_t)remaining;
+      }
+      if (take > 0) {
+        if (sage_qjs_proc_buf_append(&f->resp_body, &f->resp_body_len, &f->resp_body_cap,
+                                     in, take, f->max_bytes,
+                                     &f->truncated) != 0) {
+          f->truncated = 1;
+          free(in);
+          return -1;
+        }
+        if (f->truncated) {
+          free(in);
+          return -1;
+        }
+        memmove(in, in + take, in_len - take);
+        in_len -= take;
+        remaining -= (uint64_t)take;
+      }
+    }
+
+    uint8_t tmp[4096];
+    while (remaining > 0) {
+      if (atomic_load_explicit(&f->cancelled, memory_order_relaxed)) {
+        free(in);
+        return -2;
+      }
+      size_t need = (size_t)remaining;
+      if (need > sizeof(tmp)) {
+        need = sizeof(tmp);
+      }
+      ssize_t rc = sage_qjs_conn_read(c, tmp, need);
+      if (rc > 0) {
+        if (sage_qjs_proc_buf_append(&f->resp_body, &f->resp_body_len, &f->resp_body_cap,
+                                     tmp, (size_t)rc, f->max_bytes,
+                                     &f->truncated) != 0) {
+          f->truncated = 1;
+          free(in);
+          return -1;
+        }
+        if (f->truncated) {
+          free(in);
+          return -1;
+        }
+        remaining -= (uint64_t)rc;
+        continue;
+      }
+      if (rc == 0) {
+        free(in);
+        return -1;
+      }
+      if (rc == SAGE_QJS_IO_WANT_READ) {
+        int prc = sage_qjs_poll_deadline(c->fd, POLLIN, deadline_ns, f);
+        if (prc != 0) {
+          free(in);
+          return prc == -2 ? -2 : -1;
+        }
+        continue;
+      }
+      if (rc == SAGE_QJS_IO_WANT_WRITE) {
+        int prc = sage_qjs_poll_deadline(c->fd, POLLOUT, deadline_ns, f);
+        if (prc != 0) {
+          free(in);
+          return prc == -2 ? -2 : -1;
+        }
+        continue;
+      }
+      free(in);
+      return -1;
+    }
+
+    // Consume trailing CRLF after chunk data.
+    while (in_len < 2) {
+      if (atomic_load_explicit(&f->cancelled, memory_order_relaxed)) {
+        free(in);
+        return -2;
+      }
+      ssize_t rc = sage_qjs_conn_read(c, tmp, sizeof(tmp));
+      if (rc > 0) {
+        int truncated = 0;
+        if (sage_qjs_proc_buf_append(&in, &in_len, &in_cap, tmp, (size_t)rc,
+                                     SAGE_QJS_FETCH_MAX_HEADER_BYTES,
+                                     &truncated) != 0) {
+          free(in);
+          return -1;
+        }
+        if (truncated) {
+          free(in);
+          return -1;
+        }
+        continue;
+      }
+      if (rc == 0) {
+        free(in);
+        return -1;
+      }
+      if (rc == SAGE_QJS_IO_WANT_READ) {
+        int prc = sage_qjs_poll_deadline(c->fd, POLLIN, deadline_ns, f);
+        if (prc != 0) {
+          free(in);
+          return prc == -2 ? -2 : -1;
+        }
+        continue;
+      }
+      if (rc == SAGE_QJS_IO_WANT_WRITE) {
+        int prc = sage_qjs_poll_deadline(c->fd, POLLOUT, deadline_ns, f);
+        if (prc != 0) {
+          free(in);
+          return prc == -2 ? -2 : -1;
+        }
+        continue;
+      }
+      free(in);
+      return -1;
+    }
+
+    if (in[0] != '\r' || in[1] != '\n') {
+      free(in);
+      return -1;
+    }
+    memmove(in, in + 2, in_len - 2);
+    in_len -= 2;
+  }
+}
+
+static char *sage_qjs_http_resolve_location(const SageQjsHttpUrl *base,
+                                            const char *location) {
+  if (!base || !location || !*location) {
+    return NULL;
+  }
+  if (sage_qjs_http_has_prefix_ci(location, "http://") ||
+      sage_qjs_http_has_prefix_ci(location, "https://")) {
+    return strdup(location);
+  }
+  if (location[0] == '/' && location[1] == '/') {
+    const char *scheme = base->scheme == 1 ? "https:" : "http:";
+    size_t n = strlen(scheme) + strlen(location);
+    char *out = (char *)malloc(n + 1);
+    if (!out) {
+      return NULL;
+    }
+    strcpy(out, scheme);
+    strcat(out, location);
+    return out;
+  }
+
+  const char *scheme = base->scheme == 1 ? "https://" : "http://";
+  size_t origin_len = strlen(scheme) + strlen(base->host_header ? base->host_header : "");
+  size_t loc_len = strlen(location);
+
+  if (location[0] == '/') {
+    char *out = (char *)malloc(origin_len + loc_len + 1);
+    if (!out) {
+      return NULL;
+    }
+    strcpy(out, scheme);
+    strcat(out, base->host_header ? base->host_header : "");
+    strcat(out, location);
+    return out;
+  }
+
+  // Relative: resolve against base path directory.
+  const char *t = base->target ? base->target : "/";
+  const char *q = strchr(t, '?');
+  size_t path_len = q ? (size_t)(q - t) : strlen(t);
+  size_t slash = 0;
+  for (size_t i = 0; i < path_len; i++) {
+    if (t[i] == '/') {
+      slash = i;
+    }
+  }
+  size_t dir_len = slash + 1; // include trailing slash
+  char *out = (char *)malloc(origin_len + dir_len + loc_len + 1);
+  if (!out) {
+    return NULL;
+  }
+  strcpy(out, scheme);
+  strcat(out, base->host_header ? base->host_header : "");
+  strncat(out, t, dir_len);
+  strcat(out, location);
+  return out;
 }
 
 static void *sage_qjs_fetch_thread_main(void *opaque) {
@@ -1771,79 +3196,199 @@ static void *sage_qjs_fetch_thread_main(void *opaque) {
     return NULL;
   }
 
-  CURL *curl = curl_easy_init();
-  if (!curl) {
-    f->err = strdup("fetch: curl init failed");
+  uint64_t now = sage_qjs_now_ns();
+  uint64_t deadline_ns =
+      now + ((uint64_t)f->timeout_ms * 1000000ull);
+
+  char *cur_url = f->req_url ? strdup(f->req_url) : NULL;
+  char *method = f->req_method ? strdup(f->req_method) : strdup("GET");
+  if (!cur_url || !method) {
+    free(cur_url);
+    free(method);
+    f->err = strdup("fetch: out of memory");
     atomic_store_explicit(&f->done, 1, memory_order_release);
     return NULL;
   }
 
-  char errbuf[CURL_ERROR_SIZE];
-  errbuf[0] = 0;
+  const uint8_t *body = f->req_body;
+  size_t body_len = f->req_body_len;
 
-  curl_easy_setopt(curl, CURLOPT_URL, f->req_url ? f->req_url : "");
-  const char *method = f->req_method ? f->req_method : "GET";
-  curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, method);
-  curl_easy_setopt(curl, CURLOPT_NOBODY, strcmp(method, "HEAD") == 0 ? 1L : 0L);
-  curl_easy_setopt(curl, CURLOPT_HTTPHEADER, f->req_headers);
-  curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, f->follow_redirects ? 1L : 0L);
-  curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 10L);
-  curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
-  curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-  curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, (long)f->timeout_ms);
-  curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 10000L);
+  for (int redirects = 0; redirects <= SAGE_QJS_FETCH_MAX_REDIRECTS; redirects++) {
+    if (atomic_load_explicit(&f->cancelled, memory_order_relaxed)) {
+      f->err = strdup("fetch: aborted");
+      break;
+    }
 
-  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, sage_qjs_curl_write_cb);
-  curl_easy_setopt(curl, CURLOPT_WRITEDATA, f);
-  curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, sage_qjs_curl_header_cb);
-  curl_easy_setopt(curl, CURLOPT_HEADERDATA, f);
+    SageQjsHttpUrl u;
+    if (sage_qjs_http_url_parse(cur_url, &u) != 0) {
+      f->err = strdup("fetch: invalid url");
+      break;
+    }
 
-  curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
-  curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, sage_qjs_curl_xferinfo);
-  curl_easy_setopt(curl, CURLOPT_XFERINFODATA, f);
-
-  curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errbuf);
-
-  if (f->req_body && f->req_body_len > 0) {
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, f->req_body);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)f->req_body_len);
-  } else {
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, NULL);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, 0L);
-  }
-
-  CURLcode rc = curl_easy_perform(curl);
-  if (atomic_load_explicit(&f->cancelled, memory_order_relaxed)) {
-    f->err = strdup("fetch: aborted");
-  } else if (f->truncated) {
-    f->err = strdup("fetch: response too large");
-  } else if (rc != CURLE_OK) {
-    const char *m = errbuf[0] ? errbuf : curl_easy_strerror(rc);
-    if (m && *m) {
-      size_t need = strlen(m) + 16;
-      char *e = (char *)malloc(need);
-      if (e) {
-        snprintf(e, need, "fetch: %s", m);
-        f->err = e;
+    SageQjsConn c;
+    sage_qjs_conn_init(&c);
+    int fd = sage_qjs_tcp_connect_host(u.host, u.port, deadline_ns, f);
+    if (fd < 0) {
+      sage_qjs_http_url_free(&u);
+      sage_qjs_conn_close(&c);
+      if (fd == -2 || atomic_load_explicit(&f->cancelled, memory_order_relaxed)) {
+        f->err = strdup("fetch: aborted");
       } else {
-        f->err = strdup("fetch: failed");
+        f->err = strdup("fetch: connect failed");
+      }
+      break;
+    }
+    c.fd = fd;
+
+    if (u.scheme == 1) {
+      int trc = sage_qjs_conn_start_tls(&c, u.host, deadline_ns, f);
+      if (trc != 0) {
+        sage_qjs_http_url_free(&u);
+        sage_qjs_conn_close(&c);
+        if (trc == -2 || atomic_load_explicit(&f->cancelled, memory_order_relaxed)) {
+          f->err = strdup("fetch: aborted");
+        } else {
+          f->err = strdup("fetch: tls handshake failed");
+        }
+        break;
+      }
+    }
+
+    uint8_t *req = NULL;
+    size_t req_len = 0;
+    if (sage_qjs_http_build_request(f, &u, method, body, body_len, &req, &req_len) != 0) {
+      sage_qjs_http_url_free(&u);
+      sage_qjs_conn_close(&c);
+      f->err = strdup("fetch: build request failed");
+      break;
+    }
+
+    int wrc = sage_qjs_conn_write_all(&c, req, req_len, deadline_ns, f);
+    free(req);
+    if (wrc != 0) {
+      sage_qjs_http_url_free(&u);
+      sage_qjs_conn_close(&c);
+      if (wrc == -2 || atomic_load_explicit(&f->cancelled, memory_order_relaxed)) {
+        f->err = strdup("fetch: aborted");
+      } else {
+        f->err = strdup("fetch: write failed");
+      }
+      break;
+    }
+
+    uint8_t *hdr_buf = NULL;
+    size_t hdr_len = 0;
+    size_t hdr_end = 0;
+    int hrc = sage_qjs_http_read_headers(f, &c, deadline_ns, &hdr_buf, &hdr_len, &hdr_end);
+    if (hrc != 0) {
+      sage_qjs_http_url_free(&u);
+      sage_qjs_conn_close(&c);
+      free(hdr_buf);
+      if (hrc == -2 || atomic_load_explicit(&f->cancelled, memory_order_relaxed)) {
+        f->err = strdup("fetch: aborted");
+      } else {
+        f->err = strdup("fetch: read headers failed");
+      }
+      break;
+    }
+
+    // Reset per-response captures (redirects produce multiple responses).
+    sage_qjs_fetch_headers_clear(f);
+    free(f->status_text);
+    f->status_text = NULL;
+
+    int64_t content_len = -1;
+    int chunked = 0;
+    char *location = NULL;
+    if (sage_qjs_http_parse_response_headers(f, hdr_buf, hdr_end, &content_len, &chunked,
+                                            &location) != 0) {
+      sage_qjs_http_url_free(&u);
+      sage_qjs_conn_close(&c);
+      free(location);
+      free(hdr_buf);
+      f->err = strdup("fetch: invalid response");
+      break;
+    }
+
+    free(f->effective_url);
+    f->effective_url = strdup(cur_url);
+
+    int is_redirect = 0;
+    if (f->follow_redirects && location &&
+        (f->status == 301 || f->status == 302 || f->status == 303 || f->status == 307 ||
+         f->status == 308) &&
+        redirects < SAGE_QJS_FETCH_MAX_REDIRECTS) {
+      is_redirect = 1;
+    }
+
+    if (is_redirect) {
+      char *next_url = sage_qjs_http_resolve_location(&u, location);
+      free(location);
+      free(hdr_buf);
+      sage_qjs_http_url_free(&u);
+      sage_qjs_conn_close(&c);
+      if (!next_url) {
+        f->err = strdup("fetch: redirect failed");
+        break;
+      }
+
+      // Redirect method handling (common client semantics).
+      if (f->status == 303 ||
+          ((f->status == 301 || f->status == 302) && strcmp(method, "POST") == 0)) {
+        free(method);
+        method = strdup("GET");
+        body = NULL;
+        body_len = 0;
+        if (!method) {
+          free(next_url);
+          f->err = strdup("fetch: out of memory");
+          break;
+        }
+      }
+
+      free(cur_url);
+      cur_url = next_url;
+      continue;
+    }
+
+    // Body.
+    const uint8_t *init = hdr_buf + hdr_end;
+    size_t init_len = hdr_len - hdr_end;
+
+    int brc = 0;
+    if (strcmp(method, "HEAD") == 0 || f->status == 204 || f->status == 304) {
+      brc = 0;
+    } else if (chunked) {
+      brc = sage_qjs_http_read_body_chunked(f, &c, deadline_ns, init, init_len);
+    } else if (content_len >= 0) {
+      if ((uint64_t)content_len > (uint64_t)f->max_bytes) {
+        f->truncated = 1;
+        brc = -1;
+      } else {
+        brc = sage_qjs_http_read_body_len(f, &c, deadline_ns, (uint64_t)content_len, init,
+                                          init_len);
       }
     } else {
+      brc = sage_qjs_http_read_body_to_eof(f, &c, deadline_ns, init, init_len);
+    }
+
+    free(location);
+    free(hdr_buf);
+    sage_qjs_http_url_free(&u);
+    sage_qjs_conn_close(&c);
+
+    if (brc == -2 || atomic_load_explicit(&f->cancelled, memory_order_relaxed)) {
+      f->err = strdup("fetch: aborted");
+    } else if (f->truncated) {
+      f->err = strdup("fetch: response too large");
+    } else if (brc != 0) {
       f->err = strdup("fetch: failed");
     }
+    break;
   }
 
-  long status = 0;
-  (void)curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
-  f->status = status;
-
-  char *eff = NULL;
-  (void)curl_easy_getinfo(curl, CURLINFO_EFFECTIVE_URL, &eff);
-  if (eff && *eff) {
-    f->effective_url = strdup(eff);
-  }
-
-  curl_easy_cleanup(curl);
+  free(cur_url);
+  free(method);
 
   atomic_store_explicit(&f->done, 1, memory_order_release);
   return NULL;
@@ -1886,19 +3431,7 @@ static int sage_qjs_fetch_add_header(SageQjsFetch *f, const char *name,
   if (nlen == 0 || nlen > 1024 || vlen > 8192) {
     return -1;
   }
-  size_t need = nlen + 2 + vlen + 1;
-  char *line = (char *)malloc(need);
-  if (!line) {
-    return -1;
-  }
-  snprintf(line, need, "%s: %s", name, value);
-  struct curl_slist *next = curl_slist_append(f->req_headers, line);
-  free(line);
-  if (!next) {
-    return -1;
-  }
-  f->req_headers = next;
-  return 0;
+  return sage_qjs_fetch_req_headers_push(f, name, value);
 }
 
 static int sage_qjs_fetch_parse_headers(JSContext *ctx, SageQjsFetch *f,
@@ -2064,7 +3597,6 @@ static JSValue js_sage_fetch(JSContext *ctx, JSValueConst this_val, int argc,
     return JS_ThrowInternalError(ctx, "__sage_fetch: plugins disabled");
   }
   SageQjs *q = p->host;
-  pthread_once(&sage_qjs_curl_once, sage_qjs_curl_global_init_once);
 
   if (argc < 1) {
     return JS_ThrowTypeError(ctx, "__sage_fetch(url, [opts])");
@@ -2105,6 +3637,8 @@ static JSValue js_sage_fetch(JSContext *ctx, JSValueConst this_val, int argc,
     return JS_ThrowOutOfMemory(ctx);
   }
   f->req_headers = NULL;
+  f->req_headers_len = 0;
+  f->req_headers_cap = 0;
   f->req_body = NULL;
   f->req_body_len = 0;
   f->timeout_ms = 30000;
@@ -2267,6 +3801,126 @@ static JSValue js_sage_fetch_abort(JSContext *ctx, JSValueConst this_val,
     SageQjsFetch *f = p->fetches[i];
     if (f && f->id == id) {
       atomic_store_explicit(&f->cancelled, 1, memory_order_relaxed);
+      return JS_NewBool(ctx, true);
+    }
+  }
+  return JS_NewBool(ctx, false);
+}
+
+static JSValue js_sage_timer_set(JSContext *ctx, JSValueConst this_val, int argc,
+                                 JSValueConst *argv) {
+  (void)this_val;
+  SageQjsPlugin *p = (SageQjsPlugin *)JS_GetContextOpaque(ctx);
+  SageQjs *q = p ? p->host : NULL;
+  if (!p || !q || p->disabled) {
+    return JS_ThrowInternalError(ctx, "__sage_timer_set: plugins disabled");
+  }
+  if (argc < 2) {
+    return JS_ThrowTypeError(ctx,
+                            "__sage_timer_set(fn, delayMs, [intervalMs], ...args)");
+  }
+  if (!JS_IsFunction(ctx, argv[0])) {
+    return JS_ThrowTypeError(ctx, "__sage_timer_set: fn must be a function");
+  }
+
+  double delay_ms = 0.0;
+  if (argc >= 2 && !JS_IsUndefined(argv[1]) && !JS_IsNull(argv[1])) {
+    if (JS_ToFloat64(ctx, &delay_ms, argv[1]) != 0) {
+      return JS_EXCEPTION;
+    }
+  }
+  if (!(delay_ms >= 0.0)) {
+    delay_ms = 0.0;
+  }
+  if (delay_ms > 2147483647.0) {
+    delay_ms = 2147483647.0;
+  }
+
+  double interval_ms = 0.0;
+  if (argc >= 3 && !JS_IsUndefined(argv[2]) && !JS_IsNull(argv[2])) {
+    if (JS_ToFloat64(ctx, &interval_ms, argv[2]) != 0) {
+      return JS_EXCEPTION;
+    }
+  }
+  if (!(interval_ms >= 0.0)) {
+    interval_ms = 0.0;
+  }
+  if (interval_ms > 2147483647.0) {
+    interval_ms = 2147483647.0;
+  }
+
+  uint64_t now = sage_qjs_now_ns();
+  uint64_t delay_ns = (uint64_t)(delay_ms * 1000000.0);
+  uint64_t interval_ns = (uint64_t)(interval_ms * 1000000.0);
+
+  SageQjsTimer t;
+  memset(&t, 0, sizeof(t));
+  t.id = q->next_timer_id++;
+  if (t.id == 0) {
+    t.id = q->next_timer_id++;
+    if (t.id == 0) {
+      t.id = 1;
+      q->next_timer_id = 2;
+    }
+  }
+
+  if (now != 0 && delay_ns <= (UINT64_MAX - now)) {
+    t.due_ns = now + delay_ns;
+  } else if (now != 0) {
+    t.due_ns = UINT64_MAX;
+  } else {
+    t.due_ns = delay_ns;
+  }
+  t.interval_ns = interval_ns;
+  t.fn = JS_DupValue(ctx, argv[0]);
+  t.args = NULL;
+  t.argc = 0;
+
+  int extra = (argc > 3) ? (argc - 3) : 0;
+  if (extra > 0) {
+    t.args = (JSValue *)malloc((size_t)extra * sizeof(JSValue));
+    if (!t.args) {
+      JS_FreeValue(ctx, t.fn);
+      t.fn = JS_UNDEFINED;
+      return JS_ThrowOutOfMemory(ctx);
+    }
+    t.argc = extra;
+    for (int i = 0; i < extra; i++) {
+      t.args[i] = JS_DupValue(ctx, argv[3 + i]);
+    }
+  }
+
+  if (sage_qjs_plugin_timers_push(p, &t) != 0) {
+    sage_qjs_timer_free(ctx, &t);
+    return JS_ThrowOutOfMemory(ctx);
+  }
+
+  return JS_NewInt64(ctx, (int64_t)t.id);
+}
+
+static JSValue js_sage_timer_clear(JSContext *ctx, JSValueConst this_val, int argc,
+                                   JSValueConst *argv) {
+  (void)this_val;
+  SageQjsPlugin *p = (SageQjsPlugin *)JS_GetContextOpaque(ctx);
+  if (!p || p->disabled) {
+    return JS_NewBool(ctx, false);
+  }
+  if (argc < 1) {
+    return JS_ThrowTypeError(ctx, "__sage_timer_clear(id)");
+  }
+  int64_t id_i64 = 0;
+  if (JS_ToInt64(ctx, &id_i64, argv[0]) != 0 || id_i64 <= 0) {
+    return JS_NewBool(ctx, false);
+  }
+  uint64_t id = (uint64_t)id_i64;
+  for (size_t i = 0; i < p->timers_len; i++) {
+    SageQjsTimer *t = &p->timers[i];
+    if (t->id == id) {
+      sage_qjs_timer_free(ctx, t);
+      if (p->timers_len > 0 && i != (p->timers_len - 1)) {
+        p->timers[i] = p->timers[p->timers_len - 1];
+      }
+      p->timers_len--;
       return JS_NewBool(ctx, true);
     }
   }
@@ -2700,6 +4354,108 @@ static void sage_qjs_plugin_poll_procs(SageQjsPlugin *p) {
     p->procs[w++] = pr;
   }
   p->procs_len = w;
+}
+
+static void sage_qjs_plugin_poll_timers(SageQjsPlugin *p) {
+  if (!p || !p->ctx || p->disabled) {
+    return;
+  }
+  if (!p->timers || p->timers_len == 0) {
+    return;
+  }
+
+  JSContext *ctx = p->ctx;
+  uint64_t now = sage_qjs_now_ns();
+  if (now == 0) {
+    return;
+  }
+
+  size_t i = 0;
+  while (i < p->timers_len) {
+    SageQjsTimer t = p->timers[i];
+    if (t.due_ns != 0 && now < t.due_ns) {
+      i++;
+      continue;
+    }
+
+    JSValue fn = JS_DupValue(ctx, t.fn);
+    int argc = t.argc;
+    JSValue *argv = NULL;
+    if (argc > 0) {
+      argv = (JSValue *)malloc((size_t)argc * sizeof(JSValue));
+      if (!argv) {
+        JS_FreeValue(ctx, fn);
+        sage_qjs_plugin_disable(p, "out of memory in timer callback");
+        return;
+      }
+      for (int j = 0; j < argc; j++) {
+        argv[j] = JS_DupValue(ctx, t.args[j]);
+      }
+    }
+
+    int repeat = (t.interval_ns != 0);
+    if (repeat) {
+      uint64_t next = t.due_ns + t.interval_ns;
+      if (next < t.due_ns || next < now) {
+        if (t.interval_ns <= (UINT64_MAX - now)) {
+          next = now + t.interval_ns;
+        } else {
+          next = UINT64_MAX;
+        }
+      }
+      p->timers[i].due_ns = next;
+      i++;
+    } else {
+      sage_qjs_timer_free(ctx, &p->timers[i]);
+      if (p->timers_len > 0 && i != (p->timers_len - 1)) {
+        p->timers[i] = p->timers[p->timers_len - 1];
+      }
+      p->timers_len--;
+    }
+
+    sage_qjs_begin_budget(p, p->event_timeout_ms);
+    JSValue call_rc = JS_Call(ctx, fn, JS_UNDEFINED, argc, (JSValueConst *)argv);
+    if (p->timed_out) {
+      if (JS_IsException(call_rc)) {
+        sage_qjs_dump_exception(p);
+      }
+      JS_FreeValue(ctx, call_rc);
+      if (argv) {
+        for (int j = 0; j < argc; j++) {
+          JS_FreeValue(ctx, argv[j]);
+        }
+      }
+      free(argv);
+      JS_FreeValue(ctx, fn);
+      sage_qjs_end_budget(p);
+      sage_qjs_plugin_disable(p, "timeout while running timer callback");
+      return;
+    }
+
+    if (JS_IsException(call_rc)) {
+      sage_qjs_dump_exception(p);
+    }
+    JS_FreeValue(ctx, call_rc);
+
+    if (argv) {
+      for (int j = 0; j < argc; j++) {
+        JS_FreeValue(ctx, argv[j]);
+      }
+    }
+    free(argv);
+    JS_FreeValue(ctx, fn);
+
+    sage_qjs_drain_jobs(p);
+    sage_qjs_end_budget(p);
+    if (p->disabled) {
+      return;
+    }
+
+    now = sage_qjs_now_ns();
+    if (now == 0) {
+      return;
+    }
+  }
 }
 
 static size_t sage_qjs_fs_max_bytes(JSContext *ctx, int argc,
@@ -3341,6 +5097,10 @@ static int sage_qjs_define_host_api(SageQjsPlugin *p) {
   JS_SetPropertyStr(ctx, global, "__sage_crypto_random_bytes",
                     JS_NewCFunction(ctx, js_sage_crypto_random_bytes,
                                     "__sage_crypto_random_bytes", 1));
+  JS_SetPropertyStr(ctx, global, "__sage_uuid_v4",
+                    JS_NewCFunction(ctx, js_sage_uuid_v4, "__sage_uuid_v4", 0));
+  JS_SetPropertyStr(ctx, global, "__sage_uuid_v7",
+                    JS_NewCFunction(ctx, js_sage_uuid_v7, "__sage_uuid_v7", 1));
   JS_SetPropertyStr(ctx, global, "__sage_performance_now",
                     JS_NewCFunction(ctx, js_sage_performance_now,
                                     "__sage_performance_now", 0));
@@ -3356,6 +5116,12 @@ static int sage_qjs_define_host_api(SageQjsPlugin *p) {
   JS_SetPropertyStr(ctx, global, "__sage_process_exec",
                     JS_NewCFunction(ctx, js_sage_process_exec,
                                     "__sage_process_exec", 3));
+  JS_SetPropertyStr(ctx, global, "__sage_timer_set",
+                    JS_NewCFunction(ctx, js_sage_timer_set, "__sage_timer_set",
+                                    2));
+  JS_SetPropertyStr(ctx, global, "__sage_timer_clear",
+                    JS_NewCFunction(ctx, js_sage_timer_clear,
+                                    "__sage_timer_clear", 1));
   JS_SetPropertyStr(ctx, global, "__sage_fetch",
                     JS_NewCFunction(ctx, js_sage_fetch, "__sage_fetch", 2));
   JS_SetPropertyStr(ctx, global, "__sage_fetch_abort",
@@ -3404,6 +5170,7 @@ SageQjs *sage_qjs_new(int64_t verbose) {
   q->plugins_len = 0;
   q->plugins_cap = 0;
   q->next_fetch_id = 1;
+  q->next_timer_id = 1;
   q->exec_cmds = NULL;
   q->exec_cmds_len = 0;
   q->exec_cmds_cap = 0;
@@ -3564,8 +5331,7 @@ static void sage_qjs_fetch_free(JSContext *ctx, SageQjsFetch *f) {
     return;
   }
 
-  curl_slist_free_all(f->req_headers);
-  f->req_headers = NULL;
+  sage_qjs_fetch_req_headers_clear(f);
 
   free(f->req_url);
   f->req_url = NULL;
@@ -3603,6 +5369,27 @@ static void sage_qjs_fetch_free(JSContext *ctx, SageQjsFetch *f) {
   free(f);
 }
 
+static void sage_qjs_timer_free(JSContext *ctx, SageQjsTimer *t) {
+  if (!t || !ctx) {
+    return;
+  }
+  if (!JS_IsUndefined(t->fn)) {
+    JS_FreeValue(ctx, t->fn);
+    t->fn = JS_UNDEFINED;
+  }
+  if (t->args && t->argc > 0) {
+    for (int i = 0; i < t->argc; i++) {
+      JS_FreeValue(ctx, t->args[i]);
+    }
+  }
+  free(t->args);
+  t->args = NULL;
+  t->argc = 0;
+  t->id = 0;
+  t->due_ns = 0;
+  t->interval_ns = 0;
+}
+
 static void sage_qjs_plugin_clear_fetches(SageQjsPlugin *p) {
   if (!p || !p->fetches) {
     return;
@@ -3631,6 +5418,20 @@ static void sage_qjs_plugin_clear_fetches(SageQjsPlugin *p) {
   p->fetches_cap = 0;
 }
 
+static void sage_qjs_plugin_clear_timers(SageQjsPlugin *p) {
+  if (!p || !p->timers) {
+    return;
+  }
+  JSContext *ctx = p->ctx;
+  for (size_t i = 0; i < p->timers_len; i++) {
+    sage_qjs_timer_free(ctx, &p->timers[i]);
+  }
+  free(p->timers);
+  p->timers = NULL;
+  p->timers_len = 0;
+  p->timers_cap = 0;
+}
+
 static void sage_qjs_plugin_clear_procs(SageQjsPlugin *p) {
   if (!p || !p->procs) {
     return;
@@ -3651,6 +5452,7 @@ static void sage_qjs_plugin_close(SageQjsPlugin *p) {
   }
 
   sage_qjs_plugin_clear_fetches(p);
+  sage_qjs_plugin_clear_timers(p);
   sage_qjs_plugin_clear_procs(p);
 
   free(p->module_root);
@@ -3730,6 +5532,9 @@ static int sage_qjs_plugin_init_runtime(SageQjsPlugin *p) {
   p->fetches = NULL;
   p->fetches_len = 0;
   p->fetches_cap = 0;
+  p->timers = NULL;
+  p->timers_len = 0;
+  p->timers_cap = 0;
   p->fs_data_dir = NULL;
 
   p->rt = JS_NewRuntime();
@@ -4194,6 +5999,7 @@ int64_t sage_qjs_poll(SageQjs *q) {
     }
     sage_qjs_plugin_poll_procs(p);
     sage_qjs_plugin_poll_fetches(p);
+    sage_qjs_plugin_poll_timers(p);
   }
   return 0;
 }

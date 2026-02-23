@@ -141,7 +141,8 @@ Plugins are evaluated as ES modules (ESM), so `import ... from ...` works.
   - `sage:env` (`get/set/unset`)
   - `sage:navigator` (browser-like `navigator`)
   - `sage:performance` (`performance.now()` + `performance.timeOrigin`)
-  - `sage:crypto` (`crypto.getRandomValues(...)` + `crypto.randomUUID()`)
+  - `sage:crypto` (`crypto.getRandomValues(...)` + `crypto.randomUUID()`; libsodium-backed randomness)
+  - `sage:uuid` (`uuid.v4()` + `uuid.v7([unixMs])`)
   - `sage:url` (WHATWG-style `URL` + `URLSearchParams` + `URL.parse`/`URL.canParse`)
   - `sage:core/dom` (`DOMException` + `structuredClone`)
   - `sage:core/web` (host-free WHATWG-ish web primitives: `Headers`/`Request`/`Response`/`FormData`/`Blob`/`ReadableStream`/`AbortController`/`AbortSignal`/`TextEncoder`/`TextDecoder`)
@@ -155,6 +156,7 @@ The JS bootstrap extends `globalThis` (browser-like):
 - `addEventListener/removeEventListener/dispatchEvent` (Event objects)
 - `on/once/off` (payload-only helpers: `CustomEvent.detail` / `MessageEvent.data`)
 - `queueMicrotask(fn)`
+- `setTimeout/clearTimeout/setInterval/clearInterval` and `sleep(ms)`
 - `isSageRuntime` (stable runtime check getter)
 - `DOMException` and `structuredClone`
 - `console` (level-gated by `SAGE_CONSOLE_LEVEL`: `silent|error|warn|info|verbose|debug`)

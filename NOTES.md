@@ -2,17 +2,20 @@
 
 ## Snapshot (last verified)
 
-- Date: **2026-02-19**
-- `sage`: `f20d95d` (base commit; notes reflect subsequent local edits)
-- `silk`: `440f569` (`silk (ABI) 0.2.0`)
+- Date: **2026-02-23**
+- `sage`: `b440e59` (notes reflect subsequent local edits)
+- `silk`: `940cd78` (`silk (ABI) 0.2.0`)
 - Baseline: linux/glibc x86_64 (hosted POSIX runtime)
 - Verified:
   - `silk test --package .` (20 tests)
   - `silk build --package .` (build module enabled)
+  - `ldd ./build/bin/sage` (no libcurl DT_NEEDED)
   - `./build/bin/sage --index-only http://example.com`
   - `./build/bin/sage --index-only https://example.com`
+  - `./build/bin/sage --index-only https://httpbin.org/stream/5`
+  - `./build/bin/sage --index-only https://httpbin.org/redirect/2`
   - interactive `./build/bin/sage -v --no-alt-screen --no-plugins https://example.com` (quit with `q`)
-  - interactive `SAGE_CONSOLE_LEVEL=debug SAGE_PLUGIN_LOG=/tmp/sage-plugin-smoke.log ./build/bin/sage --no-alt-screen --plugins-dir ./examples/plugins ./NOTES.md` (ran `:fs-demo`, `:url-demo`, `:fetch https://example.com/`, `:fetch-abort https://example.com/`, `:crypto-demo`, quit with `q`)
+  - interactive `SAGE_CONSOLE_LEVEL=debug SAGE_PLUGIN_LOG=/tmp/sage-plugin-smoke.log ./build/bin/sage --no-alt-screen --plugins-dir ./examples/plugins ./NOTES.md` (ran `:fs-demo`, `:url-demo`, `:dom-demo`, `:timers-demo`, `:fetch https://example.com/`, `:fetch https://httpbin.org/stream/5`, `:fetch-abort https://example.com/`, `:uuid-v4`, `:uuid-v7`, `:rand 16`, `:crypto-demo`, `:uuid-demo`, quit with `q`)
 
 ## Architecture
 
@@ -23,14 +26,17 @@
   - Implementation: fetches over TCP/TLS, spools bytes to an **unlinked temp file** (`mkstemp` + `unlink`), then `mmap`s it so the rest of the pager pipeline stays zero-copy.
   - DNS: includes a tiny IPv4 `A` resolver (UDP) that reads the first `nameserver` from `/etc/resolv.conf` and sets a best-effort `SO_RCVTIMEO` (2s). Fallbacks: `1.1.1.1`, then `8.8.8.8`.
   - Limitations (current):
-    - **IPv4-only** (no IPv6 sockets; `std::https` only exposes `connect(SocketAddrV4)` today).
-    - **No `Transfer-Encoding: chunked`** support (blocked by `std::http` / `std::https` response parser rejecting non-`identity` transfer encodings).
-    - **No redirects**, auth, or caching; switching away from a URL tab and back will re-fetch.
+    - **IPv4-only** (no IPv6 sockets; `std::https` uses `SocketAddrV4` today).
+    - `std::http` / `std::https` currently only accept `Transfer-Encoding: identity` (no chunked decoding). To avoid chunked, `sage::netfile` sends `HTTP/1.0` + `Connection: close` and reads the body to EOF.
+    - Redirects: follows `Location` for common 3xx responses (up to 10). Still no auth/caching; switching away from a URL tab and back will re-fetch.
     - HTTPS is currently **unauthenticated** in the stdlib snapshot (`mbedTLS` is configured with `VERIFY_NONE`), so this is transport encryption only.
-    - Ctrl-K find (external grep) **skips network tabs** because the paths are not local files.
-  - SNI note (upstream-relevant): many modern HTTPS servers require **SNI** to complete the handshake. The shipped `std::https::Connection.connect(SocketAddrV4)` API has no way to set a hostname, so `sage` currently calls `mbedtls_ssl_set_hostname()` directly via an `ext` binding (using `std::tls::Session.ssl`) before handshaking. Ideal upstream fix: expose a safe `std::tls::Session.set_hostname()` and plumb hostname through `std::https`.
+  - Ctrl-K find (external grep) **skips network tabs** because the paths are not local files.
+  - TLS hostname (SNI): `sage` uses `std::https::Connection.connect_host(SocketAddrV4, hostname)` (which calls `std::tls::Session.set_hostname(...)`) so modern HTTPS servers handshake correctly without local mbedTLS bindings.
   - Packaging note (upstream-relevant): `std::tls` introduces a runtime DT_NEEDED on `libmbedtls.so.14`. `sage/build.slk` bundles a local `build/lib/libmbedtls.so.14` and sets RUNPATH `$ORIGIN/../lib` so `sage` runs without a system mbedTLS install **when** the legacy runtime’s pinned static archives exist (currently under `../legacy-runtime/build/x86_64-desktop/mbedtls/build/library/`). Also observed: `silk/vendor/deps/mbedtls` is mbedTLS 4.x and does not export the 2.x-era symbols currently bound by `std::tls` (soname 14).
-  - Note (Silk quirk observed): importing `std::url` currently collided with `sage`’s `VecU64` (the compiler resolved `VecU64` as `std::vector::Vector(u64)`), so URL parsing in `sage` is currently a minimal in-module parser instead of using `std::url`.
+  - URL parsing: `sage::netfile` uses the stdlib WHATWG parser via a named import (`from "std/url"`) so we don't pull `std::url`’s internal helper aliases into the local namespace.
+    - Upstream note (Silk `940cd78`): `import std::url;` can still collide with downstream types (example: `sage`’s `VecU64`) because `std::url` defines generic helper aliases like `type VecU64 = std::vector::Vector(u64);`.
+      - Repro: add `import std::url;` anywhere in the `sage` package and build → `error[E2001]: type mismatch` at `src/main.slk:4348` (`VecU64.init(...)` expected `std::vector::Vector(u64)?`).
+      - Workaround: prefer named imports from `"std/url"` (only import what you need), or rename internal aliases in `std/url.slk` to module-specific names.
 - **Viewport model**: scrolling is **byte-offset based** (`top_off`), so `sage`
   can page through extremely large files without building a full line table.
   Scrolling and rendering operate in **visual lines** (wrap-to-viewport), so
@@ -82,16 +88,16 @@
     - Performance: syntax highlighters are cached in a small ring buffer while the modal is open to avoid reloading/compiling grammars on every redraw.
   - Modal controls: Up/Down/Tab/Shift-Tab (or `j/k`), mouse wheel scroll, Enter/click to jump, Esc to close.
 - **Plugins (QuickJS / JavaScript)**:
-	  - **Build**:
-	    - `silk.toml` opts in to a build module (`build.slk`) which:
-	      - generates `build/gen/plugins_bootstrap.slk` from `src/sage/plugins/bootstrap.js` (embedded JS bootstrap), and
-	      - generates `build/gen/plugins_api_modules.slk` from `src/sage/plugins/api/**` (embedded `sage:*` ESM sources; no JS sources live in C), and
-	      - emits a manifest that compiles QuickJS into the `sage` executable via `[[target]].inputs` (`quickjs/*.c` + `src/native/sage_qjs.c`).
-	    - `sage:fetch` is backed by libcurl in the native host, so the `sage` executable declares DT_NEEDED on `libcurl.so.4` (and `libpthread.so.0`).
-	    - Note (current subset limitation): the generated bootstrap exports a `fn plugins_bootstrap_js() -> string` instead of an exported module-level `string` binding.
-	    - Note (build-module subset quirks observed):
-	      - `match` on `Result` should use unqualified `Ok(...)` / `Err(...)` patterns (qualified variant paths were rejected in this snapshot).
-	      - Calling `.drop()` requires a `let mut` local binding (since `drop` takes a mutable receiver).
+		  - **Build**:
+		    - `silk.toml` opts in to a build module (`build.slk`) which:
+		      - generates `build/gen/plugins_bootstrap.slk` from `src/sage/plugins/bootstrap.js` (embedded JS bootstrap), and
+		      - generates `build/gen/plugins_api_modules.slk` from `src/sage/plugins/api/**` (embedded `sage:*` ESM sources; no JS sources live in C), and
+		      - emits a manifest that compiles QuickJS into the `sage` executable via `[[target]].inputs` (`quickjs/*.c` + `src/native/sage_qjs.c`).
+		    - `sage:fetch` is backed by the native host HTTP/HTTPS client (sockets + mbedTLS), so the `sage` executable does **not** depend on libcurl (still DT_NEEDED on `libpthread.so.0` + `libmbedtls.so.14`).
+		    - Note (current subset limitation): the generated bootstrap exports a `fn plugins_bootstrap_js() -> string` instead of an exported module-level `string` binding.
+		    - Note (build-module subset quirks observed):
+		      - `match` on `Result` should use unqualified `Ok(...)` / `Err(...)` patterns (qualified variant paths were rejected in this snapshot).
+		      - Calling `.drop()` requires a `let mut` local binding (since `drop` takes a mutable receiver).
 	  - **Runtime plugin discovery**:
 	    - Plugins are initialized only in the interactive TUI path (when stdout is a TTY). In pass-through mode (`stdout_tty=false`), `sage` returns early and does not run plugins.
 	    - Disable plugins (safe mode): `SAGE_NO_PLUGINS=1`, `--no-plugins`, or `.sagerc` `plugins = false`.
@@ -120,16 +126,17 @@
     - `SAGE_PLUGIN_LOG_STDERR=1` forces plugin logs to stderr (debug only; may corrupt the TUI).
   - **JS API surface**:
     - Plugins are evaluated as ES modules (ESM) with a custom module resolver:
-      - Built-in modules: `sage:fs`, `sage:path`, `sage:process`, `sage:env`, `sage:navigator`, `sage:performance`, `sage:crypto`, `sage:url`, `sage:core/dom`, `sage:core/web`, `sage:fetch`
+      - Built-in modules: `sage:fs`, `sage:path`, `sage:process`, `sage:env`, `sage:navigator`, `sage:performance`, `sage:crypto`, `sage:uuid`, `sage:url`, `sage:core/dom`, `sage:core/web`, `sage:fetch`
       - Relative imports are allowed for filesystem modules under the plugin’s directory tree.
         Bare imports are rejected. Top-level await is not supported.
 	    - The embedded bootstrap extends `globalThis` (instead of a `sage` object):
 	      - `EventTarget`, `Event`, `CustomEvent`, `MessageEvent` are global.
 	      - `isSageRuntime` is a stable runtime check getter.
-        - `queueMicrotask(fn)` is available.
-	      - Event helpers:
-	        - `addEventListener/removeEventListener/dispatchEvent` receive Event objects (host events are `CustomEvent`s; payload is in `ev.detail`).
-	        - `on/once/off` call `fn(payload)` where payload is `CustomEvent.detail` or `MessageEvent.data`.
+	        - `queueMicrotask(fn)` is available.
+	        - `setTimeout/clearTimeout/setInterval/clearInterval` and `sleep(ms)` are available.
+		      - Event helpers:
+		        - `addEventListener/removeEventListener/dispatchEvent` receive Event objects (host events are `CustomEvent`s; payload is in `ev.detail`).
+		        - `on/once/off` call `fn(payload)` where payload is `CustomEvent.detail` or `MessageEvent.data`.
       - `console` has `log`, `debug`, `verbose`, `info`, `warn`, `error` filtered by `SAGE_CONSOLE_LEVEL`
         (`silent|off` disables; default is `warn` unless `--verbose` → `debug`).
       - `command(name, fn)` registers a custom `:<name>` command (async ok).
@@ -149,13 +156,16 @@
       - `sage:path`: minimal POSIX-y path helpers
       - `sage:navigator`: browser-like `navigator` (`userAgent`, versions)
       - `sage:performance`: `performance.now()` (monotonic) + `performance.timeOrigin`
-      - `sage:crypto`: `crypto.getRandomValues(...)` + `crypto.randomUUID()`
+      - `sage:crypto`: `crypto.getRandomValues(...)` + `crypto.randomUUID()` (libsodium-backed randomness)
+      - `sage:uuid`: `v4()` + `v7([unixMs])` (v7 is time-ordered; matches RFC 9562 layout)
 	      - `sage:url`: WHATWG-style `URL` + `URLSearchParams` + `URL.parse`/`URL.canParse`
 	        - Implementation note (upstream-relevant): `sage:url` is a pure-JS URL Standard implementation focused on correctness for common cases and Node/WHATWG compatibility. It supports special-scheme parsing (including IPv4 canonicalization). Known gaps: no full TR46/IDNA mapping (punycode encode only) and no IPv6 parsing/normalization beyond bracketed literals.
 	      - `sage:core/dom`: DOM-ish host-free primitives (`DOMException`, `structuredClone`)
 	      - `sage:core/web`: host-free WHATWG-ish web primitives (`Headers`/`Request`/`Response`/`FormData`/`Blob`/`ReadableStream`/`AbortController`/`AbortSignal` + `TextEncoder`/`TextDecoder`)
 	      - `sage:fetch`: WHATWG-ish `fetch(...)` backed by the native host (plus `timeoutMs`/`maxBytes`/`followRedirects` options)
-	    - Known JS runtime gaps (current): no timers (`setTimeout`/`setInterval`), no `crypto.subtle` yet.
+	        - Native host transport supports `Content-Length`, `Transfer-Encoding: chunked`, and body-to-EOF responses; `maxBytes` is enforced for all paths.
+	        - TLS verification is currently disabled (`VERIFY_NONE`) in the host fetch transport (transport encryption only).
+	    - Known JS runtime gaps (current): no `crypto.subtle` yet.
     - Plugins run without QuickJS `std`/`os` modules linked in the current host.
     - Events currently emitted by the host:
       - `open`: `{ path, tab, tab_count }` (tabs are 1-indexed in events)

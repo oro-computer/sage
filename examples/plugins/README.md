@@ -52,8 +52,9 @@ Plugins are evaluated as ES modules and can import:
 - `sage:navigator`: browser-like `navigator` instance (`userAgent`, versions).
 - `sage:performance`: `performance.now()` + `performance.timeOrigin`.
   - The bootstrap also installs `performance` on `globalThis`.
-- `sage:crypto`: `crypto.getRandomValues(...)` + `crypto.randomUUID()`.
+- `sage:crypto`: `crypto.getRandomValues(...)` + `crypto.randomUUID()` (libsodium-backed randomness).
   - The bootstrap also installs `crypto` on `globalThis`.
+- `sage:uuid`: UUID helpers: `v4()` and `v7([unixMs])`.
 - `sage:url`: WHATWG-style `URL` + `URLSearchParams` + `URL.parse`/`URL.canParse`.
   - The bootstrap also installs `URL` and `URLSearchParams` on `globalThis`.
 - `sage:core/dom`: `DOMException` + `structuredClone`.
@@ -80,3 +81,5 @@ Plugins are evaluated as ES modules and can import:
 - `81-url.js`: demonstrates WHATWG-style `URL` + `URLSearchParams` (`sage:url`) (parse + relative resolution + query editing).
 - `82-crypto.js`: demonstrates `crypto.getRandomValues` + `crypto.randomUUID` and `performance.now` (`sage:crypto` / `sage:performance`).
 - `83-dom.js`: demonstrates `DOMException` + `structuredClone` (`sage:core/dom`).
+- `84-timers.js`: demonstrates `setTimeout`/`setInterval` + `sleep(ms)` (global).
+- `85-uuid.js`: demonstrates UUID v4/v7 helpers (`sage:uuid`).

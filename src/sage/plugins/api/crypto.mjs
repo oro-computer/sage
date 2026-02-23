@@ -2,6 +2,7 @@ import { requireHostFunction } from 'sage:internal/host'
 import { defineGlobal } from 'sage:core/global'
 
 const randomBytesHost = requireHostFunction('__sage_crypto_random_bytes')
+const uuidV4Host = requireHostFunction('__sage_uuid_v4')
 
 function isTypedArray(v) {
   return (
@@ -30,10 +31,6 @@ function quotaExceededError(bytes) {
   return e
 }
 
-function hex2(b) {
-  return (b + 0x100).toString(16).slice(1)
-}
-
 export class Crypto {
   constructor() {
     // No state.
@@ -60,33 +57,7 @@ export class Crypto {
   }
 
   randomUUID() {
-    const b = new Uint8Array(16)
-    this.getRandomValues(b)
-    // RFC 4122 v4: set version and variant bits.
-    b[6] = (b[6] & 0x0f) | 0x40
-    b[8] = (b[8] & 0x3f) | 0x80
-    return (
-      hex2(b[0]) +
-      hex2(b[1]) +
-      hex2(b[2]) +
-      hex2(b[3]) +
-      '-' +
-      hex2(b[4]) +
-      hex2(b[5]) +
-      '-' +
-      hex2(b[6]) +
-      hex2(b[7]) +
-      '-' +
-      hex2(b[8]) +
-      hex2(b[9]) +
-      '-' +
-      hex2(b[10]) +
-      hex2(b[11]) +
-      hex2(b[12]) +
-      hex2(b[13]) +
-      hex2(b[14]) +
-      hex2(b[15])
-    )
+    return String(uuidV4Host())
   }
 }
 

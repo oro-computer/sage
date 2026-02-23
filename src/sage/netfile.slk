@@ -10,13 +10,11 @@ import std::runtime::posix::fs;
 import std::runtime::posix::net;
 import std::strings;
 import std::tls;
+import { URL as StdURL, parse_with_base as url_parse_with_base } from "std/url";
 import { memchr, mkstemp } from "./os.slk";
 import { MappedFile } from "./file.slk";
 
 let SO_RCVTIMEO: int = 20; // linux: SO_RCVTIMEO
-
-// mbedTLS SNI API (not currently exposed by `std::tls` in the shipped stdlib).
-ext mbedtls_ssl_set_hostname = fn (u64, u64) -> i32;
 
 fn ascii_lower (b: u8) -> u8 {
   if b >= 65 && b <= 90 {
@@ -492,63 +490,6 @@ fn http_write_request_http10_tls (sess: &std::tls::Session, target: string, host
   return w_err == None;
 }
 
-fn tls_set_hostname (sess: &std::tls::Session, hostname: string) -> bool {
-  // Access `std::tls::Session.ssl` directly (current hosted stdlib layout).
-  if sess.ssl == 0 {
-    return false;
-  }
-
-  let p: u64 = std::runtime::mem::string_ptr(hostname);
-  let n: i64 = std::runtime::mem::string_len(hostname);
-  if p == 0 || n <= 0 || n > 1024 {
-    return false;
-  }
-
-  // Reject embedded NULs (API expects a C string).
-  var i: i64 = 0;
-  while i < n {
-    if std::runtime::mem::load_u8(p, i) == 0 {
-      return false;
-    }
-    i = i + 1;
-  }
-
-  // NUL-terminated copy.
-  let cstr: u64 = std::runtime::mem::alloc(n + 1);
-  if cstr == 0 {
-    return false;
-  }
-  i = 0;
-  while i < n {
-    std::runtime::mem::store_u8(cstr, i, std::runtime::mem::load_u8(p, i));
-    i = i + 1;
-  }
-  std::runtime::mem::store_u8(cstr, n, 0);
-
-  let rc: i32 = mbedtls_ssl_set_hostname(sess.ssl, cstr);
-  std::runtime::mem::free(cstr);
-  return rc == 0;
-}
-
-fn tls_handshake_client (sess: &std::tls::Session) -> bool {
-  // Mirror `std::https`'s handshake loop: retry on WOULD_BLOCK.
-  while true {
-    let step_r: std::tls::TlsIntResult = sess.handshake_step();
-    if step_r.is_ok() {
-      return true;
-    }
-    if step_r.is_err() {
-      let err: std::tls::TlsFailed = std::tls::TlsIntResult.err_value(step_r) ?? std::tls::TlsFailed{ code: 0 };
-      let code: int = err.code;
-      if code == std::tls::ERR_WOULD_BLOCK_READ || code == std::tls::ERR_WOULD_BLOCK_WRITE {
-        continue;
-      }
-      return false;
-    }
-  }
-  return false;
-}
-
 fn tmp_template_write (p: u64) -> void {
   // "/tmp/sageXXXXXX\0"
   std::runtime::mem::store_u8(p, 0, 47);  // /
@@ -651,10 +592,24 @@ let SCHEME_HTTPS: int = 1;
 
 struct ParsedUrl {
   scheme: int,
-  host: string,
+  host: std::strings::String,
   port: int,
   target: std::strings::String,
   host_header: std::strings::String,
+}
+
+fn parsed_url_drop (mut p: &ParsedUrl) -> void {
+  let mut host: std::strings::String = p.host;
+  host.drop();
+  p.host = host;
+
+  let mut target: std::strings::String = p.target;
+  target.drop();
+  p.target = target;
+
+  let mut host_header: std::strings::String = p.host_header;
+  host_header.drop();
+  p.host_header = host_header;
 }
 
 fn push_decimal_port (mut out: &std::strings::String, port: int) -> bool {
@@ -695,294 +650,315 @@ fn push_decimal_port (mut out: &std::strings::String, port: int) -> bool {
 }
 
 fn parse_http_url (input: string) -> ParsedUrl? {
-  let p: u64 = std::runtime::mem::string_ptr(input);
-  let n: i64 = std::runtime::mem::string_len(input);
-  if p == 0 || n <= 0 {
+  // Parse using the stdlib WHATWG URL implementation.
+  //
+  // NOTE: we intentionally use a named import (`from "std/url"`) instead of
+  // `import std::url;` to avoid importing internal helper aliases like `VecU64`
+  // into the local namespace.
+  let url_r = StdURL.parse(input);
+  if url_r.is_err() {
     return None;
   }
+  let mut url: StdURL = match (url_r) {
+    Ok(v) => v,
+    Err(_) => StdURL.empty(),
+  };
 
+  let scheme_s: string = url.scheme();
   var scheme: int = -1;
-  var off: i64 = 0;
-  if has_prefix_case_insensitive(input, "http://") {
+  if scheme_s == "http" {
     scheme = SCHEME_HTTP;
-    off = 7;
-  } else if has_prefix_case_insensitive(input, "https://") {
+  } else if scheme_s == "https" {
     scheme = SCHEME_HTTPS;
-    off = 8;
   } else {
-    return None;
-  }
-  if off >= n {
-    return None;
-  }
-
-  // authority ends at '/', '?', '#', or end.
-  var auth_end: i64 = off;
-  while auth_end < n {
-    let b: u8 = std::runtime::mem::load_u8(p, auth_end);
-    if b == 47 || b == 63 || b == 35 { // '/','?','#'
-      break;
-    }
-    auth_end = auth_end + 1;
-  }
-  if auth_end <= off {
+    url.drop();
     return None;
   }
 
-  // Strip userinfo (keep substring after last '@').
-  var host_start: i64 = off;
-  var scan: i64 = off;
-  while scan < auth_end {
-    if std::runtime::mem::load_u8(p, scan) == 64 { // '@'
-      host_start = scan + 1;
-    }
-    scan = scan + 1;
+  let host_opt: string? = url.host();
+  if host_opt == None {
+    url.drop();
+    return None;
   }
-  if host_start >= auth_end {
+  let host_s: string = match (host_opt) {
+    Some(v) => v,
+    None => "",
+  };
+  let hp: u64 = std::runtime::mem::string_ptr(host_s);
+  let hn: i64 = std::runtime::mem::string_len(host_s);
+  if hp == 0 || hn <= 0 {
+    url.drop();
     return None;
   }
 
-  // Reject IPv6 bracket form for now.
-  if std::runtime::mem::load_u8(p, host_start) == 91 { // '['
+  // Reject IPv6 bracket form for now (Sage currently connects only via `SocketAddrV4`).
+  if std::runtime::mem::load_u8(hp, 0) == 91 { // '['
+    url.drop();
     return None;
   }
+
+  let host_r: std::strings::StringResult = std::strings::String.from_string(host_s);
+  if host_r.is_err() {
+    url.drop();
+    return None;
+  }
+  let mut host: std::strings::String = match (host_r) {
+    Ok(v) => v,
+    Err(_) => std::strings::String.empty(),
+  };
 
   var port: int = if scheme == SCHEME_HTTPS { 443 } else { 80 };
-  var host_end: i64 = auth_end;
-
-  // Find last ':' in the host:port segment.
-  var colon_pos: i64 = -1;
-  var k: i64 = host_start;
-  while k < auth_end {
-    if std::runtime::mem::load_u8(p, k) == 58 { // ':'
-      colon_pos = k;
-    }
-    k = k + 1;
+  let port_opt: int? = url.port();
+  if port_opt != None {
+    port = match (port_opt) { Some(v) => v, None => port };
   }
 
-  if colon_pos >= 0 {
-    host_end = colon_pos;
-    let port_start: i64 = colon_pos + 1;
-    if port_start >= auth_end {
-      return None;
-    }
-    var pv: int = 0;
-    var m: i64 = port_start;
-    while m < auth_end {
-      let b: u8 = std::runtime::mem::load_u8(p, m);
-      if b < 48 || b > 57 {
-        return None;
-      }
-      pv = pv * 10 + (((b - 48) as int) as int);
-      if pv > 65535 {
-        return None;
-      }
-      m = m + 1;
-    }
-    port = pv;
-  }
-
-  if host_end <= host_start {
-    return None;
-  }
-  let host: string = std::runtime::mem::string_from_ptr_len(p + (host_start as u64), (host_end - host_start) as int);
+  let path_s: string = url.path();
+  let query_opt: string? = url.query();
 
   // target: path + optional query, excluding fragment.
-  var frag: i64 = auth_end;
-  while frag < n {
-    if std::runtime::mem::load_u8(p, frag) == 35 { // '#'
-      break;
-    }
-    frag = frag + 1;
-  }
-  let target_end: i64 = frag;
-
   let mut target: std::strings::String = std::strings::String.empty();
-  if auth_end >= n || std::runtime::mem::load_u8(p, auth_end) == 35 {
-    if target.push_string("/") != None { target.drop(); return None; }
-  } else if std::runtime::mem::load_u8(p, auth_end) == 47 { // '/'
-    let sub: string = std::runtime::mem::string_from_ptr_len(p + (auth_end as u64), (target_end - auth_end) as int);
-    if target.push_string(sub) != None { target.drop(); return None; }
-  } else if std::runtime::mem::load_u8(p, auth_end) == 63 { // '?'
-    if target.push_string("/") != None { target.drop(); return None; }
-    let sub2: string = std::runtime::mem::string_from_ptr_len(p + (auth_end as u64), (target_end - auth_end) as int);
-    if target.push_string(sub2) != None { target.drop(); return None; }
+  if path_s == "" {
+    if target.push_string("/") != None { host.drop(); target.drop(); url.drop(); return None; }
   } else {
-    if target.push_string("/") != None { target.drop(); return None; }
+    if target.push_string(path_s) != None { host.drop(); target.drop(); url.drop(); return None; }
+  }
+  if query_opt != None {
+    let q: string = match (query_opt) { Some(v) => v, None => "" };
+    if target.push_u8(63) != None { host.drop(); target.drop(); url.drop(); return None; }
+    if target.push_string(q) != None { host.drop(); target.drop(); url.drop(); return None; }
   }
 
   // host header: host[:port] if non-default
   let mut host_header: std::strings::String = std::strings::String.empty();
-  if host_header.push_string(host) != None { target.drop(); host_header.drop(); return None; }
+  if host_header.push_string(host.as_string()) != None { host.drop(); target.drop(); host_header.drop(); url.drop(); return None; }
   let default_port: bool = (scheme == SCHEME_HTTP && port == 80) || (scheme == SCHEME_HTTPS && port == 443);
   if !default_port {
-    if host_header.push_u8(58) != None { target.drop(); host_header.drop(); return None; }
-    if !push_decimal_port(mut host_header, port) { target.drop(); host_header.drop(); return None; }
+    if host_header.push_u8(58) != None { host.drop(); target.drop(); host_header.drop(); url.drop(); return None; }
+    if !push_decimal_port(mut host_header, port) { host.drop(); target.drop(); host_header.drop(); url.drop(); return None; }
   }
 
+  url.drop();
   return Some(ParsedUrl{ scheme: scheme, host: host, port: port, target: target, host_header: host_header });
 }
 
-export fn map_url (input: string, allow_binary: bool) -> MappedFile? {
-  let parts_opt: ParsedUrl? = parse_http_url(input);
-  if parts_opt == None {
+fn resolve_redirect_url (base: string, location: string) -> std::strings::String? {
+  let base_r = StdURL.parse(base);
+  if base_r.is_err() {
     return None;
   }
-  let mut parts: ParsedUrl = parts_opt ?? ParsedUrl{
-    scheme: -1,
-    host: "",
-    port: 0,
-    target: std::strings::String.empty(),
-    host_header: std::strings::String.empty(),
+  let mut base_url: StdURL = match (base_r) {
+    Ok(v) => v,
+    Err(_) => StdURL.empty(),
   };
 
-  let ip_opt: int? = resolve_host_ipv4_value(parts.host);
-  if ip_opt == None {
-    parts.target.drop();
-    parts.host_header.drop();
+  let next_r = url_parse_with_base(location, &base_url);
+  if next_r.is_err() {
+    base_url.drop();
     return None;
   }
-  let ip_value: int = match (ip_opt) { Some(v) => v, None => 0 };
-  if ip_value == 0 {
-    parts.target.drop();
-    parts.host_header.drop();
+  let mut next_url: StdURL = match (next_r) {
+    Ok(v) => v,
+    Err(_) => StdURL.empty(),
+  };
+
+  let href_r: std::strings::StringResult = next_url.href();
+  next_url.drop();
+  base_url.drop();
+  if href_r.is_err() {
     return None;
   }
+  let mut href: std::strings::String = match (href_r) {
+    Ok(v) => v,
+    Err(_) => std::strings::String.empty(),
+  };
+  return Some(href);
+}
 
-  let addr: std::net::SocketAddrV4 = std::net::SocketAddrV4.from_ipv4_value(ip_value, parts.port);
-
-  if parts.scheme == SCHEME_HTTP {
-    let stream_r: std::net::TcpStreamResult = std::net::TcpStream.connect(addr);
-    if stream_r.is_err() {
-      parts.target.drop();
-      parts.host_header.drop();
-      return None;
-    }
-    let stream: std::net::TcpStream = match (stream_r) { Ok(v) => v, Err(_) => std::net::TcpStream.invalid() };
-    let mut conn: std::http::Connection = std::http::Connection.from_stream(stream);
-
-    let ok_w: bool = http_write_request_http10_tcp(&conn.stream, parts.target.as_string(), parts.host_header.as_string());
-    if !ok_w {
-      conn.close();
-      parts.target.drop();
-      parts.host_header.drop();
-      return None;
-    }
-
-    let resp_r: std::http::ResponseResult = conn.read_response();
-    if resp_r.is_err() {
-      conn.close();
-      parts.target.drop();
-      parts.host_header.drop();
-      return None;
-    }
-    let mut resp: std::http::Response = match (resp_r) { Ok(v) => v, Err(_) => std::http::Response{ bytes_ptr: 0, bytes_len: 0, bytes_cap: 0, header_end: 0, version_off: 0, version_len: 0, status_code: 0, reason_off: 0, reason_len: 0, body_off: 0, body_len: 0 } };
-
-    if resp.status_code() < 200 || resp.status_code() >= 300 {
-      resp.drop();
-      conn.close();
-      parts.target.drop();
-      parts.host_header.drop();
-      return None;
-    }
-
-    let body: string = resp.body();
-    let mapped_opt: MappedFile? = spool_bytes_to_tmp_map(body, allow_binary);
-    resp.drop();
-    conn.close();
-    parts.target.drop();
-    parts.host_header.drop();
-    return mapped_opt;
+export fn map_url (input: string, allow_binary: bool) -> MappedFile? {
+  let cur_r: std::strings::StringResult = std::strings::String.from_string(input);
+  if cur_r.is_err() {
+    return None;
   }
+  let mut cur: std::strings::String = match (cur_r) {
+    Ok(v) => v,
+    Err(_) => std::strings::String.empty(),
+  };
 
-  if parts.scheme == SCHEME_HTTPS {
-    // Manual connect so we can set SNI. `std::https::Connection.connect` takes
-    // only an IP address and cannot set `mbedtls_ssl_set_hostname`, so many
-    // modern servers fail the handshake (including example.com).
-    let stream_r: std::net::TcpStreamResult = std::net::TcpStream.connect(addr);
-    if stream_r.is_err() {
-      parts.target.drop();
-      parts.host_header.drop();
+  let max_redirects: int = 10;
+  var redirects: int = 0;
+  while redirects <= max_redirects {
+    let cur_s: string = cur.as_string();
+    let parts_opt: ParsedUrl? = parse_http_url(cur_s);
+    if parts_opt == None {
+      cur.drop();
       return None;
     }
-    let stream: std::net::TcpStream = match (stream_r) { Ok(v) => v, Err(_) => std::net::TcpStream.invalid() };
-
-    let sess_r: std::tls::SessionResult = std::tls::Session.client();
-    if sess_r.is_err() {
-      let mut s: std::net::TcpStream = stream;
-      let _ = s.close();
-      parts.target.drop();
-      parts.host_header.drop();
-      return None;
-    }
-    let sess: std::tls::Session = match (sess_r) { Ok(v) => v, Err(_) => std::tls::Session.invalid() };
-
-    if !tls_set_hostname(&sess, parts.host) {
-      let mut s: std::net::TcpStream = stream;
-      let _ = s.close();
-      let mut ss: std::tls::Session = sess;
-      ss.drop();
-      parts.target.drop();
-      parts.host_header.drop();
-      return None;
-    }
-
-    sess.set_bio_fd(stream.fd);
-    if !tls_handshake_client(&sess) {
-      let mut s: std::net::TcpStream = stream;
-      let _ = s.close();
-      let mut ss: std::tls::Session = sess;
-      ss.drop();
-      parts.target.drop();
-      parts.host_header.drop();
-      return None;
-    }
-
-    let mut conn2: std::https::Connection = std::https::Connection{
-      stream: stream,
-      session: sess,
-      closed: false,
-      max_header_bytes: std::http::DEFAULT_MAX_HEADER_BYTES,
-      buf_ptr: 0,
-      buf_len: 0,
-      buf_cap: 0,
+    let mut parts: ParsedUrl = parts_opt ?? ParsedUrl{
+      scheme: -1,
+      host: std::strings::String.empty(),
+      port: 0,
+      target: std::strings::String.empty(),
+      host_header: std::strings::String.empty(),
     };
 
-    let ok_w2: bool = http_write_request_http10_tls(&conn2.session, parts.target.as_string(), parts.host_header.as_string());
-    if !ok_w2 {
-      conn2.close();
-      parts.target.drop();
-      parts.host_header.drop();
+    let ip_opt: int? = resolve_host_ipv4_value(parts.host.as_string());
+    if ip_opt == None {
+      parsed_url_drop(mut parts);
+      cur.drop();
+      return None;
+    }
+    let ip_value: int = match (ip_opt) { Some(v) => v, None => 0 };
+    if ip_value == 0 {
+      parsed_url_drop(mut parts);
+      cur.drop();
       return None;
     }
 
-    let resp_r2: std::http::ResponseResult = conn2.read_response();
-    if resp_r2.is_err() {
-      conn2.close();
-      parts.target.drop();
-      parts.host_header.drop();
-      return None;
-    }
-    let mut resp2: std::http::Response = match (resp_r2) { Ok(v) => v, Err(_) => std::http::Response{ bytes_ptr: 0, bytes_len: 0, bytes_cap: 0, header_end: 0, version_off: 0, version_len: 0, status_code: 0, reason_off: 0, reason_len: 0, body_off: 0, body_len: 0 } };
+    let addr: std::net::SocketAddrV4 = std::net::SocketAddrV4.from_ipv4_value(ip_value, parts.port);
 
-    if resp2.status_code() < 200 || resp2.status_code() >= 300 {
+    if parts.scheme == SCHEME_HTTP {
+      let stream_r: std::net::TcpStreamResult = std::net::TcpStream.connect(addr);
+      if stream_r.is_err() {
+        parsed_url_drop(mut parts);
+        cur.drop();
+        return None;
+      }
+      let stream: std::net::TcpStream = match (stream_r) { Ok(v) => v, Err(_) => std::net::TcpStream.invalid() };
+      let mut conn: std::http::Connection = std::http::Connection.from_stream(stream);
+
+      let ok_w: bool = http_write_request_http10_tcp(&conn.stream, parts.target.as_string(), parts.host_header.as_string());
+      if !ok_w {
+        conn.close();
+        parsed_url_drop(mut parts);
+        cur.drop();
+        return None;
+      }
+
+      let resp_r: std::http::ResponseResult = conn.read_response();
+      if resp_r.is_err() {
+        conn.close();
+        parsed_url_drop(mut parts);
+        cur.drop();
+        return None;
+      }
+      let mut resp: std::http::Response = match (resp_r) { Ok(v) => v, Err(_) => std::http::Response{ bytes_ptr: 0, bytes_len: 0, bytes_cap: 0, header_end: 0, version_off: 0, version_len: 0, status_code: 0, reason_off: 0, reason_len: 0, body_off: 0, body_len: 0 } };
+
+      let status: int = resp.status_code();
+      if status >= 300 && status < 400 && redirects < max_redirects {
+        let loc_opt: string? = resp.header("location");
+        if loc_opt != None {
+          let loc: string = match (loc_opt) { Some(v) => v, None => "" };
+          let next_opt: std::strings::String? = resolve_redirect_url(cur_s, loc);
+          if next_opt != None {
+            let mut next: std::strings::String = next_opt ?? std::strings::String.empty();
+            resp.drop();
+            conn.close();
+            parsed_url_drop(mut parts);
+
+            cur.drop();
+            cur = move next;
+            redirects = redirects + 1;
+            continue;
+          }
+        }
+      }
+
+      if status < 200 || status >= 300 {
+        resp.drop();
+        conn.close();
+        parsed_url_drop(mut parts);
+        cur.drop();
+        return None;
+      }
+
+      let body: string = resp.body();
+      let mapped_opt: MappedFile? = spool_bytes_to_tmp_map(body, allow_binary);
+      resp.drop();
+      conn.close();
+      parsed_url_drop(mut parts);
+      cur.drop();
+      return mapped_opt;
+    }
+
+    if parts.scheme == SCHEME_HTTPS {
+      let conn_r2: std::https::ConnectionResult = std::https::Connection.connect_host(addr, parts.host.as_string());
+      if conn_r2.is_err() {
+        parsed_url_drop(mut parts);
+        cur.drop();
+        return None;
+      }
+      let mut conn2: std::https::Connection = match (conn_r2) {
+        Ok(v) => v,
+        Err(_) => std::https::Connection{
+          stream: std::net::TcpStream.invalid(),
+          session: std::tls::Session.invalid(),
+          closed: true,
+          max_header_bytes: std::http::DEFAULT_MAX_HEADER_BYTES,
+          buf_ptr: 0,
+          buf_len: 0,
+          buf_cap: 0,
+        },
+      };
+
+      let ok_w2: bool = http_write_request_http10_tls(&conn2.session, parts.target.as_string(), parts.host_header.as_string());
+      if !ok_w2 {
+        conn2.close();
+        parsed_url_drop(mut parts);
+        cur.drop();
+        return None;
+      }
+
+      let resp_r2: std::http::ResponseResult = conn2.read_response();
+      if resp_r2.is_err() {
+        conn2.close();
+        parsed_url_drop(mut parts);
+        cur.drop();
+        return None;
+      }
+      let mut resp2: std::http::Response = match (resp_r2) { Ok(v) => v, Err(_) => std::http::Response{ bytes_ptr: 0, bytes_len: 0, bytes_cap: 0, header_end: 0, version_off: 0, version_len: 0, status_code: 0, reason_off: 0, reason_len: 0, body_off: 0, body_len: 0 } };
+
+      let status2: int = resp2.status_code();
+      if status2 >= 300 && status2 < 400 && redirects < max_redirects {
+        let loc_opt2: string? = resp2.header("location");
+        if loc_opt2 != None {
+          let loc2: string = match (loc_opt2) { Some(v) => v, None => "" };
+          let next_opt2: std::strings::String? = resolve_redirect_url(cur_s, loc2);
+          if next_opt2 != None {
+            let mut next2: std::strings::String = next_opt2 ?? std::strings::String.empty();
+            resp2.drop();
+            conn2.close();
+            parsed_url_drop(mut parts);
+
+            cur.drop();
+            cur = move next2;
+            redirects = redirects + 1;
+            continue;
+          }
+        }
+      }
+
+      if status2 < 200 || status2 >= 300 {
+        resp2.drop();
+        conn2.close();
+        parsed_url_drop(mut parts);
+        cur.drop();
+        return None;
+      }
+
+      let body2: string = resp2.body();
+      let mapped_opt2: MappedFile? = spool_bytes_to_tmp_map(body2, allow_binary);
       resp2.drop();
       conn2.close();
-      parts.target.drop();
-      parts.host_header.drop();
-      return None;
+      parsed_url_drop(mut parts);
+      cur.drop();
+      return mapped_opt2;
     }
 
-    let body2: string = resp2.body();
-    let mapped_opt2: MappedFile? = spool_bytes_to_tmp_map(body2, allow_binary);
-    resp2.drop();
-    conn2.close();
-    parts.target.drop();
-    parts.host_header.drop();
-    return mapped_opt2;
+    parsed_url_drop(mut parts);
+    break;
   }
 
-  parts.target.drop();
-  parts.host_header.drop();
+  cur.drop();
   return None;
 }

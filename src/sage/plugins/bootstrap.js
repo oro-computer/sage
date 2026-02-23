@@ -304,6 +304,60 @@ void (function () {
   }
 
   // ---------------------------------------------------------------------------
+  // Timers (setTimeout/setInterval).
+
+  const timerSetHost = typeof globalThis.__sage_timer_set === 'function' ? globalThis.__sage_timer_set : null
+  const timerClearHost = typeof globalThis.__sage_timer_clear === 'function' ? globalThis.__sage_timer_clear : null
+
+  if (timerSetHost && timerClearHost && typeof globalThis.setTimeout !== 'function') {
+    function setTimeout(fn, ms) {
+      if (typeof fn !== 'function') {
+        throw new TypeError('setTimeout(fn, ms, ...args): fn must be a function')
+      }
+      let delay = 0
+      if (arguments.length >= 2) {
+        delay = Number(ms)
+        if (!Number.isFinite(delay) || delay < 0) delay = 0
+      }
+      const args = []
+      for (let i = 2; i < arguments.length; i++) args.push(arguments[i])
+      return timerSetHost.apply(null, [fn, delay, 0].concat(args))
+    }
+
+    function clearTimeout(id) {
+      timerClearHost(id)
+    }
+
+    function setInterval(fn, ms) {
+      if (typeof fn !== 'function') {
+        throw new TypeError('setInterval(fn, ms, ...args): fn must be a function')
+      }
+      let delay = 0
+      if (arguments.length >= 2) {
+        delay = Number(ms)
+        if (!Number.isFinite(delay) || delay < 0) delay = 0
+      }
+      const args = []
+      for (let i = 2; i < arguments.length; i++) args.push(arguments[i])
+      return timerSetHost.apply(null, [fn, delay, delay].concat(args))
+    }
+
+    function clearInterval(id) {
+      timerClearHost(id)
+    }
+
+    function sleep(ms) {
+      return new Promise((resolve) => setTimeout(resolve, ms))
+    }
+
+    bindGlobal('setTimeout', setTimeout)
+    bindGlobal('clearTimeout', clearTimeout)
+    bindGlobal('setInterval', setInterval)
+    bindGlobal('clearInterval', clearInterval)
+    bindGlobal('sleep', sleep)
+  }
+
+  // ---------------------------------------------------------------------------
   // `:` command integration.
 
   const commands = Object.create(null)
