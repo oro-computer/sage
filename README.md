@@ -1,4 +1,4 @@
-# `sage` — a fast, ergonomic terminal pager (WIP)
+# `sage` — a fast, ergonomic terminal pager
 
 `sage` is a terminal pager inspired by `most`, written in Silk.
 
@@ -146,7 +146,7 @@ Plugins are evaluated as ES modules (ESM), so `import ... from ...` works.
   - `sage:url` (WHATWG-style `URL` + `URLSearchParams` + `URL.parse`/`URL.canParse`)
   - `sage:core/dom` (`DOMException` + `structuredClone`)
   - `sage:core/web` (host-free WHATWG-ish web primitives: `Headers`/`Request`/`Response`/`FormData`/`Blob`/`ReadableStream`/`AbortController`/`AbortSignal`/`TextEncoder`/`TextDecoder`)
-  - `sage:fetch` (WHATWG-ish `fetch` backed by the native host; extra options: `timeoutMs`/`maxBytes`/`followRedirects`)
+  - `sage:fetch` (WHATWG-ish `fetch` backed by the native host; extra options: `timeoutMs`/`maxBytes`/`followRedirects`; HTTPS verifies system CAs by default, `SAGE_FETCH_INSECURE=1` disables verification)
 - Relative imports are allowed for filesystem modules under the plugin’s directory tree.
   Bare imports are rejected. Top-level await is not supported.
 

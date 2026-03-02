@@ -2,13 +2,13 @@ module sage::plugins;
 
 import std::interfaces;
 import std::runtime::env;
+import std::runtime::fs;
 import std::runtime::mem;
 import std::runtime::posix::fs;
 
 import { plugins_bootstrap_js } from "../../build/gen/plugins_bootstrap.slk";
 import { plugins_api_modules_count, plugins_api_module_name, plugins_api_module_source } from "../../build/gen/plugins_api_modules.slk";
 import { BufferU8 } from "./buf.slk";
-import { mkstemp } from "./os.slk";
 
 // ---------------------------------------------------------------------------
 // QuickJS plugin host (C shim).
@@ -690,8 +690,10 @@ test "sage::plugins collect_plugins_dir sorts and filters" {
   let tmpl: string = match (tmpl_opt) { Some(v) => v, None => "" };
   let tmpl_ptr: u64 = std::runtime::mem::string_ptr(tmpl);
   assert(tmpl_ptr != 0, "mkstemp template ptr");
-  let fd: int = mkstemp(tmpl_ptr);
-  assert(fd >= 0, "mkstemp");
+  let fd_r: std::runtime::fs::IntResult = std::runtime::fs::mkstemp(tmpl_ptr);
+  assert(!fd_r.is_err(), "mkstemp");
+  let fd: int = std::runtime::fs::IntResult.ok_value(fd_r) ?? -1;
+  assert(fd >= 0, "mkstemp fd");
   let _ = std::runtime::posix::fs::close(fd);
 
   let root_opt: string? = join2(tmpl, ".d");

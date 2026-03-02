@@ -4,22 +4,9 @@ import std::interfaces;
 import std::runtime::mem;
 import std::runtime::fs;
 import std::runtime::posix::fs;
+import std::strings;
 
-import { memchr, mkstemp } from "./os.slk";
-
-fn cstr_len (cstr: u64, max: i64) -> i64 {
-  if cstr == 0 || max <= 0 {
-    return 0;
-  }
-  var i: i64 = 0;
-  while i < max {
-    if std::runtime::mem::load_u8(cstr, i) == 0 {
-      return i;
-    }
-    i = i + 1;
-  }
-  return max;
-}
+import { memchr } from "./os.slk";
 
 fn detect_binary (ptr: u64, len: i64) -> bool {
   if ptr == 0 || len <= 0 {
@@ -83,44 +70,30 @@ export fn map_path (path: string, allow_binary: bool) -> MappedFile? {
   return Some(m);
 }
 
-fn write_tmp_template (p: u64) -> void {
-  // "/tmp/sageXXXXXX\0"
-  std::runtime::mem::store_u8(p, 0, 47);  // /
-  std::runtime::mem::store_u8(p, 1, 116); // t
-  std::runtime::mem::store_u8(p, 2, 109); // m
-  std::runtime::mem::store_u8(p, 3, 112); // p
-  std::runtime::mem::store_u8(p, 4, 47);  // /
-  std::runtime::mem::store_u8(p, 5, 115); // s
-  std::runtime::mem::store_u8(p, 6, 97);  // a
-  std::runtime::mem::store_u8(p, 7, 103); // g
-  std::runtime::mem::store_u8(p, 8, 101); // e
-  std::runtime::mem::store_u8(p, 9, 88);  // X
-  std::runtime::mem::store_u8(p, 10, 88);
-  std::runtime::mem::store_u8(p, 11, 88);
-  std::runtime::mem::store_u8(p, 12, 88);
-  std::runtime::mem::store_u8(p, 13, 88);
-  std::runtime::mem::store_u8(p, 14, 88);
-  std::runtime::mem::store_u8(p, 15, 0);
-}
-
 export fn map_stdin_spool (allow_binary: bool) -> MappedFile? {
   // Create a temp file and unlink it immediately (it will be removed on close).
-  let tmpl: u64 = std::runtime::mem::alloc(16);
-  if tmpl == 0 {
+  let tmpl_r = std::strings::String.from_string("/tmp/sageXXXXXX");
+  if tmpl_r.is_err() {
     return None;
   }
-  write_tmp_template(tmpl);
+  let mut tmpl: std::strings::String = match (tmpl_r) { Ok(v) => v, Err(_) => std::strings::String.empty() };
+  if tmpl.len <= 0 {
+    return None;
+  }
 
-  let fd: int = mkstemp(tmpl) as int;
+  let fd_r: std::runtime::fs::IntResult = std::runtime::fs::mkstemp(tmpl.ptr);
+  if fd_r.is_err() {
+    tmpl.drop();
+    return None;
+  }
+  let fd: int = std::runtime::fs::IntResult.ok_value(fd_r) ?? -1;
   if fd < 0 {
-    std::runtime::mem::free(tmpl);
+    tmpl.drop();
     return None;
   }
 
-  let nlen: i64 = cstr_len(tmpl, 256);
-  let path: string = std::runtime::mem::string_from_ptr_len(tmpl, nlen as int);
-  let _ = std::runtime::posix::fs::unlink(path);
-  std::runtime::mem::free(tmpl);
+  let _ = std::runtime::posix::fs::unlink(tmpl.as_string());
+  tmpl.drop();
 
   let buf: u64 = std::runtime::mem::alloc(65536);
   if buf == 0 {

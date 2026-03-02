@@ -24,14 +24,6 @@ export ext memmem = fn (u64, i64, u64, i64) -> u64;
 export ext memrchr = fn (u64, int, i64) -> u64;
 
 /**
- * `mkstemp(3)` — create a unique temporary file from a template.
- *
- * The template must be a writable NUL-terminated byte string ending in
- * `XXXXXX`. `mkstemp` modifies it in place.
- */
-export ext mkstemp = fn (u64) -> int;
-
-/**
  * Read `errno` via the hosted POSIX backend.
  */
 export fn errno () -> int {

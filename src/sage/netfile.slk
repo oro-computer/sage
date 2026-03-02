@@ -11,8 +11,9 @@ import std::runtime::posix::net;
 import std::strings;
 import std::tls;
 import { URL as StdURL, parse_with_base as url_parse_with_base } from "std/url";
-import { memchr, mkstemp } from "./os.slk";
+import { memchr } from "./os.slk";
 import { MappedFile } from "./file.slk";
+import { MappedInput } from "./mapped.slk";
 
 let SO_RCVTIMEO: int = 20; // linux: SO_RCVTIMEO
 
@@ -49,6 +50,136 @@ fn has_prefix_case_insensitive (s: string, prefix: string) -> bool {
 
 export fn is_network_path (path: string) -> bool {
   return has_prefix_case_insensitive(path, "http://") || has_prefix_case_insensitive(path, "https://") || has_prefix_case_insensitive(path, "ssh://");
+}
+
+export fn is_ssh_path (path: string) -> bool {
+  return has_prefix_case_insensitive(path, "ssh://");
+}
+
+fn is_ascii_ws (b: u8) -> bool {
+  return b == 32 || (b >= 9 && b <= 13);
+}
+
+fn eq_nocase_ptr_len (a_ptr: u64, a_len: i64, b: string) -> bool {
+  let b_ptr: u64 = std::runtime::mem::string_ptr(b);
+  let b_len: i64 = std::runtime::mem::string_len(b);
+  if a_ptr == 0 || b_ptr == 0 || a_len != b_len {
+    return false;
+  }
+  var i: i64 = 0;
+  while i < a_len {
+    let x: u8 = ascii_lower(std::runtime::mem::load_u8(a_ptr, i));
+    let y: u8 = ascii_lower(std::runtime::mem::load_u8(b_ptr, i));
+    if x != y {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+fn ends_with_nocase_ptr_len (a_ptr: u64, a_len: i64, suffix: string) -> bool {
+  let s_ptr: u64 = std::runtime::mem::string_ptr(suffix);
+  let s_len: i64 = std::runtime::mem::string_len(suffix);
+  if a_ptr == 0 || s_ptr == 0 || a_len < s_len || s_len <= 0 {
+    return false;
+  }
+  let off: i64 = a_len - s_len;
+  var i: i64 = 0;
+  while i < s_len {
+    let x: u8 = ascii_lower(std::runtime::mem::load_u8(a_ptr + (off as u64), i));
+    let y: u8 = ascii_lower(std::runtime::mem::load_u8(s_ptr, i));
+    if x != y {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+fn syntax_hint_for_content_type (content_type: string) -> string {
+  let p: u64 = std::runtime::mem::string_ptr(content_type);
+  let n: i64 = std::runtime::mem::string_len(content_type);
+  if p == 0 || n <= 0 {
+    return "";
+  }
+
+  // Trim leading whitespace.
+  var start: i64 = 0;
+  while start < n && is_ascii_ws(std::runtime::mem::load_u8(p, start)) {
+    start = start + 1;
+  }
+  if start >= n {
+    return "";
+  }
+
+  // Stop at ';' (ignore params like `charset=utf-8`).
+  var end: i64 = n;
+  var i: i64 = start;
+  while i < n {
+    if std::runtime::mem::load_u8(p, i) == 59 { // ';'
+      end = i;
+      break;
+    }
+    i = i + 1;
+  }
+
+  // Trim trailing whitespace.
+  while end > start && is_ascii_ws(std::runtime::mem::load_u8(p, end - 1)) {
+    end = end - 1;
+  }
+
+  let mt_ptr: u64 = p + (start as u64);
+  let mt_len: i64 = end - start;
+  if mt_ptr == 0 || mt_len <= 0 {
+    return "";
+  }
+
+  // XHTML is best highlighted as HTML, even though it is XML.
+  if eq_nocase_ptr_len(mt_ptr, mt_len, "application/xhtml+xml") {
+    return "html";
+  }
+
+  // `+json` / `+xml` structured syntax suffixes.
+  if ends_with_nocase_ptr_len(mt_ptr, mt_len, "+json") {
+    return "json";
+  }
+  if ends_with_nocase_ptr_len(mt_ptr, mt_len, "+xml") {
+    return "xml";
+  }
+
+  if eq_nocase_ptr_len(mt_ptr, mt_len, "application/json") || eq_nocase_ptr_len(mt_ptr, mt_len, "text/json") {
+    return "json";
+  }
+  if eq_nocase_ptr_len(mt_ptr, mt_len, "text/html") || eq_nocase_ptr_len(mt_ptr, mt_len, "application/xhtml+xml") {
+    return "html";
+  }
+  if eq_nocase_ptr_len(mt_ptr, mt_len, "text/css") {
+    return "css";
+  }
+  if eq_nocase_ptr_len(mt_ptr, mt_len, "application/javascript")
+    || eq_nocase_ptr_len(mt_ptr, mt_len, "text/javascript")
+    || eq_nocase_ptr_len(mt_ptr, mt_len, "application/x-javascript") {
+    return "js";
+  }
+  if eq_nocase_ptr_len(mt_ptr, mt_len, "application/typescript") || eq_nocase_ptr_len(mt_ptr, mt_len, "text/typescript") {
+    return "ts";
+  }
+  if eq_nocase_ptr_len(mt_ptr, mt_len, "application/xml") || eq_nocase_ptr_len(mt_ptr, mt_len, "text/xml") {
+    return "xml";
+  }
+  if eq_nocase_ptr_len(mt_ptr, mt_len, "text/markdown") || eq_nocase_ptr_len(mt_ptr, mt_len, "text/x-markdown") {
+    return "md";
+  }
+  if eq_nocase_ptr_len(mt_ptr, mt_len, "application/yaml")
+    || eq_nocase_ptr_len(mt_ptr, mt_len, "application/x-yaml")
+    || eq_nocase_ptr_len(mt_ptr, mt_len, "text/yaml") {
+    return "yaml";
+  }
+  if eq_nocase_ptr_len(mt_ptr, mt_len, "text/csv") {
+    return "csv";
+  }
+  return "";
 }
 
 fn parse_ipv4_literal_value (host: string) -> int? {
@@ -490,40 +621,6 @@ fn http_write_request_http10_tls (sess: &std::tls::Session, target: string, host
   return w_err == None;
 }
 
-fn tmp_template_write (p: u64) -> void {
-  // "/tmp/sageXXXXXX\0"
-  std::runtime::mem::store_u8(p, 0, 47);  // /
-  std::runtime::mem::store_u8(p, 1, 116); // t
-  std::runtime::mem::store_u8(p, 2, 109); // m
-  std::runtime::mem::store_u8(p, 3, 112); // p
-  std::runtime::mem::store_u8(p, 4, 47);  // /
-  std::runtime::mem::store_u8(p, 5, 115); // s
-  std::runtime::mem::store_u8(p, 6, 97);  // a
-  std::runtime::mem::store_u8(p, 7, 103); // g
-  std::runtime::mem::store_u8(p, 8, 101); // e
-  std::runtime::mem::store_u8(p, 9, 88);  // X
-  std::runtime::mem::store_u8(p, 10, 88);
-  std::runtime::mem::store_u8(p, 11, 88);
-  std::runtime::mem::store_u8(p, 12, 88);
-  std::runtime::mem::store_u8(p, 13, 88);
-  std::runtime::mem::store_u8(p, 14, 88);
-  std::runtime::mem::store_u8(p, 15, 0);
-}
-
-fn cstr_len_max (cstr: u64, max: i64) -> i64 {
-  if cstr == 0 || max <= 0 {
-    return 0;
-  }
-  var i: i64 = 0;
-  while i < max {
-    if std::runtime::mem::load_u8(cstr, i) == 0 {
-      return i;
-    }
-    i = i + 1;
-  }
-  return max;
-}
-
 fn map_fd_readonly (fd: int, len: i64) -> MappedFile? {
   if len <= 0 {
     let _ = std::runtime::posix::fs::close(fd);
@@ -556,22 +653,28 @@ fn spool_bytes_to_tmp_map (bytes: string, allow_binary: bool) -> MappedFile? {
     }
   }
 
-  let tmpl: u64 = std::runtime::mem::alloc(16);
-  if tmpl == 0 {
+  let tmpl_r = std::strings::String.from_string("/tmp/sageXXXXXX");
+  if tmpl_r.is_err() {
     return None;
   }
-  tmp_template_write(tmpl);
+  let mut tmpl: std::strings::String = match (tmpl_r) { Ok(v) => v, Err(_) => std::strings::String.empty() };
+  if tmpl.len <= 0 {
+    return None;
+  }
 
-  let fd: int = mkstemp(tmpl) as int;
+  let fd_r: std::runtime::fs::IntResult = std::runtime::fs::mkstemp(tmpl.ptr);
+  if fd_r.is_err() {
+    tmpl.drop();
+    return None;
+  }
+  let fd: int = std::runtime::fs::IntResult.ok_value(fd_r) ?? -1;
   if fd < 0 {
-    std::runtime::mem::free(tmpl);
+    tmpl.drop();
     return None;
   }
 
-  let nlen: i64 = cstr_len_max(tmpl, 256);
-  let path: string = std::runtime::mem::string_from_ptr_len(tmpl, nlen as int);
-  let _ = std::runtime::posix::fs::unlink(path);
-  std::runtime::mem::free(tmpl);
+  let _ = std::runtime::posix::fs::unlink(tmpl.as_string());
+  tmpl.drop();
 
   // Write all bytes.
   var off: i64 = 0;
@@ -775,7 +878,7 @@ fn resolve_redirect_url (base: string, location: string) -> std::strings::String
   return Some(href);
 }
 
-export fn map_url (input: string, allow_binary: bool) -> MappedFile? {
+export fn map_url (input: string, allow_binary: bool) -> MappedInput? {
   let cur_r: std::strings::StringResult = std::strings::String.from_string(input);
   if cur_r.is_err() {
     return None;
@@ -872,13 +975,28 @@ export fn map_url (input: string, allow_binary: bool) -> MappedFile? {
         return None;
       }
 
+      var hint: string = "";
+      let ct_opt: string? = resp.header("content-type");
+      if ct_opt != None {
+        let ct: string = match (ct_opt) { Some(v) => v, None => "" };
+        hint = syntax_hint_for_content_type(ct);
+      }
+
       let body: string = resp.body();
       let mapped_opt: MappedFile? = spool_bytes_to_tmp_map(body, allow_binary);
+      if mapped_opt == None {
+        resp.drop();
+        conn.close();
+        parsed_url_drop(mut parts);
+        cur.drop();
+        return None;
+      }
+      let mut mapped: MappedFile = match (mapped_opt) { Some(v) => v, None => MappedFile{ ptr: 0, len: 0 } };
       resp.drop();
       conn.close();
       parsed_url_drop(mut parts);
       cur.drop();
-      return mapped_opt;
+      return Some(MappedInput{ file: move mapped, syntax_hint: hint });
     }
 
     if parts.scheme == SCHEME_HTTPS {
@@ -946,13 +1064,28 @@ export fn map_url (input: string, allow_binary: bool) -> MappedFile? {
         return None;
       }
 
+      var hint2: string = "";
+      let ct_opt2: string? = resp2.header("content-type");
+      if ct_opt2 != None {
+        let ct2: string = match (ct_opt2) { Some(v) => v, None => "" };
+        hint2 = syntax_hint_for_content_type(ct2);
+      }
+
       let body2: string = resp2.body();
       let mapped_opt2: MappedFile? = spool_bytes_to_tmp_map(body2, allow_binary);
+      if mapped_opt2 == None {
+        resp2.drop();
+        conn2.close();
+        parsed_url_drop(mut parts);
+        cur.drop();
+        return None;
+      }
+      let mut mapped2: MappedFile = match (mapped_opt2) { Some(v) => v, None => MappedFile{ ptr: 0, len: 0 } };
       resp2.drop();
       conn2.close();
       parsed_url_drop(mut parts);
       cur.drop();
-      return mapped_opt2;
+      return Some(MappedInput{ file: move mapped2, syntax_hint: hint2 });
     }
 
     parsed_url_drop(mut parts);

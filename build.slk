@@ -534,41 +534,6 @@ fn generate_plugins_api_modules (package_root: string) -> int {
   return rc;
 }
 
-fn build_mbedtls_shared (package_root: string) -> int {
-  // `std::tls` currently pulls in a DT_NEEDED dependency on `libmbedtls.so.14`.
-  // Build a local shared library from the vendored static archives so `sage`
-  // runs on minimal systems without a system mbedTLS install.
-  //
-  // NOTE: `std::tls` binds the mbedTLS 2.x-era symbol surface (soname 14). The
-  // `silk/vendor` mbedTLS snapshot is newer and does not export the expected
-  // function names, so we use the runtime's pinned build.
-  let lib_tls: string = "../legacy-runtime/build/x86_64-desktop/mbedtls/build/library/libmbedtls.a";
-  let lib_x509: string = "../legacy-runtime/build/x86_64-desktop/mbedtls/build/library/libmbedx509.a";
-  let lib_crypto: string = "../legacy-runtime/build/x86_64-desktop/mbedtls/build/library/libmbedcrypto.a";
-
-  if !fs::exists(lib_tls) || !fs::exists(lib_x509) || !fs::exists(lib_crypto) {
-    return 0;
-  }
-
-  let mut g: build::StepGraph = build::StepGraph.init(package_root);
-  let dir = g.mkdir_all("build/lib", 493); // 0755
-
-  let cmd = g.run_cmd("cc");
-  g.cmd_arg(cmd, "-shared");
-  g.cmd_arg(cmd, "-Wl,-soname,libmbedtls.so.14");
-  g.cmd_arg(cmd, "-Wl,--whole-archive");
-  g.cmd_arg(cmd, "-o");
-  g.cmd_arg(cmd, "build/lib/libmbedtls.so.14");
-  g.cmd_arg(cmd, lib_tls);
-  g.cmd_arg(cmd, lib_x509);
-  g.cmd_arg(cmd, lib_crypto);
-  g.cmd_arg(cmd, "-Wl,--no-whole-archive");
-  g.cmd_arg(cmd, "-lm");
-  g.depends_on(cmd, dir);
-
-  return g.run();
-}
-
 export async fn run (package_root: string, action: string) -> int {
   let _ = action;
 
@@ -576,9 +541,6 @@ export async fn run (package_root: string, action: string) -> int {
     return 1;
   }
   if generate_plugins_api_modules(package_root) != 0 {
-    return 1;
-  }
-  if build_mbedtls_shared(package_root) != 0 {
     return 1;
   }
 
@@ -603,13 +565,13 @@ export async fn run (package_root: string, action: string) -> int {
   b.target_add_cflag(t, "-std=c11");
   b.target_add_cflag(t, "-D_GNU_SOURCE");
   b.target_add_cflag(t, "-Iquickjs");
-  b.target_add_cflag(t, "-I../legacy-runtime/build/include");
+  b.target_add_cflag(t, "-I../silk/vendor/include");
   b.target_add_cflag(t, "-pthread");
   b.target_add_ldflag(t, "-lm");
   b.target_add_needed(t, "libpthread.so.0");
-
-  // Find `build/lib/libmbedtls.so.14` without requiring LD_LIBRARY_PATH.
-  b.target_add_runpath(t, "$ORIGIN/../lib");
+  b.target_add_input(t, "../silk/vendor/lib/x64-linux/libmbedtls.a");
+  b.target_add_input(t, "../silk/vendor/lib/x64-linux/libmbedx509.a");
+  b.target_add_input(t, "../silk/vendor/lib/x64-linux/libmbedcrypto.a");
 
   return b.emit();
 }

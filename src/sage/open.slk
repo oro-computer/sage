@@ -1,15 +1,25 @@
 module sage::open;
 
 import { MappedFile, map_path, map_stdin_spool } from "./file.slk";
+import { MappedInput } from "./mapped.slk";
 import netfile from "./netfile.slk";
 
-export fn map_input (path: string, allow_binary: bool) -> MappedFile? {
+export fn map_input (path: string, allow_binary: bool) -> MappedInput? {
   if path == "-" {
-    return map_stdin_spool(allow_binary);
+    let m_opt: MappedFile? = map_stdin_spool(allow_binary);
+    if m_opt == None {
+      return None;
+    }
+    let mut m: MappedFile = match (m_opt) { Some(v) => v, None => MappedFile{ ptr: 0, len: 0 } };
+    return Some(MappedInput{ file: move m, syntax_hint: "" });
   }
   if netfile::is_network_path(path) {
     return netfile::map_url(path, allow_binary);
   }
-  return map_path(path, allow_binary);
+  let m_opt2: MappedFile? = map_path(path, allow_binary);
+  if m_opt2 == None {
+    return None;
+  }
+  let mut m2: MappedFile = match (m_opt2) { Some(v) => v, None => MappedFile{ ptr: 0, len: 0 } };
+  return Some(MappedInput{ file: move m2, syntax_hint: "" });
 }
-

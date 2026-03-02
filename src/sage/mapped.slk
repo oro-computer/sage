@@ -1,0 +1,12 @@
+module sage::mapped;
+
+import { MappedFile } from "./file.slk";
+
+export struct MappedInput {
+  file: MappedFile,
+  syntax_hint: string,
+}
+
+export fn mapped_input_empty () -> MappedInput {
+  return MappedInput{ file: MappedFile{ ptr: 0, len: 0 }, syntax_hint: "" };
+}

@@ -29,6 +29,9 @@
 #include <mbedtls/error.h>
 #include <mbedtls/net_sockets.h>
 #include <mbedtls/ssl.h>
+#include <mbedtls/x509.h>
+#include <mbedtls/x509_crt.h>
+#include <psa/crypto.h>
 
 #include "quickjs.h"
 
@@ -206,6 +209,63 @@ static pthread_once_t sage_qjs_sodium_once = PTHREAD_ONCE_INIT;
 static int sage_qjs_sodium_init_rc = -1;
 static void sage_qjs_sodium_init_once(void) {
   sage_qjs_sodium_init_rc = sodium_init();
+}
+
+static pthread_once_t sage_qjs_system_ca_once = PTHREAD_ONCE_INIT;
+static mbedtls_x509_crt sage_qjs_system_ca;
+static int sage_qjs_system_ca_ok = 0;
+static char *sage_qjs_system_ca_path = NULL;
+static int sage_qjs_system_ca_try_path(const char *path) {
+  if (!path || !*path) {
+    return -1;
+  }
+  uint8_t *buf = NULL;
+  size_t len = 0;
+  if (sage_qjs_read_file(path, &buf, &len) != 0) {
+    return -1;
+  }
+
+  // For PEM, mbedTLS expects a NUL terminator included in the length. Our
+  // reader always appends one byte of NUL, so pass len+1 here.
+  int rc = mbedtls_x509_crt_parse(&sage_qjs_system_ca, buf, len + 1);
+  free(buf);
+  if (rc == 0) {
+    if (!sage_qjs_system_ca_path) {
+      sage_qjs_system_ca_path = strdup(path);
+    }
+    return 0;
+  }
+
+  // Clear any partial chain before trying the next path.
+  mbedtls_x509_crt_free(&sage_qjs_system_ca);
+  mbedtls_x509_crt_init(&sage_qjs_system_ca);
+  return -1;
+}
+static void sage_qjs_system_ca_init_once(void) {
+  mbedtls_x509_crt_init(&sage_qjs_system_ca);
+  sage_qjs_system_ca_ok = 0;
+
+  const char *p_env = getenv("SSL_CERT_FILE");
+  const char *paths[] = {
+      "/etc/ssl/certs/ca-certificates.crt",
+      "/etc/pki/tls/certs/ca-bundle.crt",
+      "/etc/ssl/ca-bundle.pem",
+      "/etc/ssl/cert.pem",
+  };
+
+  if (p_env && *p_env) {
+    if (sage_qjs_system_ca_try_path(p_env) == 0) {
+      sage_qjs_system_ca_ok = 1;
+      return;
+    }
+  }
+
+  for (size_t i = 0; i < (sizeof(paths) / sizeof(paths[0])); i++) {
+    if (sage_qjs_system_ca_try_path(paths[i]) == 0) {
+      sage_qjs_system_ca_ok = 1;
+      return;
+    }
+  }
 }
 
 static uint64_t sage_qjs_now_ns(void) {
@@ -2201,6 +2261,8 @@ static int sage_qjs_tcp_connect_host(const char *host, int port,
 typedef struct SageQjsConn {
   int fd;
   int is_tls;
+  int tls_rc;
+  uint32_t verify_flags;
   mbedtls_ssl_context ssl;
   mbedtls_ssl_config conf;
 } SageQjsConn;
@@ -2212,6 +2274,8 @@ static void sage_qjs_conn_init(SageQjsConn *c) {
   memset(c, 0, sizeof(*c));
   c->fd = -1;
   c->is_tls = 0;
+  c->tls_rc = 0;
+  c->verify_flags = 0;
   mbedtls_ssl_init(&c->ssl);
   mbedtls_ssl_config_init(&c->conf);
 }
@@ -2230,11 +2294,6 @@ static void sage_qjs_conn_close(SageQjsConn *c) {
     close(c->fd);
     c->fd = -1;
   }
-}
-
-static int sage_qjs_mbedtls_rng(void *ctx, unsigned char *buf, size_t len) {
-  (void)ctx;
-  return sage_qjs_random_bytes((uint8_t *)buf, len) == 0 ? 0 : -1;
 }
 
 static int sage_qjs_mbedtls_send(void *ctx, const unsigned char *buf, size_t len) {
@@ -2276,20 +2335,40 @@ static int sage_qjs_conn_start_tls(SageQjsConn *c, const char *hostname,
     return -1;
   }
 
+  // mbedTLS 4.x requires PSA crypto initialization for TLS/X.509.
+  (void)psa_crypto_init();
+
+  int insecure = (sage_qjs_env_u64("SAGE_FETCH_INSECURE", 0) != 0);
+
   int rc = mbedtls_ssl_config_defaults(
       &c->conf, MBEDTLS_SSL_IS_CLIENT, MBEDTLS_SSL_TRANSPORT_STREAM,
       MBEDTLS_SSL_PRESET_DEFAULT);
   if (rc != 0) {
+    c->tls_rc = rc;
     return -1;
   }
-  mbedtls_ssl_conf_authmode(&c->conf, MBEDTLS_SSL_VERIFY_NONE);
-  mbedtls_ssl_conf_rng(&c->conf, sage_qjs_mbedtls_rng, NULL);
+  int verify = !insecure;
+  if (verify) {
+    pthread_once(&sage_qjs_system_ca_once, sage_qjs_system_ca_init_once);
+    if (!sage_qjs_system_ca_ok) {
+      return -3;
+    }
+    mbedtls_ssl_conf_authmode(&c->conf, MBEDTLS_SSL_VERIFY_REQUIRED);
+    mbedtls_ssl_conf_ca_chain(&c->conf, &sage_qjs_system_ca, NULL);
+  } else {
+    mbedtls_ssl_conf_authmode(&c->conf, MBEDTLS_SSL_VERIFY_NONE);
+  }
 
   rc = mbedtls_ssl_setup(&c->ssl, &c->conf);
   if (rc != 0) {
+    c->tls_rc = rc;
     return -1;
   }
-  (void)mbedtls_ssl_set_hostname(&c->ssl, hostname);
+  rc = mbedtls_ssl_set_hostname(&c->ssl, hostname);
+  if (rc != 0) {
+    c->tls_rc = rc;
+    return -1;
+  }
   mbedtls_ssl_set_bio(&c->ssl, &c->fd, sage_qjs_mbedtls_send, sage_qjs_mbedtls_recv,
                       NULL);
 
@@ -2299,6 +2378,13 @@ static int sage_qjs_conn_start_tls(SageQjsConn *c, const char *hostname,
     }
     rc = mbedtls_ssl_handshake(&c->ssl);
     if (rc == 0) {
+      if (verify) {
+        uint32_t flags = mbedtls_ssl_get_verify_result(&c->ssl);
+        if (flags != 0) {
+          c->verify_flags = flags;
+          return -4;
+        }
+      }
       c->is_tls = 1;
       return 0;
     }
@@ -2316,7 +2402,21 @@ static int sage_qjs_conn_start_tls(SageQjsConn *c, const char *hostname,
       }
       continue;
     }
+    c->tls_rc = rc;
     return -1;
+  }
+}
+
+static void sage_qjs_sanitize_one_line(char *s) {
+  if (!s) {
+    return;
+  }
+  char *p = s;
+  while (*p) {
+    if (*p == '\n' || *p == '\r' || *p == '\t') {
+      *p = ' ';
+    }
+    p++;
   }
 }
 
@@ -2366,6 +2466,11 @@ static ssize_t sage_qjs_conn_read(SageQjsConn *c, uint8_t *buf, size_t len) {
     if (rc == 0) {
       return 0;
     }
+#ifdef MBEDTLS_ERR_SSL_RECEIVED_NEW_SESSION_TICKET
+    if (rc == MBEDTLS_ERR_SSL_RECEIVED_NEW_SESSION_TICKET) {
+      return SAGE_QJS_IO_WANT_READ;
+    }
+#endif
     if (rc == MBEDTLS_ERR_SSL_WANT_READ) {
       return SAGE_QJS_IO_WANT_READ;
     }
@@ -3245,13 +3350,68 @@ static void *sage_qjs_fetch_thread_main(void *opaque) {
       if (trc != 0) {
         sage_qjs_http_url_free(&u);
         sage_qjs_conn_close(&c);
-        if (trc == -2 || atomic_load_explicit(&f->cancelled, memory_order_relaxed)) {
-          f->err = strdup("fetch: aborted");
-        } else {
-          f->err = strdup("fetch: tls handshake failed");
+      if (trc == -2 || atomic_load_explicit(&f->cancelled, memory_order_relaxed)) {
+        f->err = strdup("fetch: aborted");
+      } else if (trc == -3) {
+        f->err = strdup("fetch: tls: no system CA bundle found (set SSL_CERT_FILE or SAGE_FETCH_INSECURE=1)");
+      } else if (trc == -4) {
+        char info[512];
+        info[0] = 0;
+        if (c.verify_flags != 0) {
+          (void)mbedtls_x509_crt_verify_info(info, sizeof(info), "", c.verify_flags);
         }
-        break;
+        sage_qjs_sanitize_one_line(info);
+
+        char msg[1024];
+        const char *ca = sage_qjs_system_ca_path ? sage_qjs_system_ca_path : "";
+        if (info[0] && ca[0]) {
+          snprintf(msg, sizeof(msg),
+                   "fetch: tls certificate verify failed: %s (ca=%s; set SAGE_FETCH_INSECURE=1 to disable verification)",
+                   info, ca);
+        } else if (info[0]) {
+          snprintf(msg, sizeof(msg),
+                   "fetch: tls certificate verify failed: %s (set SAGE_FETCH_INSECURE=1 to disable verification)",
+                   info);
+        } else if (ca[0]) {
+          snprintf(msg, sizeof(msg),
+                   "fetch: tls certificate verify failed (ca=%s; set SAGE_FETCH_INSECURE=1 to disable verification)",
+                   ca);
+        } else {
+          snprintf(msg, sizeof(msg),
+                   "fetch: tls certificate verify failed (set SAGE_FETCH_INSECURE=1 to disable verification)");
+        }
+        f->err = strdup(msg);
+      } else {
+        char detail[256];
+        detail[0] = 0;
+        if (c.tls_rc != 0) {
+          mbedtls_strerror(c.tls_rc, detail, sizeof(detail));
+        }
+        sage_qjs_sanitize_one_line(detail);
+
+        char msg[512];
+        const char *ca = sage_qjs_system_ca_path ? sage_qjs_system_ca_path : "";
+        const int is_verify_fail = (c.tls_rc == MBEDTLS_ERR_X509_CERT_VERIFY_FAILED);
+        const char *hint = is_verify_fail ? "; set SAGE_FETCH_INSECURE=1 to disable verification" : "";
+
+        if (c.tls_rc != 0 && detail[0] && ca[0]) {
+          snprintf(msg, sizeof(msg), "fetch: tls handshake failed (rc=%d: %s; ca=%s%s)",
+                   c.tls_rc, detail, ca, hint);
+        } else if (c.tls_rc != 0 && detail[0]) {
+          snprintf(msg, sizeof(msg), "fetch: tls handshake failed (rc=%d: %s%s)", c.tls_rc,
+                   detail, hint);
+        } else if (c.tls_rc != 0 && ca[0]) {
+          snprintf(msg, sizeof(msg), "fetch: tls handshake failed (rc=%d; ca=%s%s)", c.tls_rc,
+                   ca, hint);
+        } else if (c.tls_rc != 0) {
+          snprintf(msg, sizeof(msg), "fetch: tls handshake failed (rc=%d%s)", c.tls_rc, hint);
+        } else {
+          snprintf(msg, sizeof(msg), "fetch: tls handshake failed");
+        }
+        f->err = strdup(msg);
       }
+      break;
+    }
     }
 
     uint8_t *req = NULL;

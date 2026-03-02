@@ -14,8 +14,9 @@ import std::strings;
 
 import { memchr, memmem, memrchr } from "./sage/os.slk";
 import { MappedFile } from "./sage/file.slk";
+import { MappedInput, mapped_input_empty } from "./sage/mapped.slk";
 import { map_input } from "./sage/open.slk";
-import { is_network_path } from "./sage/netfile.slk";
+import { is_network_path, is_ssh_path } from "./sage/netfile.slk";
 import { BufferU8, ByteSlice, VecU64 } from "./sage/buf.slk";
 import { CompileFailed, ExecResult, RegExp, EXEC_MATCH, EXEC_NO_MATCH, exec_bytes, search_bytes } from "./sage/re.slk";
 import { Writer, write_str } from "./sage/out.slk";
@@ -167,6 +168,7 @@ let ALERT_COPIED: int = 11;
 let ALERT_COPY_TOO_BIG: int = 12;
 let ALERT_COPY_FAILED: int = 13;
 let ALERT_PLUGIN_ERROR: int = 14;
+let ALERT_SSH_UNSUPPORTED: int = 15;
 
 let COPY_MAX_BYTES: i64 = 200000;
 let SYN_STATE_LOOKBACK_BYTES: i64 = 65536;
@@ -1501,40 +1503,82 @@ fn load_sagerc (mut cfg: &Config, path_opt: string?) -> void {
   let _ = try_load_sagerc_home(mut cfg);
 }
 
+fn print_help_opt (mut w: &Writer, left: string, desc: string) -> void {
+  let _ = w.push_str(left);
+  let col: i64 = 28; // column where descriptions start
+  let left_len: i64 = std::runtime::mem::string_len(left);
+  if left_len < col {
+    var i: i64 = 0;
+    while i < (col - left_len) {
+      let _ = w.push_u8(32); // ' '
+      i = i + 1;
+    }
+  } else {
+    let _ = w.push_u8(32);
+  }
+  let _ = w.push_str(desc);
+  let _ = w.push_u8(10); // '\n'
+}
+
+fn path_for_syntax (path: string) -> string {
+  // Network tabs often include query strings / fragments (e.g. signed URLs).
+  // Those shouldn't affect syntax selection.
+  if !is_network_path(path) {
+    return path;
+  }
+  let p: u64 = std::runtime::mem::string_ptr(path);
+  let n: i64 = std::runtime::mem::string_len(path);
+  if p == 0 || n <= 0 {
+    return path;
+  }
+  var i: i64 = 0;
+  while i < n {
+    let b: u8 = std::runtime::mem::load_u8(p, i);
+    if b == 63 || b == 35 { // '?' / '#'
+      if i > 0 {
+        return std::runtime::mem::string_from_ptr_len(p, i as int);
+      }
+      return path;
+    }
+    i = i + 1;
+  }
+  return path;
+}
+
 fn print_help () -> void {
   let w_opt: Writer? = Writer.stderr(false, 8192);
   if w_opt == None { return; }
   let mut w: Writer = match (w_opt) { Some(v) => v, None => Writer{ fd: -1, color: false, buf: BufferU8.empty() } };
 
-  let _ = w.push_str("sage — a fast, ergonomic terminal pager (WIP)\n");
+  let _ = w.push_str("sage — a fast, ergonomic terminal pager\n");
   let _ = w.push_str("\n");
   let _ = w.push_str("Usage:\n");
   let _ = w.push_str("  sage <path> [path ...]  (directories expand to child files)\n");
   let _ = w.push_str("  cat <path> | sage\n");
   let _ = w.push_str("\n");
   let _ = w.push_str("Options:\n");
-  let _ = w.push_str("  -h, --help        Show help\n");
-  let _ = w.push_str("  -V, --version     Show version\n");
-  let _ = w.push_str("      --compile-cache Compile syntax files in XDG_CONFIG_HOME/sage/syntax\n");
-  let _ = w.push_str("      --list-syntax  List compiled syntax keys\n");
-  let _ = w.push_str("  -v, --verbose     Verbose logging to stderr\n");
-  let _ = w.push_str("      --no-plugins  Disable JavaScript plugins\n");
-  let _ = w.push_str("      --plugins-dir <path> Load plugins from <path>\n");
-  let _ = w.push_str("      --color <mode> Colorize UI (auto|always|never)\n");
-  let _ = w.push_str("      --no-color     Disable colors (same as --color never)\n");
-  let _ = w.push_str("      --theme <name> UI theme (default|ocean|light)\n");
-  let _ = w.push_str("      --[no-]syntax  Enable syntax highlighting for files (default: on)\n");
-  let _ = w.push_str("      --[no-]gutter  Show line number gutter (default: auto)\n");
-  let _ = w.push_str("      --[no-]mouse   Enable mouse wheel scrolling (default: on)\n");
-  let _ = w.push_str("      --rc <path>    Read config from <path> (default: ./.sagerc, $HOME/.sagerc)\n");
-  let _ = w.push_str("      --no-rc        Do not read any config file\n");
-  let _ = w.push_str("      --no-alt-screen Do not use the terminal alternate screen\n");
-  let _ = w.push_str("      --[no-]ansi    Allow ANSI SGR in content (default: on)\n");
-  let _ = w.push_str("      --raw         Render bytes as-is (unsafe)\n");
-  let _ = w.push_str("      --binary      Allow NUL bytes\n");
-  let _ = w.push_str("  -R, --regex       Search uses regex\n");
-  let _ = w.push_str("  -i, --ignore-case Case-insensitive search\n");
-  let _ = w.push_str("      --index-only  Build line index, print stats, exit\n");
+  print_help_opt(mut w, "  -h, --help", "Show help");
+  print_help_opt(mut w, "  -V, --version", "Show version");
+  print_help_opt(mut w, "      --compile-cache", "Compile syntax files in XDG_CONFIG_HOME/sage/syntax");
+  print_help_opt(mut w, "      --list-syntax", "List compiled syntax keys");
+  print_help_opt(mut w, "  -v, --verbose", "Verbose logging to stderr");
+  print_help_opt(mut w, "      --no-plugins", "Disable JavaScript plugins");
+  print_help_opt(mut w, "      --plugins-dir <path>", "Load plugins from <path>");
+  print_help_opt(mut w, "      --color <mode>", "Colorize UI (auto|always|never)");
+  print_help_opt(mut w, "      --no-color", "Disable colors (same as --color never)");
+  print_help_opt(mut w, "      --theme <name>", "UI theme (default|ocean|light)");
+  print_help_opt(mut w, "      --[no-]syntax", "Enable syntax highlighting for files (default: on)");
+  print_help_opt(mut w, "      --[no-]gutter", "Show line number gutter (default: auto)");
+  print_help_opt(mut w, "      --[no-]mouse", "Enable mouse wheel scrolling (default: on)");
+  print_help_opt(mut w, "      --rc <path>", "Read config from <path> (default: ./.sagerc, $HOME/.sagerc)");
+  print_help_opt(mut w, "      --no-rc", "Do not read any config file");
+  print_help_opt(mut w, "      --no-alt-screen", "Do not use the terminal alternate screen");
+  print_help_opt(mut w, "      --[no-]ansi", "Allow ANSI SGR in content (default: on)");
+  print_help_opt(mut w, "      --raw", "Render bytes as-is (unsafe)");
+  print_help_opt(mut w, "      --binary", "Allow NUL bytes");
+  print_help_opt(mut w, "  -R, --regex", "Search uses regex");
+  print_help_opt(mut w, "  -i, --ignore-case", "Case-insensitive search");
+  print_help_opt(mut w, "      --index-only", "Build line index, print stats, exit");
   let _ = w.push_str("\n");
   let _ = w.push_str("Keys: q quit, Ctrl-C quit/copy, Ctrl-K find, j/k/u/d/Up/Down scroll, MouseWheel scroll, Space/PgDn/Ctrl-D page down, b/PgUp/Ctrl-U page up, Left/Right page, gg/G top/bottom, Tab/Shift-Tab tabs, MouseDrag select, / or Ctrl-F search, n next, p prev, : cmd, L gutter, Esc cancel, ? help\n");
 
@@ -3006,6 +3050,7 @@ fn status_alert_len (alert: int) -> int {
   if alert == ALERT_COPY_TOO_BIG { return 12; } // "copy too big"
   if alert == ALERT_COPY_FAILED { return 11; }  // "copy failed"
   if alert == ALERT_PLUGIN_ERROR { return 10; } // "plugin err"
+  if alert == ALERT_SSH_UNSUPPORTED { return 15; } // "ssh unsupported"
   return 5;                    // "error"
 }
 
@@ -3257,6 +3302,8 @@ fn push_status_right (
       let _ = w.push_str("copy failed");
     } else if alert == ALERT_PLUGIN_ERROR {
       let _ = w.push_str("plugin err");
+    } else if alert == ALERT_SSH_UNSUPPORTED {
+      let _ = w.push_str("ssh unsupported");
     } else {
       let _ = w.push_str("error");
     }
@@ -5996,12 +6043,18 @@ export async fn main (argc: int, argv: u64) -> int {
       }
 
       // Map file contents.
-      let m_opt: MappedFile? = map_input(path, cfg.allow_binary);
-      if m_opt == None {
-        let _ = write_str(std::runtime::posix::io::STDERR_FD, "sage: failed to open input\n");
+      let mi_opt: MappedInput? = map_input(path, cfg.allow_binary);
+      if mi_opt == None {
+        if is_ssh_path(path) {
+          let _ = write_str(std::runtime::posix::io::STDERR_FD, "sage: ssh:// is not supported yet\n");
+        } else {
+          let _ = write_str(std::runtime::posix::io::STDERR_FD, "sage: failed to open input\n");
+        }
         return 2;
       }
-      let mut file: MappedFile = match (m_opt) { Some(v) => v, None => MappedFile{ ptr: 0, len: 0 } };
+      let mut mi: MappedInput = match (mi_opt) { Some(v) => v, None => mapped_input_empty() };
+      let mut file: MappedFile = mi.file;
+      mi.file = MappedFile{ ptr: 0, len: 0 };
 
       if v_on {
         let _ = vw.push_str("sage[v] index-only path=");
@@ -6185,7 +6238,7 @@ export async fn main (argc: int, argv: u64) -> int {
       } else if cfg.gutter == GUTTER_NEVER {
         t.gutter_on = false;
       } else {
-        t.gutter_on = if t.path != "-" { has_syntax_for_path(t.path) } else { false };
+        t.gutter_on = if t.path != "-" { has_syntax_for_path(path_for_syntax(t.path)) } else { false };
       }
       (tabs.ptr as TabState[](tabs.cap as int))[k_i] = t;
       k_i = k_i + 1;
@@ -6194,6 +6247,7 @@ export async fn main (argc: int, argv: u64) -> int {
     var active_tab: i64 = 0;
     var path: string = (tabs.ptr as TabState[](tabs.cap as int))[0].path;
     var gutter_on: bool = (tabs.ptr as TabState[](tabs.cap as int))[0].gutter_on;
+    var syntax_hint: string = "";
 
     if v_on {
       let _ = vw.push_str("sage[v] open path=");
@@ -6205,13 +6259,20 @@ export async fn main (argc: int, argv: u64) -> int {
     }
 
     // Map file contents for the active tab.
-    let m_opt: MappedFile? = map_input(path, cfg.allow_binary);
-    if m_opt == None {
+    let mi_opt: MappedInput? = map_input(path, cfg.allow_binary);
+    if mi_opt == None {
       tabs_free(mut tabs);
-      let _ = write_str(std::runtime::posix::io::STDERR_FD, "sage: failed to open input\n");
+      if is_ssh_path(path) {
+        let _ = write_str(std::runtime::posix::io::STDERR_FD, "sage: ssh:// is not supported yet\n");
+      } else {
+        let _ = write_str(std::runtime::posix::io::STDERR_FD, "sage: failed to open input\n");
+      }
       return 2;
     }
-    let mut file: MappedFile = match (m_opt) { Some(v) => v, None => MappedFile{ ptr: 0, len: 0 } };
+    let mut mi: MappedInput = match (mi_opt) { Some(v) => v, None => mapped_input_empty() };
+    syntax_hint = mi.syntax_hint;
+    let mut file: MappedFile = mi.file;
+    mi.file = MappedFile{ ptr: 0, len: 0 };
 
     if v_on {
       let _ = vw.push_str("sage[v] mapped bytes=");
@@ -6306,7 +6367,10 @@ export async fn main (argc: int, argv: u64) -> int {
     var syn_active: bool = false;
     let mut syn: Highlighter = highlighter_empty();
     if cfg.syntax && use_color && !cfg.unsafe_raw && path != "-" {
-      let syn_opt: Highlighter? = load_for_path(path);
+      let mut syn_opt: Highlighter? = load_for_path(path_for_syntax(path));
+      if syn_opt == None && syntax_hint != "" {
+        syn_opt = load_for_path(syntax_hint);
+      }
       if syn_opt != None {
         syn = match (syn_opt) { Some(v) => v, None => syn };
         syn_active = true;
@@ -7389,13 +7453,16 @@ export async fn main (argc: int, argv: u64) -> int {
         if want_tab >= 0 && want_tab < tabs.len && want_tab != active_tab {
           // Map the new tab first so a failed open doesn't destroy the current view.
           let new_state: TabState = (tabs.ptr as TabState[](tabs.cap as int))[want_tab];
-          let m2_opt: MappedFile? = map_input(new_state.path, cfg.allow_binary);
-          if m2_opt == None {
-            alert = ALERT_OPEN_FAILED;
+          let mi2_opt: MappedInput? = map_input(new_state.path, cfg.allow_binary);
+          if mi2_opt == None {
+            alert = if is_ssh_path(new_state.path) { ALERT_SSH_UNSUPPORTED } else { ALERT_OPEN_FAILED };
             need_redraw = true;
             continue;
           }
-          let mut file2: MappedFile = match (m2_opt) { Some(v) => v, None => MappedFile{ ptr: 0, len: 0 } };
+          let mut mi2: MappedInput = match (mi2_opt) { Some(v) => v, None => mapped_input_empty() };
+          let new_syntax_hint: string = mi2.syntax_hint;
+          let mut file2: MappedFile = mi2.file;
+          mi2.file = MappedFile{ ptr: 0, len: 0 };
 
           // Prepare a fresh indexer for the new file.
           let ch2_r = ChanU64.init(256);
@@ -7434,6 +7501,7 @@ export async fn main (argc: int, argv: u64) -> int {
           path = new_state.path;
           gutter_on = new_state.gutter_on;
           top_off = new_state.top_off;
+          syntax_hint = new_syntax_hint;
 
           // Replace file mapping.
           file = move file2;
@@ -7470,7 +7538,10 @@ export async fn main (argc: int, argv: u64) -> int {
           syn_active = false;
           syn = highlighter_empty();
           if cfg.syntax && use_color && !cfg.unsafe_raw && path != "-" {
-            let syn_opt2: Highlighter? = load_for_path(path);
+            let mut syn_opt2: Highlighter? = load_for_path(path_for_syntax(path));
+            if syn_opt2 == None && syntax_hint != "" {
+              syn_opt2 = load_for_path(syntax_hint);
+            }
             if syn_opt2 != None {
               syn = match (syn_opt2) { Some(v) => v, None => syn };
               syn_active = true;
@@ -7685,13 +7756,16 @@ export async fn main (argc: int, argv: u64) -> int {
               if want_tab_cmd >= 0 && want_tab_cmd < tabs.len && want_tab_cmd != active_tab {
                 // Map the new tab first so a failed open doesn't destroy the current view.
                 let new_state2: TabState = (tabs.ptr as TabState[](tabs.cap as int))[want_tab_cmd];
-                let m3_opt: MappedFile? = map_input(new_state2.path, cfg.allow_binary);
-                if m3_opt == None {
-                  alert = ALERT_OPEN_FAILED;
+                let mi3_opt: MappedInput? = map_input(new_state2.path, cfg.allow_binary);
+                if mi3_opt == None {
+                  alert = if is_ssh_path(new_state2.path) { ALERT_SSH_UNSUPPORTED } else { ALERT_OPEN_FAILED };
                   need_redraw = true;
                   continue;
                 }
-                let mut file3: MappedFile = match (m3_opt) { Some(v) => v, None => MappedFile{ ptr: 0, len: 0 } };
+                let mut mi3: MappedInput = match (mi3_opt) { Some(v) => v, None => mapped_input_empty() };
+                let new_syntax_hint2: string = mi3.syntax_hint;
+                let mut file3: MappedFile = mi3.file;
+                mi3.file = MappedFile{ ptr: 0, len: 0 };
 
                 // Prepare a fresh indexer for the new file.
                 let ch3_r = ChanU64.init(256);
@@ -7730,6 +7804,7 @@ export async fn main (argc: int, argv: u64) -> int {
                 path = new_state2.path;
                 gutter_on = new_state2.gutter_on;
                 top_off = new_state2.top_off;
+                syntax_hint = new_syntax_hint2;
 
                 // Replace file mapping.
                 file = move file3;
@@ -7766,7 +7841,10 @@ export async fn main (argc: int, argv: u64) -> int {
                 syn_active = false;
                 syn = highlighter_empty();
                 if cfg.syntax && use_color && !cfg.unsafe_raw && path != "-" {
-                  let syn_opt2: Highlighter? = load_for_path(path);
+                  let mut syn_opt2: Highlighter? = load_for_path(path_for_syntax(path));
+                  if syn_opt2 == None && syntax_hint != "" {
+                    syn_opt2 = load_for_path(syntax_hint);
+                  }
                   if syn_opt2 != None {
                     syn = match (syn_opt2) { Some(v) => v, None => syn };
                     syn_active = true;
