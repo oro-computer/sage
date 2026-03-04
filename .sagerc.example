@@ -1,3 +1,5 @@
+# vim: ft=toml
+#
 # Example `sage` config file.
 #
 # Location (loaded in this order):
@@ -5,35 +7,46 @@
 # - ./.sagerc
 # - $HOME/.sagerc
 #
-# Format:
-#   key = value
-# Comments start with `#` or `;`.
+# Format: TOML
 #
 # CLI flags always override this file.
 
 # Theme + UI chrome.
-theme = ocean            # default | ocean | light
-color = auto             # auto | always | never
+theme = "ocean"          # "default" | "ocean" | "light"
+color = "auto"           # "auto" | "always" | "never"
 alt_screen = true
 mouse = true             # enable mouse wheel scrolling
 
 # Content handling.
 ansi = true              # allow ESC[...m in content
 syntax = true            # enable syntax highlighting for file paths
-gutter = auto            # auto | always | never | true | false
+gutter = "auto"          # "auto" | "always" | "never" | true | false
 
 # Search defaults.
 regex = false
 ignore_case = false
 
 # Ctrl-K find tool (defaults to rg/ag/slg/grep).
-# Note: value is whitespace-split (no shell quoting).
-# find_cmd = rg --vimgrep --
+# - String form is whitespace-split (no shell quoting).
+# - Array form preserves arguments.
+# find_cmd = "rg --vimgrep --"
+# find_cmd = ["rg", "--vimgrep", "--"]
+
+# Syntax override map (pattern -> syntax key).
+# Matching:
+# - exact basename (e.g. "Makefile")
+# - exact extension (e.g. "rs", "toml", "sagerc")
+# - glob patterns with '*' and '?' (matched against basename unless pattern contains '/')
+#
+# [syntax_map]
+# "Makefile" = "make"
+# "*.bashrc" = "bash"
+# "sagerc" = "toml"
 
 # Plugins (QuickJS / JavaScript).
 plugins = true
-# plugins_dir = /absolute/path/to/plugins
-# plugin_log_path = /absolute/path/to/plugins.log
+# plugins_dir = "/absolute/path/to/plugins"
+# plugin_log_path = "/absolute/path/to/plugins.log"
 # plugin_load_timeout_ms = 500
 # plugin_event_timeout_ms = 50
 # plugin_mem_limit_mb = 64

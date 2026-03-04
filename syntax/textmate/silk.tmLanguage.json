@@ -195,7 +195,7 @@
         },
         {
           "name": "keyword.declaration.silk",
-          "match": "\\b(package|module|import|from|export|public|private|default|const|let|var|mut|move|fn|test|theory|struct|extends|enum|type|error|interface|impl|using|as|raw|ext)\\b"
+          "match": "\\b(package|module|import|from|export|public|private|default|const|let|var|mut|move|fn|c_fn|test|theory|struct|extends|enum|type|error|interface|impl|using|as|raw|ext)\\b"
         },
         {
           "name": "keyword.modifier.silk",
@@ -203,7 +203,7 @@
         },
         {
           "name": "keyword.other.silk",
-          "match": "\\b(region|with|new|sizeof|alignof|offsetof|typename|asm|where|is)\\b"
+          "match": "\\b(region|with|new|sizeof|alignof|offsetof|typename|asm|where|is|attr)\\b"
         }
       ]
     },
@@ -211,11 +211,11 @@
       "patterns": [
         {
           "name": "storage.type.silk",
-          "match": "\\b(bool|u8|i8|u16|i16|u32|i32|u64|i64|i128|u128|int|usize|size|isize|f32|f64|f128|char|string|regexp|void)\\b"
+          "match": "\\b(bool|u8|i8|u16|i16|u32|i32|u64|i64|i128|u128|int|usize|size|isize|f32|f64|f128|char|string|regexp|range|void)\\b"
         },
         {
           "name": "support.type.silk",
-          "match": "\\b(Region|Instant|Duration|Option|Buffer|Self|Task|Promise)\\b"
+          "match": "\\b(Region|Instant|Duration|Option|Result|Buffer|Self|Task|Promise)\\b"
         },
         {
           "name": "support.type.silk",

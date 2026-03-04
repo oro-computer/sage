@@ -1,0 +1,50 @@
+%YAML 1.2
+---
+# Minimal YAML syntax for `sage` (subset-friendly).
+#
+# Notes:
+# - This is not a full YAML grammar.
+# - It aims for decent readability: comments, scalars, keys, and basic values.
+name: YAML
+scope: source.yaml
+version: 2
+
+file_extensions:
+  - yaml
+  - yml
+
+first_line_match: |-
+  (?xi:
+    ^ %yaml \b
+  )
+
+contexts:
+  main:
+    - match: '^\s*#.*$'
+      scope: comment.line.number-sign.yaml
+
+    - match: '^\s*(?:---|\.\.\.)\s*$'
+      scope: keyword.control.yaml
+
+    - match: '^\s*-(?=\s+)'
+      scope: keyword.operator.list-item.yaml
+
+    # Keys: best-effort "thing before ':'".
+    - match: '^\s*[^#:\n]+(?=\s*:)'
+      scope: entity.name.tag.yaml
+
+    - match: ':'
+      scope: punctuation.separator.key-value.yaml
+
+    - match: '\b(true|false|null)\b'
+      scope: constant.language.yaml
+
+    - match: '\b-?(?:0|[1-9][0-9_]*)(?:\.[0-9_]+)?\b'
+      scope: constant.numeric.yaml
+
+    - match: "\"(?:\\\\.|[^\"\\\\])*\""
+      scope: string.quoted.double.yaml
+
+    - match: "'(?:''|[^'])*'"
+      scope: string.quoted.single.yaml
+

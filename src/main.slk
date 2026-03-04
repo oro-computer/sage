@@ -10,6 +10,7 @@ import std::runtime::posix::time;
 import std::process;
 import std::result;
 import std::sync;
+import std::toml;
 import std::strings;
 
 import { memchr, memmem, memrchr } from "./sage/os.slk";
@@ -125,6 +126,257 @@ struct Theme {
   syn_preproc: int,
 }
 
+struct SyntaxMapEntry {
+  pattern: string,
+  syntax: string,
+}
+
+struct SyntaxMap {
+  ptr: u64,
+  len: i64,
+  cap: i64,
+}
+
+fn syntax_map_empty () -> SyntaxMap {
+  return SyntaxMap{ ptr: 0, len: 0, cap: 0 };
+}
+
+fn syntax_map_is_empty (m: &SyntaxMap) -> bool {
+  return m.ptr == 0 || m.len <= 0;
+}
+
+fn syntax_map_ensure_cap (mut m: &SyntaxMap, need: i64) -> bool {
+  if need <= m.cap {
+    return true;
+  }
+
+  var new_cap: i64 = if m.cap > 0 { m.cap } else { 8 };
+  while new_cap < need {
+    new_cap = new_cap * 2;
+    if new_cap < 0 {
+      new_cap = need;
+      break;
+    }
+  }
+
+  let elem_bytes: i64 = (sizeof (SyntaxMapEntry)) as i64;
+  let new_bytes: i64 = new_cap * elem_bytes;
+  if new_bytes <= 0 {
+    return false;
+  }
+
+  let p: u64 = std::runtime::mem::realloc(m.ptr, new_bytes);
+  if p == 0 {
+    return false;
+  }
+  m.ptr = p;
+  m.cap = new_cap;
+  return true;
+}
+
+fn syntax_map_push_owned (mut m: &SyntaxMap, pattern: string, syntax: string) -> bool {
+  let pat_len: i64 = std::runtime::mem::string_len(pattern);
+  let syn_len: i64 = std::runtime::mem::string_len(syntax);
+  if pat_len <= 0 || syn_len <= 0 {
+    return false;
+  }
+
+  let need: i64 = m.len + 1;
+  if !syntax_map_ensure_cap(mut m, need) {
+    return false;
+  }
+
+  (m.ptr as SyntaxMapEntry[](m.cap as int))[m.len] = SyntaxMapEntry{ pattern: pattern, syntax: syntax };
+  m.len = need;
+  return true;
+}
+
+fn contains_byte (s: string, want: u8) -> bool {
+  let p: u64 = std::runtime::mem::string_ptr(s);
+  let n: i64 = std::runtime::mem::string_len(s);
+  if p == 0 || n <= 0 {
+    return false;
+  }
+  var i: i64 = 0;
+  while i < n {
+    if std::runtime::mem::load_u8(p, i) == want {
+      return true;
+    }
+    i = i + 1;
+  }
+  return false;
+}
+
+fn has_glob_meta (s: string) -> bool {
+  // Minimal glob support: '*', '?', '['.
+  return contains_byte(s, 42) || contains_byte(s, 63) || contains_byte(s, 91);
+}
+
+fn glob_match_ptr_len (pat_ptr: u64, pat_len: i64, text_ptr: u64, text_len: i64) -> bool {
+  // Supports '*' and '?' with simple backtracking.
+  if pat_ptr == 0 || text_ptr == 0 || pat_len < 0 || text_len < 0 {
+    return false;
+  }
+
+  var pi: i64 = 0;
+  var ti: i64 = 0;
+  var star_pi: i64 = -1;
+  var star_ti: i64 = 0;
+
+  while ti < text_len {
+    if pi < pat_len {
+      let pc: u8 = std::runtime::mem::load_u8(pat_ptr, pi);
+      if pc == 63 { // '?'
+        pi = pi + 1;
+        ti = ti + 1;
+        continue;
+      }
+      if pc == 42 { // '*'
+        // Collapse consecutive '*'.
+        while pi < pat_len && std::runtime::mem::load_u8(pat_ptr, pi) == 42 { pi = pi + 1; }
+        if pi >= pat_len {
+          return true;
+        }
+        star_pi = pi;
+        star_ti = ti;
+        continue;
+      }
+      if pc == std::runtime::mem::load_u8(text_ptr, ti) {
+        pi = pi + 1;
+        ti = ti + 1;
+        continue;
+      }
+    }
+
+    if star_pi >= 0 {
+      star_ti = star_ti + 1;
+      ti = star_ti;
+      pi = star_pi;
+      continue;
+    }
+    return false;
+  }
+
+  // Skip trailing '*'.
+  while pi < pat_len && std::runtime::mem::load_u8(pat_ptr, pi) == 42 { pi = pi + 1; }
+  return pi == pat_len;
+}
+
+struct PathParts {
+  base_ptr: u64,
+  base_len: i64,
+  ext_ptr: u64,
+  ext_len: i64,
+}
+
+fn path_basename_and_ext (path: string) -> PathParts {
+  let p: u64 = std::runtime::mem::string_ptr(path);
+  let n: i64 = std::runtime::mem::string_len(path);
+  if p == 0 || n <= 0 {
+    return PathParts{ base_ptr: 0, base_len: 0, ext_ptr: 0, ext_len: 0 };
+  }
+
+  // basename start.
+  var base0: i64 = 0;
+  var i: i64 = 0;
+  while i < n {
+    if std::runtime::mem::load_u8(p, i) == 47 { // '/'
+      base0 = i + 1;
+    }
+    i = i + 1;
+  }
+
+  let base_ptr: u64 = p + (base0 as u64);
+  let base_len: i64 = n - base0;
+  if base_len <= 0 {
+    return PathParts{ base_ptr: 0, base_len: 0, ext_ptr: 0, ext_len: 0 };
+  }
+
+  // ext: last '.' after base0, but not the first char of basename.
+  var dot: i64 = -1;
+  var j: i64 = 0;
+  while j < base_len {
+    if std::runtime::mem::load_u8(base_ptr, j) == 46 { // '.'
+      dot = j;
+    }
+    j = j + 1;
+  }
+
+  if dot <= 0 || dot >= base_len - 1 {
+    // Dotfile like ".gitignore": treat "gitignore" as an extension key.
+    if dot == 0 && base_len > 1 {
+      return PathParts{
+        base_ptr: base_ptr, base_len: base_len,
+        ext_ptr: base_ptr + 1, ext_len: base_len - 1
+      };
+    }
+    return PathParts{ base_ptr: base_ptr, base_len: base_len, ext_ptr: 0, ext_len: 0 };
+  }
+
+  let ext_ptr: u64 = base_ptr + ((dot + 1) as u64);
+  let ext_len: i64 = base_len - (dot + 1);
+  return PathParts{ base_ptr: base_ptr, base_len: base_len, ext_ptr: ext_ptr, ext_len: ext_len };
+}
+
+fn syntax_map_lookup (m: &SyntaxMap, path: string) -> string {
+  if syntax_map_is_empty(m) {
+    return "";
+  }
+
+  let parts: PathParts = path_basename_and_ext(path);
+  if parts.base_ptr == 0 || parts.base_len <= 0 {
+    return "";
+  }
+
+  let base: string = std::runtime::mem::string_from_ptr_len(parts.base_ptr, parts.base_len as int);
+  let ext: string = if parts.ext_ptr != 0 && parts.ext_len > 0 {
+    std::runtime::mem::string_from_ptr_len(parts.ext_ptr, parts.ext_len as int)
+  } else {
+    ""
+  };
+
+  var i: i64 = m.len - 1;
+  while i >= 0 {
+    let e: SyntaxMapEntry = (m.ptr as SyntaxMapEntry[](m.cap as int))[i];
+    let pat: string = e.pattern;
+
+    if has_glob_meta(pat) {
+      let target: string = if contains_byte(pat, 47) { path } else { base };
+      let pp: u64 = std::runtime::mem::string_ptr(pat);
+      let pn: i64 = std::runtime::mem::string_len(pat);
+      let tp: u64 = std::runtime::mem::string_ptr(target);
+      let tn: i64 = std::runtime::mem::string_len(target);
+      if glob_match_ptr_len(pp, pn, tp, tn) {
+        return e.syntax;
+      }
+      i = i - 1;
+      continue;
+    }
+
+    if pat == base {
+      return e.syntax;
+    }
+    if ext != "" && pat == ext {
+      return e.syntax;
+    }
+    // Extension with a leading dot: ".toml" etc.
+    if ext != "" {
+      let pat_ptr: u64 = std::runtime::mem::string_ptr(pat);
+      let pat_len: i64 = std::runtime::mem::string_len(pat);
+      if pat_len > 1 && pat_ptr != 0 && std::runtime::mem::load_u8(pat_ptr, 0) == 46 { // '.'
+        let pat_ext: string = std::runtime::mem::string_from_ptr_len(pat_ptr + 1, (pat_len - 1) as int);
+        if pat_ext == ext {
+          return e.syntax;
+        }
+      }
+    }
+
+    i = i - 1;
+  }
+
+  return "";
+}
+
 struct Config {
   help: bool,
   version: bool,
@@ -132,6 +384,7 @@ struct Config {
   list_syntax: bool,
   verbose: bool,
   syntax: bool,
+  syntax_map: SyntaxMap,
   gutter: int,
   mouse: bool,
   unsafe_raw: bool,
@@ -168,7 +421,6 @@ let ALERT_COPIED: int = 11;
 let ALERT_COPY_TOO_BIG: int = 12;
 let ALERT_COPY_FAILED: int = 13;
 let ALERT_PLUGIN_ERROR: int = 14;
-let ALERT_SSH_UNSUPPORTED: int = 15;
 
 let COPY_MAX_BYTES: i64 = 200000;
 let SYN_STATE_LOOKBACK_BYTES: i64 = 65536;
@@ -306,6 +558,7 @@ fn cfg_default () -> Config {
     list_syntax: false,
     verbose: false,
     syntax: true,
+    syntax_map: syntax_map_empty(),
     gutter: GUTTER_AUTO,
     mouse: true,
     unsafe_raw: false,
@@ -1388,6 +1641,168 @@ fn parse_sagerc_bytes (mut cfg: &Config, buf: &BufferU8) -> void {
   }
 }
 
+fn parse_sagerc_toml_bytes (mut cfg: &Config, buf: &BufferU8) -> bool {
+  let bytes = buf.as_bytes();
+  if bytes.ptr == 0 || bytes.len <= 0 {
+    return false;
+  }
+
+  let src: string = std::runtime::mem::string_from_ptr_len(bytes.ptr, bytes.len as int);
+  let mut doc: std::toml::Document = std::toml::Document{};
+  let pr: std::toml::ParseResult = doc.parse(src);
+  if pr.is_err() {
+    // Keep this non-fatal: a config file shouldn't brick the pager.
+    let pe: std::toml::ParseError = std::toml::ParseResult.err_value(pr) ?? std::toml::ParseError.ok();
+    let _ = write_str(2, "sage: invalid .sagerc TOML: ");
+    let _ = write_str(2, std::toml::error_message(pe.kind));
+    let _ = write_str(2, " (line=");
+    write_i64_dec(2, pe.line);
+    let _ = write_str(2, " col=");
+    write_i64_dec(2, pe.column);
+    let _ = write_str(2, ")\n");
+    return false;
+  }
+
+  let root: std::toml::ValueId = match (pr) { Ok(v) => v, Err(_) => -1 };
+  if root < 0 {
+    return false;
+  }
+
+  // Apply all top-level primitive keys via the existing `key=value` handler
+  // so we keep key aliases and value parsing behavior consistent.
+  let mut member_opt: std::toml::ValueId? = doc.table_first_member(root);
+  while member_opt != None {
+    let member: std::toml::ValueId = member_opt ?? -1;
+    member_opt = doc.member_next(member);
+
+    let k_view_opt: std::toml::StrView? = doc.member_key_view(member);
+    let v_id_opt: std::toml::ValueId? = doc.member_value(member);
+    if k_view_opt == None || v_id_opt == None {
+      continue;
+    }
+    let k_view: std::toml::StrView = k_view_opt ?? std::toml::StrView.empty();
+    let k_ptr: u64 = k_view.ptr;
+    let k_len: i64 = k_view.len;
+    if k_ptr == 0 || k_len <= 0 {
+      continue;
+    }
+
+    // Handled separately below.
+    if eq_nocase(k_ptr, k_len, "syntax_map") || eq_nocase(k_ptr, k_len, "syntax-map") {
+      continue;
+    }
+
+    let v_id: std::toml::ValueId = v_id_opt ?? -1;
+    let tag_opt: int? = doc.tag(v_id);
+    let tag: int = tag_opt ?? -1;
+
+    if tag == std::toml::TAG_STRING {
+      let s_opt: string? = doc.as_string(v_id);
+      if s_opt != None {
+        let s: string = match (s_opt) { Some(v) => v, None => "" };
+        let v_ptr: u64 = std::runtime::mem::string_ptr(s);
+        let v_len: i64 = std::runtime::mem::string_len(s);
+        apply_sagerc_kv(mut cfg, k_ptr, k_len, v_ptr, v_len);
+      }
+      continue;
+    }
+    if tag == std::toml::TAG_BOOL {
+      let b_opt: bool? = doc.as_bool(v_id);
+      if b_opt != None {
+        let b: bool = match (b_opt) { Some(v) => v, None => false };
+        let lit: string = if b { "true" } else { "false" };
+        let v_ptr2: u64 = std::runtime::mem::string_ptr(lit);
+        let v_len2: i64 = std::runtime::mem::string_len(lit);
+        apply_sagerc_kv(mut cfg, k_ptr, k_len, v_ptr2, v_len2);
+      }
+      continue;
+    }
+    if tag == std::toml::TAG_INT {
+      let lex_opt: string? = doc.as_int_lexeme(v_id);
+      if lex_opt != None {
+        let lex: string = match (lex_opt) { Some(v) => v, None => "" };
+        let v_ptr3: u64 = std::runtime::mem::string_ptr(lex);
+        let v_len3: i64 = std::runtime::mem::string_len(lex);
+        apply_sagerc_kv(mut cfg, k_ptr, k_len, v_ptr3, v_len3);
+      }
+      continue;
+    }
+
+    // Special-case: `find_cmd` can be expressed as a TOML array for clarity.
+    if tag == std::toml::TAG_ARRAY && (eq_nocase(k_ptr, k_len, "find_cmd") || eq_nocase(k_ptr, k_len, "find-cmd") || eq_nocase(k_ptr, k_len, "find")) {
+      let mut joined: std::strings::String = std::strings::String.empty();
+
+      let mut first: bool = true;
+      let mut it_opt: std::toml::ValueId? = doc.array_first(v_id);
+      while it_opt != None {
+        let it: std::toml::ValueId = it_opt ?? -1;
+        it_opt = doc.next_sibling(it);
+
+        let s_opt2: string? = doc.as_string(it);
+        if s_opt2 == None {
+          continue;
+        }
+        let s2: string = match (s_opt2) { Some(v) => v, None => "" };
+        if std::runtime::mem::string_len(s2) <= 0 {
+          continue;
+        }
+
+        if !first {
+          let _ = joined.push_u8(32); // ' '
+        }
+        first = false;
+        let _ = joined.push_string(s2);
+      }
+
+      if joined.len > 0 {
+        let s3: string = joined.as_string();
+        apply_sagerc_kv(mut cfg, k_ptr, k_len, std::runtime::mem::string_ptr(s3), std::runtime::mem::string_len(s3));
+      }
+      joined.drop();
+      continue;
+    }
+  }
+
+  // syntax_map = { pattern = "syntax", ... }
+  let map_id_opt: std::toml::ValueId? = doc.table_get(root, "syntax_map");
+  if map_id_opt != None {
+    let map_id: std::toml::ValueId = map_id_opt ?? -1;
+    let tag_opt2: int? = doc.tag(map_id);
+    let tag2: int = tag_opt2 ?? -1;
+    if tag2 == std::toml::TAG_TABLE {
+      let mut mm_opt: std::toml::ValueId? = doc.table_first_member(map_id);
+      while mm_opt != None {
+        let member: std::toml::ValueId = mm_opt ?? -1;
+        mm_opt = doc.member_next(member);
+
+        let k_opt: string? = doc.member_key(member);
+        let v_opt: std::toml::ValueId? = doc.member_value(member);
+        if k_opt == None || v_opt == None {
+          continue;
+        }
+        let k: string = match (k_opt) { Some(v) => v, None => "" };
+        let v: std::toml::ValueId = v_opt ?? -1;
+        let s_opt: string? = doc.as_string(v);
+        if s_opt == None {
+          continue;
+        }
+        let s: string = match (s_opt) { Some(x) => x, None => "" };
+
+        let k_own_opt: string? = cstr_copy_owned(k);
+        let s_own_opt: string? = cstr_copy_owned(s);
+        if k_own_opt == None || s_own_opt == None {
+          continue;
+        }
+        let k_own: string = match (k_own_opt) { Some(x) => x, None => "" };
+        let s_own: string = match (s_own_opt) { Some(x) => x, None => "" };
+        let _ = syntax_map_push_owned(mut cfg.syntax_map, k_own, s_own);
+      }
+    }
+  }
+
+  return true;
+}
+
 fn read_file_all (path: string, mut out: &BufferU8) -> bool {
   out.clear();
   let fd: int = std::runtime::posix::fs::open(path, std::runtime::posix::fs::O_RDONLY, 0) as int;
@@ -1432,7 +1847,7 @@ fn try_load_sagerc_path (mut cfg: &Config, path: string) -> bool {
   let mut buf: BufferU8 = match (buf_opt) { Some(v) => v, None => BufferU8.empty() };
   let ok: bool = read_file_all(path, mut buf);
   if ok {
-    parse_sagerc_bytes(mut cfg, &buf);
+    let _ = parse_sagerc_toml_bytes(mut cfg, &buf);
   }
   // Buffer drops automatically.
   return ok;
@@ -3050,7 +3465,6 @@ fn status_alert_len (alert: int) -> int {
   if alert == ALERT_COPY_TOO_BIG { return 12; } // "copy too big"
   if alert == ALERT_COPY_FAILED { return 11; }  // "copy failed"
   if alert == ALERT_PLUGIN_ERROR { return 10; } // "plugin err"
-  if alert == ALERT_SSH_UNSUPPORTED { return 15; } // "ssh unsupported"
   return 5;                    // "error"
 }
 
@@ -3302,8 +3716,6 @@ fn push_status_right (
       let _ = w.push_str("copy failed");
     } else if alert == ALERT_PLUGIN_ERROR {
       let _ = w.push_str("plugin err");
-    } else if alert == ALERT_SSH_UNSUPPORTED {
-      let _ = w.push_str("ssh unsupported");
     } else {
       let _ = w.push_str("error");
     }
@@ -3415,7 +3827,7 @@ fn draw_help (
     r = r + 1;
   }
   if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.accent, "/ or Ctrl-F", help_desc_col, "enter a query (jumps to first match)"); r = r + 1; }
-  if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.accent, "Ctrl-K", help_desc_col, "find across open files (Tab/Shift-Tab navigate)"); r = r + 1; }
+  if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.accent, "Ctrl-K", help_desc_col, "find across open files (Tab/Shift-Tab, PgUp/PgDn, Ctrl-U/Ctrl-D navigate)"); r = r + 1; }
   if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.accent, "DoubleClick", help_desc_col, "set query to clicked word"); r = r + 1; }
   if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.accent, "n", help_desc_col, "next match"); r = r + 1; }
   if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.accent, "p", help_desc_col, "previous match"); r = r + 1; }
@@ -4897,6 +5309,70 @@ fn parse_find_loc (line_ptr: u64, line_len: i64, fmt: int) -> FindLoc? {
   return Some(FindLoc{ path_ptr: line_ptr, path_len: c1, line1: line1, col1: 1 });
 }
 
+struct MatchSpan {
+  off: i64,
+  end: i64,
+}
+
+fn find_result_match_span (file: &MappedFile, line_start: i64, col1: i64, has_col: bool, query: &BufferU8) -> MatchSpan? {
+  if file.ptr == 0 || file.len <= 0 {
+    return None;
+  }
+
+  var line_s: i64 = line_start;
+  if line_s < 0 { line_s = 0; }
+  if line_s >= file.len { return None; }
+
+  // Find the line end (exclude '\n').
+  var line_e: i64 = file.len;
+  let tail: i64 = file.len - line_s;
+  if tail > 0 {
+    let nl_ptr: u64 = memchr(file.ptr + (line_s as u64), 10, tail);
+    if nl_ptr != 0 {
+      line_e = (nl_ptr - file.ptr) as i64;
+    }
+  }
+  if line_e <= line_s {
+    return None;
+  }
+
+  let qb = query.as_bytes();
+  let q_ptr: u64 = qb.ptr;
+  let q_len0: i64 = qb.len;
+  let q_len: i64 = if q_len0 > 256 { 256 } else { q_len0 };
+
+  var off: i64 = line_s;
+  if has_col {
+    var c: i64 = col1;
+    if c < 1 { c = 1; }
+    off = line_s + (c - 1);
+    if off < line_s { off = line_s; }
+    if off >= line_e { off = line_s; }
+  } else {
+    // No column info: best-effort literal search within the line.
+    if q_ptr != 0 && q_len > 0 && (line_e - line_s) >= q_len {
+      let p: u64 = memmem(file.ptr + (line_s as u64), line_e - line_s, q_ptr, q_len);
+      if p != 0 {
+        off = (p - file.ptr) as i64;
+      }
+    }
+  }
+
+  var end: i64 = off + 1;
+  if q_ptr != 0 && q_len > 0 {
+    end = off + q_len;
+  }
+  if end > line_e { end = line_e; }
+  if end <= off {
+    end = min_i64(line_e, off + 1);
+  }
+  if end <= off {
+    return None;
+  }
+
+  return Some(MatchSpan{ off: off, end: end });
+}
+
 struct FindRun {
   fmt: int,
   exit_code: int,
@@ -5321,7 +5797,7 @@ fn draw_find_modal (
         let _ = push_head_trunc_plain(mut w, ep, take, cols);
       }
     } else {
-      let _ = w.push_str("Up/Down/Tab/Shift-Tab to navigate, Enter to jump, Esc to close, Wheel to scroll.");
+      let _ = w.push_str("Up/Down/Tab/Shift-Tab navigate, PgUp/PgDn/Ctrl-U/Ctrl-D page, Enter jump, Esc close, Wheel scroll.");
     }
     ansi_reset(mut w);
     ansi_clear_eol(mut w);
@@ -6045,11 +6521,7 @@ export async fn main (argc: int, argv: u64) -> int {
       // Map file contents.
       let mi_opt: MappedInput? = map_input(path, cfg.allow_binary);
       if mi_opt == None {
-        if is_ssh_path(path) {
-          let _ = write_str(std::runtime::posix::io::STDERR_FD, "sage: ssh:// is not supported yet\n");
-        } else {
-          let _ = write_str(std::runtime::posix::io::STDERR_FD, "sage: failed to open input\n");
-        }
+        let _ = write_str(std::runtime::posix::io::STDERR_FD, "sage: failed to open input\n");
         return 2;
       }
       let mut mi: MappedInput = match (mi_opt) { Some(v) => v, None => mapped_input_empty() };
@@ -6262,11 +6734,7 @@ export async fn main (argc: int, argv: u64) -> int {
     let mi_opt: MappedInput? = map_input(path, cfg.allow_binary);
     if mi_opt == None {
       tabs_free(mut tabs);
-      if is_ssh_path(path) {
-        let _ = write_str(std::runtime::posix::io::STDERR_FD, "sage: ssh:// is not supported yet\n");
-      } else {
-        let _ = write_str(std::runtime::posix::io::STDERR_FD, "sage: failed to open input\n");
-      }
+      let _ = write_str(std::runtime::posix::io::STDERR_FD, "sage: failed to open input\n");
       return 2;
     }
     let mut mi: MappedInput = match (mi_opt) { Some(v) => v, None => mapped_input_empty() };
@@ -6491,6 +6959,8 @@ export async fn main (argc: int, argv: u64) -> int {
     var find_sel: i64 = 0;
     var find_scroll: i64 = 0;
     var find_queued_line0: i64 = -1;
+    var find_queued_col1: i64 = -1;
+    var find_queued_has_col: bool = false;
     let fs_opt: BufferU8? = BufferU8.init(8192);
     let mut find_styles: BufferU8 = match (fs_opt) { Some(v) => v, None => BufferU8.empty() };
     let mut find_syn_cache: FindSynCache = find_syn_cache_init();
@@ -6516,6 +6986,8 @@ export async fn main (argc: int, argv: u64) -> int {
     var last_status_lines: i64 = -1;
     var last_status_alert: int = -1;
     var pending_goto_line: i64 = -1;
+    var pending_goto_col1: i64 = -1;
+    var pending_goto_has_col: bool = false;
     var sel_on: bool = false;
     var sel_anchor: i64 = -1;
     var sel_head: i64 = -1;
@@ -6749,18 +7221,42 @@ export async fn main (argc: int, argv: u64) -> int {
           if off_opt != None {
             let off0: i64 = match (off_opt) { Some(v) => v, None => 0 };
             top_off = visual_start_for_offset(file.ptr, file.len, off0, view_cols, cfg.unsafe_raw, allow_ansi);
+            // `top_line` was computed earlier in the loop; recompute it now that
+            // the jump updated `top_off` so the gutter/status don't show stale
+            // line numbers for a frame.
+            top_line = -1;
+            if file.len > 0 && (idx.done || idx.scan_off >= top_off) {
+              top_line = line_number_for_offset(file.ptr, &offsets, top_off);
+            }
+
+            // If this jump came from Ctrl-K find, highlight the selected result.
+            if pending_goto_col1 >= 0 {
+              let sp_opt: MatchSpan? = find_result_match_span(&file, off0, pending_goto_col1, pending_goto_has_col, &find_query);
+              if sp_opt != None {
+                let sp: MatchSpan = match (sp_opt) { Some(v) => v, None => MatchSpan{ off: -1, end: -1 } };
+                last_match_off = sp.off;
+                last_match_end = sp.end;
+              }
+              pending_goto_col1 = -1;
+              pending_goto_has_col = false;
+            }
+
             pending_goto_line = -1;
             alert = 0;
             need_redraw = true;
           } else {
             // Out of range (checkpoint existed but line doesn't).
             pending_goto_line = -1;
+            pending_goto_col1 = -1;
+            pending_goto_has_col = false;
             alert = 8;
             need_redraw = true;
           }
         } else if idx.done {
           // Index complete but the requested checkpoint never materialized -> out of range.
           pending_goto_line = -1;
+          pending_goto_col1 = -1;
+          pending_goto_has_col = false;
           alert = 8;
           need_redraw = true;
         }
@@ -7018,6 +7514,8 @@ export async fn main (argc: int, argv: u64) -> int {
       // Any user input cancels a pending `:<line>` jump (avoids surprise jumps).
       if has_user_input && pending_goto_line >= 0 {
         pending_goto_line = -1;
+        pending_goto_col1 = -1;
+        pending_goto_has_col = false;
         if alert == 7 { alert = 0; }
       }
 
@@ -7090,6 +7588,38 @@ export async fn main (argc: int, argv: u64) -> int {
           }
           if find_sel >= count && count > 0 {
             find_sel = count - 1;
+          }
+          need_redraw = true;
+          continue;
+        }
+
+        // Page (Ctrl-U / Ctrl-D, PgUp / PgDn).
+        if k.kind == KEY_PAGE_UP || (is_byte && b == 21) { // PgUp / Ctrl-U
+          if count > 0 {
+            let step: i64 = list_rows_i64;
+            if find_sel > 0 {
+              if find_sel > step { find_sel = find_sel - step; } else { find_sel = 0; }
+            }
+            if find_sel < find_scroll {
+              find_scroll = find_sel;
+            }
+          }
+          need_redraw = true;
+          continue;
+        }
+        if k.kind == KEY_PAGE_DOWN || (is_byte && b == 4) { // PgDn / Ctrl-D
+          if count > 0 {
+            let step2: i64 = list_rows_i64;
+            if find_sel < (count - 1) {
+              find_sel = find_sel + step2;
+              if find_sel >= count { find_sel = count - 1; }
+            }
+            if find_sel >= (find_scroll + list_rows_i64) {
+              find_scroll = find_sel - list_rows_i64 + 1;
+            }
+            if find_scroll > max_scroll {
+              find_scroll = max_scroll;
+            }
           }
           need_redraw = true;
           continue;
@@ -7178,6 +7708,7 @@ export async fn main (argc: int, argv: u64) -> int {
             continue;
           }
           let loc: FindLoc = match (loc_opt) { Some(v) => v, None => FindLoc{ path_ptr: 0, path_len: 0, line1: 0, col1: 0 } };
+          let loc_has_col: bool = find_fmt == FIND_FMT_VIMGREP;
           let path_s: string = std::runtime::mem::string_from_ptr_len(loc.path_ptr, loc.path_len as int);
 
           // Resolve tab index by exact path match.
@@ -7221,9 +7752,27 @@ export async fn main (argc: int, argv: u64) -> int {
             if off_opt != None {
               let off0: i64 = match (off_opt) { Some(v) => v, None => 0 };
               top_off = visual_start_for_offset(file.ptr, file.len, off0, view_cols, cfg.unsafe_raw, allow_ansi);
+
+              // Highlight the selected result in the current file view.
+              let sp_opt: MatchSpan? = find_result_match_span(&file, off0, loc.col1, loc_has_col, &find_query);
+              if sp_opt != None {
+                let sp: MatchSpan = match (sp_opt) { Some(v) => v, None => MatchSpan{ off: -1, end: -1 } };
+                last_match_off = sp.off;
+                last_match_end = sp.end;
+              } else {
+                last_match_off = -1;
+                last_match_end = -1;
+              }
+
               pending_goto_line = -1;
+              pending_goto_col1 = -1;
+              pending_goto_has_col = false;
             } else {
               pending_goto_line = line0;
+              pending_goto_col1 = loc.col1;
+              pending_goto_has_col = loc_has_col;
+              last_match_off = -1;
+              last_match_end = -1;
             }
             need_redraw = true;
             continue;
@@ -7232,6 +7781,8 @@ export async fn main (argc: int, argv: u64) -> int {
           // Switch tabs and then apply the line jump after the switch.
           want_tab = hit_tab;
           find_queued_line0 = line0;
+          find_queued_col1 = loc.col1;
+          find_queued_has_col = loc_has_col;
           need_redraw = true;
           // Fall through to the shared tab switch logic below.
         } else {
@@ -7277,6 +7828,8 @@ export async fn main (argc: int, argv: u64) -> int {
         }
         if pending_goto_line >= 0 {
           pending_goto_line = -1;
+          pending_goto_col1 = -1;
+          pending_goto_has_col = false;
           if alert == 7 { alert = 0; }
           need_redraw = true;
         }
@@ -7455,7 +8008,10 @@ export async fn main (argc: int, argv: u64) -> int {
           let new_state: TabState = (tabs.ptr as TabState[](tabs.cap as int))[want_tab];
           let mi2_opt: MappedInput? = map_input(new_state.path, cfg.allow_binary);
           if mi2_opt == None {
-            alert = if is_ssh_path(new_state.path) { ALERT_SSH_UNSUPPORTED } else { ALERT_OPEN_FAILED };
+            find_queued_line0 = -1;
+            find_queued_col1 = -1;
+            find_queued_has_col = false;
+            alert = ALERT_OPEN_FAILED;
             need_redraw = true;
             continue;
           }
@@ -7525,6 +8081,8 @@ export async fn main (argc: int, argv: u64) -> int {
           // Reset search state for the new file (keep the query, but clear match).
           search.active = false;
           pending_goto_line = -1;
+          pending_goto_col1 = -1;
+          pending_goto_has_col = false;
           last_match_off = -1;
           last_match_end = -1;
           sel_on = false;
@@ -7566,7 +8124,11 @@ export async fn main (argc: int, argv: u64) -> int {
           // If Ctrl-K queued a jump into this tab, apply it after the switch.
           if find_queued_line0 >= 0 {
             pending_goto_line = find_queued_line0;
+            pending_goto_col1 = find_queued_col1;
+            pending_goto_has_col = find_queued_has_col;
             find_queued_line0 = -1;
+            find_queued_col1 = -1;
+            find_queued_has_col = false;
           }
 
           need_redraw = true;
@@ -7758,7 +8320,10 @@ export async fn main (argc: int, argv: u64) -> int {
                 let new_state2: TabState = (tabs.ptr as TabState[](tabs.cap as int))[want_tab_cmd];
                 let mi3_opt: MappedInput? = map_input(new_state2.path, cfg.allow_binary);
                 if mi3_opt == None {
-                  alert = if is_ssh_path(new_state2.path) { ALERT_SSH_UNSUPPORTED } else { ALERT_OPEN_FAILED };
+                  find_queued_line0 = -1;
+                  find_queued_col1 = -1;
+                  find_queued_has_col = false;
+                  alert = ALERT_OPEN_FAILED;
                   need_redraw = true;
                   continue;
                 }
@@ -7828,6 +8393,8 @@ export async fn main (argc: int, argv: u64) -> int {
                 // Reset search state for the new file (keep the query, but clear match).
                 search.active = false;
                 pending_goto_line = -1;
+                pending_goto_col1 = -1;
+                pending_goto_has_col = false;
                 last_match_off = -1;
                 last_match_end = -1;
                 sel_on = false;
@@ -7855,7 +8422,11 @@ export async fn main (argc: int, argv: u64) -> int {
                 // If Ctrl-K queued a jump into this tab, apply it after the switch.
                 if find_queued_line0 >= 0 {
                   pending_goto_line = find_queued_line0;
+                  pending_goto_col1 = find_queued_col1;
+                  pending_goto_has_col = find_queued_has_col;
                   find_queued_line0 = -1;
+                  find_queued_col1 = -1;
+                  find_queued_has_col = false;
                 }
 
                 need_redraw = true;

@@ -565,13 +565,9 @@ export async fn run (package_root: string, action: string) -> int {
   b.target_add_cflag(t, "-std=c11");
   b.target_add_cflag(t, "-D_GNU_SOURCE");
   b.target_add_cflag(t, "-Iquickjs");
-  b.target_add_cflag(t, "-I../silk/vendor/include");
   b.target_add_cflag(t, "-pthread");
   b.target_add_ldflag(t, "-lm");
   b.target_add_needed(t, "libpthread.so.0");
-  b.target_add_input(t, "../silk/vendor/lib/x64-linux/libmbedtls.a");
-  b.target_add_input(t, "../silk/vendor/lib/x64-linux/libmbedx509.a");
-  b.target_add_input(t, "../silk/vendor/lib/x64-linux/libmbedcrypto.a");
 
   return b.emit();
 }
