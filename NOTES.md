@@ -2,9 +2,9 @@
 
 ## Snapshot (last verified)
 
-- Date: **2026-03-03**
-- `sage`: `69384b0dda95`
-- `silk`: `4c9d025533c3` (`silk (ABI) 0.2.0`)
+- Date: **2026-03-05**
+- `sage`: `9eae523214b9`
+- `silk`: `382cc9e11f3a` (`silk (ABI) 0.2.0`)
 - Baseline: linux/glibc x86_64 (hosted POSIX runtime)
 - Verified (sage build):
   - `silk test --package .` (20 tests)
@@ -17,7 +17,7 @@
 - TTY I/O: `std::io::{isatty, tty_size, tty_open, tty_raw_mode}`
 - Concurrency: `task fn`, `attr(task=pool)` / `attr(task_pool)`, `SILK_TASK_POOL_THREADS=<n>`
 - Sync primitives: `std::sync::{ChannelBorrow(T).wait_fd, ChannelSender(T), CancellationToken}`
-- Async event loop surface: `std::runtime::event_loop::{sleep_ms, fd_wait_readable, fd_wait_readable2, fd_wait_readable_any, fd_wait_writable}`
+- Async event loop surface: `std::runtime::event_loop::{sleep_ms, fd_wait_readable, fd_wait_readable2, fd_wait_readable_any, fd_wait_readable_any_timeout_ms, fd_wait_writable}`
 - Vendored headers for C inputs: `silk build` adds `<prefix>/lib/silk/vendor/include` to the include path when compiling `.c` inputs
 - URL parsing: `std::url::{URL.parse, parse_with_base}` + `URL.{href,scheme,host,port,path,query,fragment}`
 - HTTP: `std::http` response parsing supports `Content-Length`, `Transfer-Encoding: chunked`, and body-to-EOF
@@ -28,10 +28,8 @@
 ## Silk should support (missing / needed)
 
 - DNS / connect-by-hostname in `std::net` (A/AAAA; v4/v6 selection)
-- A single “wait any of (timers + fds + channels)” primitive in `std::runtime::event_loop`
 - Reliable async coroutine spawning in multi-threaded processes
 - Portable signal wait/handling beyond Linux `signalfd`
 - Regex engine support for input sizes > `INT32_MAX` (or a streaming/iterator API)
 - Terminal cell width + grapheme segmentation for correct TUI rendering
-- Fast byte-search primitives (`memchr`/`memrchr`/`memmem`-class) in stdlib
 - Bindgen-style tooling + ABI validation for `ext` declarations

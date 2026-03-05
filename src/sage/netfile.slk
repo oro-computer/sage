@@ -218,8 +218,8 @@ fn syntax_hint_for_content_type (content_type: string) -> string {
     return "css";
   }
   if eq_nocase_ptr_len(mt_ptr, mt_len, "application/javascript")
-    || eq_nocase_ptr_len(mt_ptr, mt_len, "text/javascript")
-    || eq_nocase_ptr_len(mt_ptr, mt_len, "application/x-javascript") {
+  || eq_nocase_ptr_len(mt_ptr, mt_len, "text/javascript")
+  || eq_nocase_ptr_len(mt_ptr, mt_len, "application/x-javascript") {
     return "js";
   }
   if eq_nocase_ptr_len(mt_ptr, mt_len, "application/typescript") || eq_nocase_ptr_len(mt_ptr, mt_len, "text/typescript") {
@@ -232,8 +232,8 @@ fn syntax_hint_for_content_type (content_type: string) -> string {
     return "md";
   }
   if eq_nocase_ptr_len(mt_ptr, mt_len, "application/yaml")
-    || eq_nocase_ptr_len(mt_ptr, mt_len, "application/x-yaml")
-    || eq_nocase_ptr_len(mt_ptr, mt_len, "text/yaml") {
+  || eq_nocase_ptr_len(mt_ptr, mt_len, "application/x-yaml")
+  || eq_nocase_ptr_len(mt_ptr, mt_len, "text/yaml") {
     return "yaml";
   }
   if eq_nocase_ptr_len(mt_ptr, mt_len, "text/csv") {

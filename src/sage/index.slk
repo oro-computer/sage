@@ -53,13 +53,16 @@ fn flush_chunk (ch: std::sync::ChannelBorrow(u64), buf: u64, n: i64, scan_off: i
  * checkpoint offsets for every `INDEX_STRIDE`th line. The UI uses these
  * checkpoints to compute line numbers without storing every line start.
  */
-export task fn build_line_index (
-  ptr: u64,
-  len: i64,
-  ch: std::sync::ChannelBorrow(u64),
-  cancel: std::sync::CancellationTokenBorrow,
-  check_cancel: bool
+task fn build_line_index_task (
+ptr: u64,
+len: i64,
+ch_handle: u64,
+cancel_handle: u64,
+check_cancel: bool
 ) -> int {
+  let ch: std::sync::ChannelBorrow(u64) = { handle: ch_handle };
+  let cancel: std::sync::CancellationTokenBorrow = { handle: cancel_handle };
+
   if ptr == 0 || len <= 0 {
     let _ = ch.send(0 as u64);
     return 0;
@@ -161,6 +164,16 @@ export task fn build_line_index (
   std::runtime::mem::free(buf);
   let _ = ch.send(0 as u64);
   return 0;
+}
+
+export fn build_line_index (
+ptr: u64,
+len: i64,
+ch: std::sync::ChannelBorrow(u64),
+cancel: std::sync::CancellationTokenBorrow,
+check_cancel: bool
+) -> Task(int) {
+  return build_line_index_task(ptr, len, ch.handle, cancel.handle, check_cancel);
 }
 
 export struct ConsumeOutcome {

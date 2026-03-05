@@ -1,0 +1,55 @@
+%YAML 1.2
+---
+# Minimal shell syntax for `sage` (bash/zsh/sh friendly).
+#
+# This intentionally avoids advanced Sublime constructs so `sage` can compile it
+# into a small, fast runtime highlighter.
+name: Shell
+scope: source.shell
+version: 2
+
+file_extensions:
+  - sh
+  - bash
+  - zsh
+  - ksh
+  - dash
+  - ash
+  - tcsh
+  - bashrc
+  - zshrc
+  - profile
+
+hidden_file_extensions:
+  - .bashrc
+  - .zshrc
+  - .profile
+
+first_line_match: |-
+  ^#!.*\b(bash|sh|zsh|ksh|dash|ash|tcsh)\b
+
+contexts:
+  main:
+    - match: '^#!.*$'
+      scope: comment.line.number-sign.shell
+
+    - match: '#.*$'
+      scope: comment.line.number-sign.shell
+
+    - match: '"(?:\\.|[^"\\])*"'
+      scope: string.quoted.double.shell
+
+    - match: "'(?:''|[^'])*'"
+      scope: string.quoted.single.shell
+
+    - match: '\b[0-9]+\b'
+      scope: constant.numeric.shell
+
+    - match: '\b(if|then|elif|else|fi|for|while|do|done|case|esac|in|function|select|until|return|break|continue|local|export|readonly|declare)\b'
+      scope: keyword.control.shell
+
+    - match: '(\|\||&&|\||;|\(|\)|\{|\}|\[|\]|<|>|=)'
+      scope: keyword.operator.shell
+
+    - match: '\$\{?[A-Za-z_][A-Za-z0-9_]*\}?'
+      scope: variable.language.shell

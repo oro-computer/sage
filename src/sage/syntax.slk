@@ -31,6 +31,25 @@ let MAGIC_SYNTAX: u64 = 0x58594E535F454741; // "AGE_SYNX" (little endian)
 let MAGIC_INDEX: u64 = 0x58444E495F454741;  // "AGE_INDX"
 let SYNTAX_VERSION: u32 = 2;
 
+// Optional override for where compiled `.sagec` files + `index.bin` live.
+//
+// At runtime we still prefer the user cache (XDG cache dir) when present, but
+// fall back to the override directory when the user cache is missing. This is
+// used to support bundled syntax caches in distributable build artifacts.
+let CACHE_DIR_OVERRIDE_ENV: string = "SAGE_SYNTAX_CACHE_DIR";
+
+/**
+ * Override the directory that `sage` uses to load compiled syntax caches.
+ *
+ * The directory must contain:
+ * - `index.bin`
+ * - `first_line.bin` (optional)
+ * - `*.sagec`
+ */
+export fn set_cache_dir_override (dir: string) -> void {
+  let _ = std::runtime::env::setenv(CACHE_DIR_OVERRIDE_ENV, dir, 1);
+}
+
 // Range highlighting flags (compiled from begin/end rules in syntax sources).
 let SYN_F_LINE_COMMENT_SLASH: u32 = 1; // //
 let SYN_F_BLOCK_COMMENT_C: u32 = 2;    // /* */
@@ -194,6 +213,35 @@ fn free_joined (s: string) -> void {
   if p != 0 {
     std::runtime::mem::free(p);
   }
+}
+
+fn join_dir_file (dir: string, file: string) -> string? {
+  let d_ptr: u64 = std::runtime::mem::string_ptr(dir);
+  let d_len: i64 = std::runtime::mem::string_len(dir);
+  if d_ptr == 0 || d_len <= 0 {
+    return None;
+  }
+  if std::runtime::mem::load_u8(d_ptr, d_len - 1) == 47 { // '/'
+    return join2(dir, file);
+  }
+  let tmp_opt: string? = join2(dir, "/");
+  if tmp_opt == None { return None; }
+  let tmp: string = match (tmp_opt) { Some(v) => v, None => "" };
+  let out_opt: string? = join2(tmp, file);
+  free_joined(tmp);
+  return out_opt;
+}
+
+fn dir_slash_owned (dir: string) -> string? {
+  let d_ptr: u64 = std::runtime::mem::string_ptr(dir);
+  let d_len: i64 = std::runtime::mem::string_len(dir);
+  if d_ptr == 0 || d_len <= 0 {
+    return None;
+  }
+  if std::runtime::mem::load_u8(d_ptr, d_len - 1) == 47 { // '/'
+    return join2("", dir);
+  }
+  return join2(dir, "/");
 }
 
 let EEXIST: int = 17;
@@ -473,10 +521,10 @@ fn write_i64_dec (fd: int, n: i64) -> void {
   }
 
   let mut digits: u8[32] = [
-    0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0
+  0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0
   ];
   var dn: i64 = 0;
   while x != 0 && dn < 32 {
@@ -854,13 +902,13 @@ fn pack_push_checked (mut pack: &BufferU8, ptr: u64, len: i64) -> i64? {
 }
 
 fn parse_sublime_syntax (
-  bytes: &BufferU8,
-  cache_name: string,
-  mut out_exts: &BufferU8,
-  mut out_first_line: &BufferU8,
-  mut out_rules: &BufferU8,
-  mut out_rule_toks: &BufferU8,
-  mut meta: &SyntaxMeta
+bytes: &BufferU8,
+cache_name: string,
+mut out_exts: &BufferU8,
+mut out_first_line: &BufferU8,
+mut out_rules: &BufferU8,
+mut out_rule_toks: &BufferU8,
+mut meta: &SyntaxMeta
 ) -> bool {
   // Produces:
   // - out_exts: NUL-separated lowercased keys.
@@ -1469,13 +1517,13 @@ fn tm_is_ascii_ws (b: u8) -> bool {
 }
 
 fn parse_textmate_syntax (
-  bytes: &BufferU8,
-  cache_name: string,
-  mut out_exts: &BufferU8,
-  mut out_first_line: &BufferU8,
-  mut out_rules: &BufferU8,
-  mut out_rule_toks: &BufferU8,
-  mut meta: &SyntaxMeta
+bytes: &BufferU8,
+cache_name: string,
+mut out_exts: &BufferU8,
+mut out_first_line: &BufferU8,
+mut out_rules: &BufferU8,
+mut out_rule_toks: &BufferU8,
+mut meta: &SyntaxMeta
 ) -> bool {
   out_exts.clear();
   out_first_line.clear();
@@ -1519,14 +1567,14 @@ fn parse_textmate_syntax (
 
     // Skip comments: <!-- ... -->
     if (i + 3) < b.len
-      && std::runtime::mem::load_u8(b.ptr, i + 1) == 33
-      && std::runtime::mem::load_u8(b.ptr, i + 2) == 45
-      && std::runtime::mem::load_u8(b.ptr, i + 3) == 45 {
+    && std::runtime::mem::load_u8(b.ptr, i + 1) == 33
+    && std::runtime::mem::load_u8(b.ptr, i + 2) == 45
+    && std::runtime::mem::load_u8(b.ptr, i + 3) == 45 {
       var j: i64 = i + 4;
       while (j + 2) < b.len {
         if std::runtime::mem::load_u8(b.ptr, j) == 45
-          && std::runtime::mem::load_u8(b.ptr, j + 1) == 45
-          && std::runtime::mem::load_u8(b.ptr, j + 2) == 62 {
+        && std::runtime::mem::load_u8(b.ptr, j + 1) == 45
+        && std::runtime::mem::load_u8(b.ptr, j + 2) == 62 {
           j = j + 3;
           break;
         }
@@ -1642,9 +1690,9 @@ fn parse_textmate_syntax (
 
       if ctx_len < ctx_cap {
         let cap_key: bool =
-          parent_pending == TM_KEY_CAPTURES ||
-          parent_pending == TM_KEY_BEGIN_CAPTURES ||
-          parent_pending == TM_KEY_END_CAPTURES;
+        parent_pending == TM_KEY_CAPTURES ||
+        parent_pending == TM_KEY_BEGIN_CAPTURES ||
+        parent_pending == TM_KEY_END_CAPTURES;
         (ctx_ptr as TMDictCtx[](ctx_cap as int))[ctx_len] = TMDictCtx{
           skip: parent_skip || cap_key,
           have_match: false,
@@ -1818,13 +1866,13 @@ fn parse_textmate_syntax (
 // Our Atom/CSON parser already extracts the subset we support (fileTypes +
 // match rules + begin/end range flags), so reuse it for `.tmLanguage.json`.
 fn parse_textmate_json (
-  bytes: &BufferU8,
-  cache_name: string,
-  mut out_exts: &BufferU8,
-  mut out_first_line: &BufferU8,
-  mut out_rules: &BufferU8,
-  mut out_rule_toks: &BufferU8,
-  mut meta: &SyntaxMeta
+bytes: &BufferU8,
+cache_name: string,
+mut out_exts: &BufferU8,
+mut out_first_line: &BufferU8,
+mut out_rules: &BufferU8,
+mut out_rule_toks: &BufferU8,
+mut meta: &SyntaxMeta
 ) -> bool {
   return parse_atom_cson(bytes, cache_name, mut out_exts, mut out_first_line, mut out_rules, mut out_rule_toks, mut meta);
 }
@@ -1991,13 +2039,13 @@ fn cson_decode_string (ptr: u64, len: i64, mut scratch: &BufferU8) -> Span {
 }
 
 fn parse_atom_cson (
-  bytes: &BufferU8,
-  cache_name: string,
-  mut out_exts: &BufferU8,
-  mut out_first_line: &BufferU8,
-  mut out_rules: &BufferU8,
-  mut out_rule_toks: &BufferU8,
-  mut meta: &SyntaxMeta
+bytes: &BufferU8,
+cache_name: string,
+mut out_exts: &BufferU8,
+mut out_first_line: &BufferU8,
+mut out_rules: &BufferU8,
+mut out_rule_toks: &BufferU8,
+mut meta: &SyntaxMeta
 ) -> bool {
   out_exts.clear();
   out_first_line.clear();
@@ -2412,10 +2460,10 @@ fn parse_atom_cson (
         } else {
           // Implicit object start: `key:` with no inline value.
           let cap_key2: bool =
-            eq_nocase(key.ptr, key.len, "captures") ||
-            eq_nocase(key.ptr, key.len, "beginCaptures") ||
-            eq_nocase(key.ptr, key.len, "endCaptures") ||
-            eq_nocase(key.ptr, key.len, "matchCaptures");
+          eq_nocase(key.ptr, key.len, "captures") ||
+          eq_nocase(key.ptr, key.len, "beginCaptures") ||
+          eq_nocase(key.ptr, key.len, "endCaptures") ||
+          eq_nocase(key.ptr, key.len, "matchCaptures");
 
           // Indentation-style blocks: `key:` then nested lines.
           if val0.ptr == 0 || val0.len <= 0 {
@@ -2707,21 +2755,21 @@ fn buf_count_nul_terms (b: &BufferU8) -> i64 {
 }
 
 fn compile_cache_scan_dir (
-  dir_path: string,
-  rel_prefix: string,
-  cache_syntax: string,
-  verbose: bool,
-  mut file_buf: &BufferU8,
-  mut exts: &BufferU8,
-  mut first_lines: &BufferU8,
-  mut rules: &BufferU8,
-  mut toks: &BufferU8,
-  mut name_scratch: &BufferU8,
-  entries_ptr: u64,
-  entries_cap: i64,
-  first_ptr: u64,
-  first_cap: i64,
-  mut stats: &CompileStats
+dir_path: string,
+rel_prefix: string,
+cache_syntax: string,
+verbose: bool,
+mut file_buf: &BufferU8,
+mut exts: &BufferU8,
+mut first_lines: &BufferU8,
+mut rules: &BufferU8,
+mut toks: &BufferU8,
+mut name_scratch: &BufferU8,
+entries_ptr: u64,
+entries_cap: i64,
+first_ptr: u64,
+first_cap: i64,
+mut stats: &CompileStats
 ) -> void {
   let dir: u64 = std::runtime::posix::fs::opendir(dir_path);
   if dir == 0 {
@@ -3121,6 +3169,45 @@ export fn compile_cache (verbose: bool) -> int {
     return 2;
   }
 
+  let rc: int = compile_cache_impl(conf_syntax, cache_syntax, verbose);
+
+  free_joined(cache_syntax);
+  free_joined(cache_sage);
+  free_joined(conf_syntax);
+  free_joined(conf_sage);
+  free_joined(conf_home);
+  free_joined(cache_home);
+  return rc;
+}
+
+export fn compile_cache_dir (conf_syntax_dir: string, cache_syntax_dir: string, verbose: bool) -> int {
+  let conf_syntax_opt: string? = dir_slash_owned(conf_syntax_dir);
+  if conf_syntax_opt == None {
+    return 2;
+  }
+  let conf_syntax: string = match (conf_syntax_opt) { Some(v) => v, None => "" };
+
+  let cache_syntax_opt: string? = dir_slash_owned(cache_syntax_dir);
+  if cache_syntax_opt == None {
+    free_joined(conf_syntax);
+    return 2;
+  }
+  let cache_syntax: string = match (cache_syntax_opt) { Some(v) => v, None => "" };
+
+  // Ensure output directory exists.
+  if !mkdir_p(cache_syntax, 493) {
+    free_joined(cache_syntax);
+    free_joined(conf_syntax);
+    return 2;
+  }
+
+  let rc: int = compile_cache_impl(conf_syntax, cache_syntax, verbose);
+  free_joined(cache_syntax);
+  free_joined(conf_syntax);
+  return rc;
+}
+
+fn compile_cache_impl (conf_syntax: string, cache_syntax: string, verbose: bool) -> int {
   let dir: u64 = std::runtime::posix::fs::opendir(conf_syntax);
   if dir == 0 {
     let e0: int = errno();
@@ -3134,12 +3221,6 @@ export fn compile_cache (verbose: bool) -> int {
       let _ = write_str(2, conf_syntax);
       let _ = write_str(2, " (add .sublime-syntax / .tmLanguage / .tmLanguage.json / .cson files)\n");
     }
-    free_joined(cache_syntax);
-    free_joined(cache_sage);
-    free_joined(conf_syntax);
-    free_joined(conf_sage);
-    free_joined(conf_home);
-    free_joined(cache_home);
     return 2;
   }
 
@@ -3147,48 +3228,24 @@ export fn compile_cache (verbose: bool) -> int {
   let file_buf_opt: BufferU8? = BufferU8.init(16384);
   if file_buf_opt == None {
     let _ = std::runtime::posix::fs::closedir(dir);
-    free_joined(cache_syntax);
-    free_joined(cache_sage);
-    free_joined(conf_syntax);
-    free_joined(conf_sage);
-    free_joined(conf_home);
-    free_joined(cache_home);
     return 2;
   }
   let mut file_buf: BufferU8 = match (file_buf_opt) { Some(v) => v, None => BufferU8.empty() };
   let exts_opt: BufferU8? = BufferU8.init(1024);
   if exts_opt == None {
     let _ = std::runtime::posix::fs::closedir(dir);
-    free_joined(cache_syntax);
-    free_joined(cache_sage);
-    free_joined(conf_syntax);
-    free_joined(conf_sage);
-    free_joined(conf_home);
-    free_joined(cache_home);
     return 2;
   }
   let mut exts: BufferU8 = match (exts_opt) { Some(v) => v, None => BufferU8.empty() };
   let rules_opt: BufferU8? = BufferU8.init(4096);
   if rules_opt == None {
     let _ = std::runtime::posix::fs::closedir(dir);
-    free_joined(cache_syntax);
-    free_joined(cache_sage);
-    free_joined(conf_syntax);
-    free_joined(conf_sage);
-    free_joined(conf_home);
-    free_joined(cache_home);
     return 2;
   }
   let mut rules: BufferU8 = match (rules_opt) { Some(v) => v, None => BufferU8.empty() };
   let toks_opt: BufferU8? = BufferU8.init(1024);
   if toks_opt == None {
     let _ = std::runtime::posix::fs::closedir(dir);
-    free_joined(cache_syntax);
-    free_joined(cache_sage);
-    free_joined(conf_syntax);
-    free_joined(conf_sage);
-    free_joined(conf_home);
-    free_joined(cache_home);
     return 2;
   }
   let mut toks: BufferU8 = match (toks_opt) { Some(v) => v, None => BufferU8.empty() };
@@ -3196,12 +3253,6 @@ export fn compile_cache (verbose: bool) -> int {
   let first_lines_opt: BufferU8? = BufferU8.init(1024);
   if first_lines_opt == None {
     let _ = std::runtime::posix::fs::closedir(dir);
-    free_joined(cache_syntax);
-    free_joined(cache_sage);
-    free_joined(conf_syntax);
-    free_joined(conf_sage);
-    free_joined(conf_home);
-    free_joined(cache_home);
     return 2;
   }
   let mut first_lines: BufferU8 = match (first_lines_opt) { Some(v) => v, None => BufferU8.empty() };
@@ -3209,12 +3260,6 @@ export fn compile_cache (verbose: bool) -> int {
   let name_scratch_opt: BufferU8? = BufferU8.init(512);
   if name_scratch_opt == None {
     let _ = std::runtime::posix::fs::closedir(dir);
-    free_joined(cache_syntax);
-    free_joined(cache_sage);
-    free_joined(conf_syntax);
-    free_joined(conf_sage);
-    free_joined(conf_home);
-    free_joined(cache_home);
     return 2;
   }
   let mut name_scratch: BufferU8 = match (name_scratch_opt) { Some(v) => v, None => BufferU8.empty() };
@@ -3299,106 +3344,81 @@ export fn compile_cache (verbose: bool) -> int {
       let _ = write_str(2, ") — check file format subset support\n");
     }
   }
-  let _ = write_str(1, "sage: compiled ");
-  let _ = write_str(1, "syntaxes=");
-  write_i64_dec(1, stats.compiled);
-  let _ = write_str(1, " rules=");
-  write_i64_dec(1, stats.rules_total);
+  let _ = write_str(2, "sage: compiled ");
+  let _ = write_str(2, "syntaxes=");
+  write_i64_dec(2, stats.compiled);
+  let _ = write_str(2, " rules=");
+  write_i64_dec(2, stats.rules_total);
   if ok_idx {
     if ok_fl || stats.first_line_entries_len == 0 {
-      let _ = write_str(1, " (index ok)");
+      let _ = write_str(2, " (index ok)");
     } else {
-      let _ = write_str(1, " (index ok; first_line failed)");
+      let _ = write_str(2, " (index ok; first_line failed)");
     }
   } else {
-    let _ = write_str(1, " (index failed)");
+    let _ = write_str(2, " (index failed)");
   }
-  let _ = write_str(1, "\n");
-
-  free_joined(cache_syntax);
-  free_joined(cache_sage);
-  free_joined(conf_syntax);
-  free_joined(conf_sage);
-  free_joined(conf_home);
-  free_joined(cache_home);
+  let _ = write_str(2, "\n");
 
   let ok_all: bool = ok_idx && (ok_fl || stats.first_line_entries_len == 0);
   return if ok_all { 0 } else { 2 };
 }
 
 export fn list_compiled_syntax (verbose: bool) -> int {
-  let cache_home_opt: string? = xdg_cache_home();
-  if cache_home_opt == None {
-    let _ = write_str(2, "sage: XDG cache dir unavailable\n");
-    return 2;
-  }
-  let cache_home: string = match (cache_home_opt) { Some(v) => v, None => "" };
-
-  let cache_syntax_opt: string? = join2(cache_home, "/sage/syntax/");
-  if cache_syntax_opt == None {
-    free_joined(cache_home);
-    return 2;
-  }
-  let cache_syntax: string = match (cache_syntax_opt) { Some(v) => v, None => "" };
-
-  let idx_path_opt: string? = join2(cache_syntax, "index.bin");
-  if idx_path_opt == None {
-    free_joined(cache_syntax);
-    free_joined(cache_home);
-    return 2;
-  }
-  let idx_path: string = match (idx_path_opt) { Some(v) => v, None => "" };
-
   let idx_opt: BufferU8? = BufferU8.init(65536);
   if idx_opt == None {
-    free_joined(idx_path);
-    free_joined(cache_syntax);
-    free_joined(cache_home);
     return 2;
   }
   let mut idx: BufferU8 = match (idx_opt) { Some(v) => v, None => BufferU8.empty() };
 
-  let ok_read: bool = read_file_all(idx_path, mut idx);
+  let ok_read: bool = load_index_file(mut idx);
   if !ok_read {
-    let _ = write_str(2, "sage: no compiled syntax index found (run --compile-cache): ");
-    let _ = write_str(2, idx_path);
-    let _ = write_str(2, "\n");
-    free_joined(idx_path);
-    free_joined(cache_syntax);
-    free_joined(cache_home);
+    let _ = write_str(2, "sage: no compiled syntax index found (run --compile-cache)\n");
     return 2;
   }
 
   let b = idx.as_bytes();
   if b.ptr == 0 || b.len < 16 {
     let _ = write_str(2, "sage: invalid syntax index (too short)\n");
-    free_joined(idx_path);
-    free_joined(cache_syntax);
-    free_joined(cache_home);
     return 2;
   }
   let magic: u64 = u64_at(b.ptr, 0);
   if magic != MAGIC_INDEX {
     let _ = write_str(2, "sage: invalid syntax index (bad magic)\n");
-    free_joined(idx_path);
-    free_joined(cache_syntax);
-    free_joined(cache_home);
     return 2;
   }
   let ver: u32 = u32_at(b.ptr, 8);
   if ver != SYNTAX_VERSION {
     let _ = write_str(2, "sage: unsupported syntax index version\n");
-    free_joined(idx_path);
-    free_joined(cache_syntax);
-    free_joined(cache_home);
     return 2;
   }
   let count: u32 = u32_at(b.ptr, 12);
 
   if verbose {
-    let _ = write_str(2, "sage[v] syntax cache dir: ");
-    let _ = write_str(2, cache_syntax);
-    let _ = write_str(2, "\n");
+    let dir_opt: string? = env_get_string(CACHE_DIR_OVERRIDE_ENV);
+    if dir_opt != None {
+      let dir: string = match (dir_opt) { Some(v) => v, None => "" };
+      if std::runtime::mem::string_len(dir) > 0 {
+        let _ = write_str(2, "sage[v] syntax cache dir (override): ");
+        let _ = write_str(2, dir);
+        let _ = write_str(2, "\n");
+      }
+      free_joined(dir);
+    } else {
+      let cache_home_opt: string? = xdg_cache_home();
+      if cache_home_opt != None {
+        let cache_home: string = match (cache_home_opt) { Some(v) => v, None => "" };
+        let cache_syntax_opt: string? = join2(cache_home, "/sage/syntax/");
+        free_joined(cache_home);
+        if cache_syntax_opt != None {
+          let cache_syntax: string = match (cache_syntax_opt) { Some(v) => v, None => "" };
+          let _ = write_str(2, "sage[v] syntax cache dir: ");
+          let _ = write_str(2, cache_syntax);
+          let _ = write_str(2, "\n");
+          free_joined(cache_syntax);
+        }
+      }
+    }
     let _ = write_str(2, "sage[v] index entries=");
     write_i64_dec(2, count as i64);
     let _ = write_str(2, "\n");
@@ -3407,18 +3427,12 @@ export fn list_compiled_syntax (verbose: bool) -> int {
   // Collect unique keys and sort them (user-facing list of supported syntaxes).
   let keys_data_opt: BufferU8? = BufferU8.init((count as i64) * 8);
   if keys_data_opt == None {
-    free_joined(idx_path);
-    free_joined(cache_syntax);
-    free_joined(cache_home);
     return 2;
   }
   let mut keys_data: BufferU8 = match (keys_data_opt) { Some(v) => v, None => BufferU8.empty() };
 
   let keys_idx2_opt: VecU64? = VecU64.init((count as i64) * 2);
   if keys_idx2_opt == None {
-    free_joined(idx_path);
-    free_joined(cache_syntax);
-    free_joined(cache_home);
     return 2;
   }
   let mut keys_idx: VecU64 = match (keys_idx2_opt) { Some(v) => v, None => VecU64.empty() };
@@ -3567,9 +3581,6 @@ export fn list_compiled_syntax (verbose: bool) -> int {
     p_i = p_i + 1;
   }
 
-  free_joined(idx_path);
-  free_joined(cache_syntax);
-  free_joined(cache_home);
   return 0;
 }
 
@@ -3983,6 +3994,176 @@ fn find_in_index (idx: &BufferU8, key_ptr: u64, key_len: i64, mut out_cache: &Bu
   return found;
 }
 
+struct FirstLinePattern {
+  pat_ptr: u64,
+  pat_len: i64,
+  flags_ptr: u64,
+  flags_len: i64,
+}
+
+fn strip_extended_regex (src_ptr: u64, src_len: i64, mut out: &BufferU8) -> void {
+  out.clear();
+  if src_ptr == 0 || src_len <= 0 {
+    return;
+  }
+
+  var escaped: bool = false;
+  var in_class: bool = false;
+  var i: i64 = 0;
+  while i < src_len {
+    let b: u8 = std::runtime::mem::load_u8(src_ptr, i);
+
+    if escaped {
+      let _ = out.push_u8(b);
+      escaped = false;
+      i = i + 1;
+      continue;
+    }
+
+    if b == 92 { // '\\'
+      let _ = out.push_u8(b);
+      escaped = true;
+      i = i + 1;
+      continue;
+    }
+
+    if !in_class && b == 91 { // '['
+      in_class = true;
+      let _ = out.push_u8(b);
+      i = i + 1;
+      continue;
+    }
+    if in_class && b == 93 { // ']'
+      in_class = false;
+      let _ = out.push_u8(b);
+      i = i + 1;
+      continue;
+    }
+
+    if !in_class {
+      // Whitespace is insignificant in "extended" mode.
+      if b == 32 || b == 9 || b == 10 || b == 13 { // space / tab / '\n' / '\r'
+        i = i + 1;
+        continue;
+      }
+
+      // In extended mode, unescaped '#' begins a comment until end-of-line.
+      if b == 35 { // '#'
+        i = i + 1;
+        while i < src_len {
+          let c: u8 = std::runtime::mem::load_u8(src_ptr, i);
+          if c == 10 || c == 13 { // '\n' / '\r'
+            break;
+          }
+          i = i + 1;
+        }
+        continue;
+      }
+    }
+
+    let _ = out.push_u8(b);
+    i = i + 1;
+  }
+}
+
+fn parse_first_line_pattern (
+src_ptr: u64,
+src_len: i64,
+mut pat_scratch: &BufferU8,
+mut flags_scratch: &BufferU8
+) -> FirstLinePattern {
+  pat_scratch.clear();
+  flags_scratch.clear();
+
+  let t: Span = trim_ascii_ws(src_ptr, src_len);
+  let p: u64 = t.ptr;
+  let n: i64 = t.len;
+  if p == 0 || n <= 0 {
+    return FirstLinePattern{ pat_ptr: 0, pat_len: 0, flags_ptr: 0, flags_len: 0 };
+  }
+
+  // Best-effort conversion from PCRE-ish inline flags to runtime flags.
+  //
+  // Common in Sublime syntaxes:
+  // - `(?xi: ... )` (flags group + extended mode)
+  // - `(?i)<html...` (prefix flags)
+  if n >= 4 && std::runtime::mem::load_u8(p, 0) == 40 && std::runtime::mem::load_u8(p, 1) == 63 { // "(?"
+    var flag_i: bool = false;
+    var flag_m: bool = false;
+    var flag_s: bool = false;
+    var flag_x: bool = false;
+
+    var k: i64 = 2;
+    while k < n {
+      let c0: u8 = std::runtime::mem::load_u8(p, k);
+      if c0 == 58 || c0 == 41 { // ':' or ')'
+        break;
+      }
+      // Only accept ASCII letters as flags; otherwise this is likely a lookahead/non-capturing group.
+      let c: u8 = lower_ascii(c0);
+      if c < 97 || c > 122 { // not 'a'..'z'
+        break;
+      }
+      if c == 105 { flag_i = true; } // 'i'
+      else if c == 109 { flag_m = true; } // 'm'
+      else if c == 115 { flag_s = true; } // 's'
+      else if c == 120 { flag_x = true; } // 'x'
+      k = k + 1;
+    }
+
+    let has_flags: bool = k > 2;
+
+    if has_flags && k < n && std::runtime::mem::load_u8(p, k) == 41 { // ')'
+      // Prefix flags: `(?i)rest`
+      let body_ptr: u64 = p + ((k + 1) as u64);
+      let body_len: i64 = n - (k + 1);
+
+      if flag_x {
+        strip_extended_regex(body_ptr, body_len, mut pat_scratch);
+      } else {
+        let _ = pat_scratch.push_ptr_len(body_ptr, body_len);
+      }
+
+      if flag_i { let _ = flags_scratch.push_u8(105); } // 'i'
+      if flag_m { let _ = flags_scratch.push_u8(109); } // 'm'
+      if flag_s { let _ = flags_scratch.push_u8(115); } // 's'
+
+      return FirstLinePattern{
+        pat_ptr: pat_scratch.ptr,
+        pat_len: pat_scratch.len,
+        flags_ptr: flags_scratch.ptr,
+        flags_len: flags_scratch.len,
+      };
+    }
+
+    if has_flags && k < n && std::runtime::mem::load_u8(p, k) == 58 && std::runtime::mem::load_u8(p, n - 1) == 41 { // ':' and trailing ')'
+      // Flags group: `(?imx: body )`
+      let body_ptr2: u64 = p + ((k + 1) as u64);
+      let body_len2: i64 = (n - 1) - (k + 1);
+
+      if flag_x {
+        strip_extended_regex(body_ptr2, body_len2, mut pat_scratch);
+      } else {
+        let _ = pat_scratch.push_ptr_len(body_ptr2, body_len2);
+      }
+
+      if flag_i { let _ = flags_scratch.push_u8(105); } // 'i'
+      if flag_m { let _ = flags_scratch.push_u8(109); } // 'm'
+      if flag_s { let _ = flags_scratch.push_u8(115); } // 's'
+
+      return FirstLinePattern{
+        pat_ptr: pat_scratch.ptr,
+        pat_len: pat_scratch.len,
+        flags_ptr: flags_scratch.ptr,
+        flags_len: flags_scratch.len,
+      };
+    }
+  }
+
+  // No inline flags; compile as-is.
+  return FirstLinePattern{ pat_ptr: p, pat_len: n, flags_ptr: 0, flags_len: 0 };
+}
+
 fn find_first_line_match (idx: &BufferU8, line_ptr: u64, line_len: i64, mut out_cache: &BufferU8) -> bool {
   // first_line.bin format:
   // [magic:u64][version:u32][count:u32] then entries
@@ -3991,6 +4172,17 @@ fn find_first_line_match (idx: &BufferU8, line_ptr: u64, line_len: i64, mut out_
   if line_ptr == 0 || line_len <= 0 {
     return false;
   }
+
+  let pat_scratch_opt: BufferU8? = BufferU8.init(1024);
+  if pat_scratch_opt == None {
+    return false;
+  }
+  let mut pat_scratch: BufferU8 = match (pat_scratch_opt) { Some(v) => v, None => BufferU8.empty() };
+  let flags_scratch_opt: BufferU8? = BufferU8.init(16);
+  if flags_scratch_opt == None {
+    return false;
+  }
+  let mut flags_scratch: BufferU8 = match (flags_scratch_opt) { Some(v) => v, None => BufferU8.empty() };
 
   let b = idx.as_bytes();
   if b.ptr == 0 || b.len < 16 {
@@ -4022,8 +4214,19 @@ fn find_first_line_match (idx: &BufferU8, line_ptr: u64, line_len: i64, mut out_
     off = off + (f_len as i64);
 
     if p_ptr != 0 && p_len > 0 && f_ptr != 0 && f_len > 0 {
-      let pat: string = std::runtime::mem::string_from_ptr_len(p_ptr, p_len as int);
-      let cr: ReCompileResult = RegExp.compile(pat, "");
+      let ptn: FirstLinePattern = parse_first_line_pattern(p_ptr, p_len as i64, mut pat_scratch, mut flags_scratch);
+      if ptn.pat_ptr == 0 || ptn.pat_len <= 0 {
+        i = i + 1;
+        continue;
+      }
+
+      let pat: string = std::runtime::mem::string_from_ptr_len(ptn.pat_ptr, ptn.pat_len as int);
+      let flags: string = if ptn.flags_ptr != 0 && ptn.flags_len > 0 {
+        std::runtime::mem::string_from_ptr_len(ptn.flags_ptr, ptn.flags_len as int)
+      } else {
+        ""
+      };
+      let cr: ReCompileResult = RegExp.compile(pat, flags);
       if !cr.is_err() {
         let re: RegExp = ReCompileResult.unwrap_or(cr, RegExp.empty());
         let r: ExecResult = search_bytes(&re, line_ptr, line_len, 0);
@@ -4046,65 +4249,128 @@ fn find_first_line_match (idx: &BufferU8, line_ptr: u64, line_len: i64, mut out_
 fn load_index_file (mut out: &BufferU8) -> bool {
   out.clear();
   let cache_home_opt: string? = xdg_cache_home();
-  if cache_home_opt == None {
-    return false;
+  if cache_home_opt != None {
+    let cache_home: string = match (cache_home_opt) { Some(v) => v, None => "" };
+    let cache_syntax_opt: string? = join2(cache_home, "/sage/syntax/index.bin");
+    if cache_syntax_opt != None {
+      let path: string = match (cache_syntax_opt) { Some(v) => v, None => "" };
+      let ok: bool = read_file_all(path, mut out);
+      free_joined(path);
+      free_joined(cache_home);
+      if ok {
+        return true;
+      }
+    } else {
+      free_joined(cache_home);
+    }
   }
-  let cache_home: string = match (cache_home_opt) { Some(v) => v, None => "" };
-  let cache_syntax_opt: string? = join2(cache_home, "/sage/syntax/index.bin");
-  if cache_syntax_opt == None {
-    free_joined(cache_home);
-    return false;
+
+  // Fallback: bundled cache directory override.
+  let dir_opt: string? = env_get_string(CACHE_DIR_OVERRIDE_ENV);
+  if dir_opt != None {
+    let dir: string = match (dir_opt) { Some(v) => v, None => "" };
+    if std::runtime::mem::string_len(dir) > 0 {
+      let path_opt: string? = join_dir_file(dir, "index.bin");
+      free_joined(dir);
+      if path_opt != None {
+        let path2: string = match (path_opt) { Some(v) => v, None => "" };
+        let ok2: bool = read_file_all(path2, mut out);
+        free_joined(path2);
+        return ok2;
+      }
+    } else {
+      free_joined(dir);
+    }
   }
-  let path: string = match (cache_syntax_opt) { Some(v) => v, None => "" };
-  let ok: bool = read_file_all(path, mut out);
-  free_joined(path);
-  free_joined(cache_home);
-  return ok;
+
+  return false;
 }
 
 fn load_first_line_file (mut out: &BufferU8) -> bool {
   out.clear();
   let cache_home_opt: string? = xdg_cache_home();
-  if cache_home_opt == None {
-    return false;
+  if cache_home_opt != None {
+    let cache_home: string = match (cache_home_opt) { Some(v) => v, None => "" };
+    let cache_syntax_opt: string? = join2(cache_home, "/sage/syntax/first_line.bin");
+    if cache_syntax_opt != None {
+      let path: string = match (cache_syntax_opt) { Some(v) => v, None => "" };
+      let ok: bool = read_file_all(path, mut out);
+      free_joined(path);
+      free_joined(cache_home);
+      if ok {
+        return true;
+      }
+    } else {
+      free_joined(cache_home);
+    }
   }
-  let cache_home: string = match (cache_home_opt) { Some(v) => v, None => "" };
-  let cache_syntax_opt: string? = join2(cache_home, "/sage/syntax/first_line.bin");
-  if cache_syntax_opt == None {
-    free_joined(cache_home);
-    return false;
+
+  // Fallback: bundled cache directory override.
+  let dir_opt: string? = env_get_string(CACHE_DIR_OVERRIDE_ENV);
+  if dir_opt != None {
+    let dir: string = match (dir_opt) { Some(v) => v, None => "" };
+    if std::runtime::mem::string_len(dir) > 0 {
+      let path_opt: string? = join_dir_file(dir, "first_line.bin");
+      free_joined(dir);
+      if path_opt != None {
+        let path2: string = match (path_opt) { Some(v) => v, None => "" };
+        let ok2: bool = read_file_all(path2, mut out);
+        free_joined(path2);
+        return ok2;
+      }
+    } else {
+      free_joined(dir);
+    }
   }
-  let path: string = match (cache_syntax_opt) { Some(v) => v, None => "" };
-  let ok: bool = read_file_all(path, mut out);
-  free_joined(path);
-  free_joined(cache_home);
-  return ok;
+
+  return false;
 }
 
 fn load_syntax_file (file_name: string, mut out: &BufferU8) -> bool {
   out.clear();
   let cache_home_opt: string? = xdg_cache_home();
-  if cache_home_opt == None {
-    return false;
+  if cache_home_opt != None {
+    let cache_home: string = match (cache_home_opt) { Some(v) => v, None => "" };
+    let base_opt: string? = join2(cache_home, "/sage/syntax/");
+    if base_opt != None {
+      let base: string = match (base_opt) { Some(v) => v, None => "" };
+      let path_opt: string? = join2(base, file_name);
+      free_joined(base);
+      if path_opt != None {
+        let path: string = match (path_opt) { Some(v) => v, None => "" };
+        let ok: bool = read_file_all(path, mut out);
+        free_joined(path);
+        free_joined(cache_home);
+        if ok {
+          return true;
+        }
+      } else {
+        free_joined(cache_home);
+      }
+    } else {
+      free_joined(cache_home);
+    }
   }
-  let cache_home: string = match (cache_home_opt) { Some(v) => v, None => "" };
-  let base_opt: string? = join2(cache_home, "/sage/syntax/");
-  if base_opt == None {
-    free_joined(cache_home);
-    return false;
+
+  // Fallback: bundled cache directory override.
+  let dir_opt: string? = env_get_string(CACHE_DIR_OVERRIDE_ENV);
+  if dir_opt != None {
+    let dir: string = match (dir_opt) { Some(v) => v, None => "" };
+    if std::runtime::mem::string_len(dir) > 0 {
+      let path_opt2: string? = join_dir_file(dir, file_name);
+      free_joined(dir);
+      if path_opt2 != None {
+        let path2: string = match (path_opt2) { Some(v) => v, None => "" };
+        let ok2: bool = read_file_all(path2, mut out);
+        free_joined(path2);
+        return ok2;
+      }
+    } else {
+      free_joined(dir);
+    }
   }
-  let base: string = match (base_opt) { Some(v) => v, None => "" };
-  let path_opt: string? = join2(base, file_name);
-  free_joined(base);
-  if path_opt == None {
-    free_joined(cache_home);
-    return false;
-  }
-  let path: string = match (path_opt) { Some(v) => v, None => "" };
-  let ok: bool = read_file_all(path, mut out);
-  free_joined(path);
-  free_joined(cache_home);
-  return ok;
+
+  return false;
 }
 
 let MAX_COMBINED_PAT_BYTES: i64 = 131072;
@@ -4131,59 +4397,48 @@ fn alt_append (mut out: &BufferU8, pat_ptr: u64, pat_len: i64) -> bool {
   return true;
 }
 
-export fn load_for_path (path: string) -> Highlighter? {
-  // Determine key candidates.
+fn cache_name_for_path (idx: &BufferU8, path: string, mut out_cache_name: &BufferU8) -> bool {
+  out_cache_name.clear();
   let parts: PathParts = parse_basename_and_ext(path);
   let base_ptr: u64 = parts.base_ptr;
   let base_len: i64 = parts.base_len;
   let ext_ptr: u64 = parts.ext_ptr;
   let ext_len: i64 = parts.ext_len;
   if base_ptr == 0 || base_len <= 0 {
-    return None;
+    return false;
   }
 
   let key_buf_opt: BufferU8? = BufferU8.init(base_len + 1);
-  if key_buf_opt == None { return None; }
+  if key_buf_opt == None { return false; }
   let mut key_buf: BufferU8 = match (key_buf_opt) { Some(v) => v, None => BufferU8.empty() };
-  let idx_opt: BufferU8? = BufferU8.init(8192);
-  if idx_opt == None { return None; }
-  let mut idx: BufferU8 = match (idx_opt) { Some(v) => v, None => BufferU8.empty() };
-
-  if !load_index_file(mut idx) {
-    return None;
-  }
-
-  let cache_name_opt: BufferU8? = BufferU8.init(256);
-  if cache_name_opt == None { return None; }
-  let mut cache_name: BufferU8 = match (cache_name_opt) { Some(v) => v, None => BufferU8.empty() };
 
   // Prefer full basename (for ".gitignore", "Makefile").
   key_buf.clear();
   let _ = key_buf.push_ptr_len(base_ptr, base_len);
-  var found: bool = find_in_index(&idx, key_buf.ptr, key_buf.len, mut cache_name);
+  var found: bool = find_in_index(idx, key_buf.ptr, key_buf.len, mut out_cache_name);
   if !found {
     to_lower_ascii_inplace(key_buf.ptr, key_buf.len);
-    found = find_in_index(&idx, key_buf.ptr, key_buf.len, mut cache_name);
+    found = find_in_index(idx, key_buf.ptr, key_buf.len, mut out_cache_name);
   }
 
   if !found && ext_ptr != 0 && ext_len > 0 {
     key_buf.clear();
     let _ = key_buf.push_ptr_len(ext_ptr, ext_len);
-    found = find_in_index(&idx, key_buf.ptr, key_buf.len, mut cache_name);
+    found = find_in_index(idx, key_buf.ptr, key_buf.len, mut out_cache_name);
     if !found {
       to_lower_ascii_inplace(key_buf.ptr, key_buf.len);
-      found = find_in_index(&idx, key_buf.ptr, key_buf.len, mut cache_name);
+      found = find_in_index(idx, key_buf.ptr, key_buf.len, mut out_cache_name);
     }
   }
-  if !found || cache_name.len <= 0 {
-    return None;
-  }
 
+  return found && out_cache_name.len > 0;
+}
+
+fn load_for_cache_name (file_name: string) -> Highlighter? {
   // Load compiled syntax file.
   let syn_buf_opt: BufferU8? = BufferU8.init(16384);
   if syn_buf_opt == None { return None; }
   let mut syn_buf: BufferU8 = match (syn_buf_opt) { Some(v) => v, None => BufferU8.empty() };
-  let file_name: string = std::runtime::mem::string_from_ptr_len(cache_name.ptr, cache_name.len as int);
   if !load_syntax_file(file_name, mut syn_buf) {
     return None;
   }
@@ -4195,27 +4450,38 @@ export fn load_for_path (path: string) -> Highlighter? {
   //
   // This is intentionally narrow (fast, low-risk). If the base syntax isn't
   // available, we proceed with the selected cache only.
+  let file_name_ptr: u64 = std::runtime::mem::string_ptr(file_name);
+  let file_name_len: i64 = std::runtime::mem::string_len(file_name);
   let merge_base_c: bool = ends_with(file_name, "c++.sagec");
   let merge_name_opt: BufferU8? = if merge_base_c { BufferU8.init(256) } else { None };
   let mut merge_name: BufferU8 = match (merge_name_opt) { Some(v) => v, None => BufferU8.empty() };
   var have_merge: bool = false;
   if merge_base_c {
-    key_buf.clear();
-    let _ = key_buf.push_str("c");
-    have_merge = find_in_index(&idx, key_buf.ptr, key_buf.len, mut merge_name);
-    // Avoid self-merge on index collisions.
-    if have_merge && merge_name.len == cache_name.len {
-      var same: bool = true;
-      var si: i64 = 0;
-      while si < merge_name.len {
-        if std::runtime::mem::load_u8(merge_name.ptr, si) != std::runtime::mem::load_u8(cache_name.ptr, si) {
-          same = false;
-          break;
+    let idx_opt: BufferU8? = BufferU8.init(8192);
+    if idx_opt != None {
+      let mut idx: BufferU8 = match (idx_opt) { Some(v) => v, None => BufferU8.empty() };
+      if load_index_file(mut idx) {
+        let key_buf_opt: BufferU8? = BufferU8.init(8);
+        if key_buf_opt != None {
+          let mut key_buf: BufferU8 = match (key_buf_opt) { Some(v) => v, None => BufferU8.empty() };
+          let _ = key_buf.push_str("c");
+          have_merge = find_in_index(&idx, key_buf.ptr, key_buf.len, mut merge_name);
         }
-        si = si + 1;
-      }
-      if same {
-        have_merge = false;
+        // Avoid self-merge on index collisions.
+        if have_merge && file_name_ptr != 0 && file_name_len == merge_name.len {
+          var same: bool = true;
+          var si: i64 = 0;
+          while si < merge_name.len {
+            if std::runtime::mem::load_u8(merge_name.ptr, si) != std::runtime::mem::load_u8(file_name_ptr, si) {
+              same = false;
+              break;
+            }
+            si = si + 1;
+          }
+          if same {
+            have_merge = false;
+          }
+        }
       }
     }
   }
@@ -4496,6 +4762,123 @@ export fn load_for_path (path: string) -> Highlighter? {
   return Some(h);
 }
 
+export fn load_for_path (path: string) -> Highlighter? {
+  let idx_opt: BufferU8? = BufferU8.init(8192);
+  if idx_opt == None { return None; }
+  let mut idx: BufferU8 = match (idx_opt) { Some(v) => v, None => BufferU8.empty() };
+  if !load_index_file(mut idx) {
+    return None;
+  }
+
+  let cache_name_opt: BufferU8? = BufferU8.init(256);
+  if cache_name_opt == None { return None; }
+  let mut cache_name: BufferU8 = match (cache_name_opt) { Some(v) => v, None => BufferU8.empty() };
+  if !cache_name_for_path(&idx, path, mut cache_name) {
+    return None;
+  }
+
+  let file_name: string = std::runtime::mem::string_from_ptr_len(cache_name.ptr, cache_name.len as int);
+  return load_for_cache_name(file_name);
+}
+
+export fn load_for_key (key: string) -> Highlighter? {
+  let key_ptr: u64 = std::runtime::mem::string_ptr(key);
+  let key_len: i64 = std::runtime::mem::string_len(key);
+  if key_ptr == 0 || key_len <= 0 {
+    return None;
+  }
+
+  // Allow passing a compiled cache file directly (".sagec").
+  if ends_with(key, ".sagec") {
+    return load_for_cache_name(key);
+  }
+
+  let idx_opt: BufferU8? = BufferU8.init(8192);
+  if idx_opt == None { return None; }
+  let mut idx: BufferU8 = match (idx_opt) { Some(v) => v, None => BufferU8.empty() };
+  if !load_index_file(mut idx) {
+    return None;
+  }
+
+  let cache_name_opt: BufferU8? = BufferU8.init(256);
+  if cache_name_opt == None { return None; }
+  let mut cache_name: BufferU8 = match (cache_name_opt) { Some(v) => v, None => BufferU8.empty() };
+
+  var found: bool = find_in_index(&idx, key_ptr, key_len, mut cache_name);
+  if !found {
+    let tmp_opt: BufferU8? = BufferU8.init(key_len);
+    if tmp_opt != None {
+      let mut tmp: BufferU8 = match (tmp_opt) { Some(v) => v, None => BufferU8.empty() };
+      let _ = tmp.push_ptr_len(key_ptr, key_len);
+      to_lower_ascii_inplace(tmp.ptr, tmp.len);
+      found = find_in_index(&idx, tmp.ptr, tmp.len, mut cache_name);
+    }
+  }
+
+  if !found || cache_name.len <= 0 {
+    return None;
+  }
+
+  let file_name: string = std::runtime::mem::string_from_ptr_len(cache_name.ptr, cache_name.len as int);
+  return load_for_cache_name(file_name);
+}
+
+export fn load_for_path_or_first_line (path: string, line_ptr: u64, line_len: i64) -> Highlighter? {
+  let idx_opt: BufferU8? = BufferU8.init(8192);
+  if idx_opt == None { return None; }
+  let mut idx: BufferU8 = match (idx_opt) { Some(v) => v, None => BufferU8.empty() };
+  let have_index: bool = load_index_file(mut idx);
+
+  let cache_name_opt: BufferU8? = BufferU8.init(256);
+  if cache_name_opt == None { return None; }
+  let mut cache_name: BufferU8 = match (cache_name_opt) { Some(v) => v, None => BufferU8.empty() };
+
+  if have_index && cache_name_for_path(&idx, path, mut cache_name) {
+    let file_name: string = std::runtime::mem::string_from_ptr_len(cache_name.ptr, cache_name.len as int);
+    return load_for_cache_name(file_name);
+  }
+
+  // Fallback: first-line matches extracted from syntax sources.
+  let fl_opt: BufferU8? = BufferU8.init(8192);
+  if fl_opt == None { return None; }
+  let mut fl: BufferU8 = match (fl_opt) { Some(v) => v, None => BufferU8.empty() };
+  if !load_first_line_file(mut fl) {
+    return None;
+  }
+  if !find_first_line_match(&fl, line_ptr, line_len, mut cache_name) {
+    return None;
+  }
+
+  let file_name2: string = std::runtime::mem::string_from_ptr_len(cache_name.ptr, cache_name.len as int);
+  return load_for_cache_name(file_name2);
+}
+
+export fn has_syntax_for_path_or_first_line (path: string, line_ptr: u64, line_len: i64) -> bool {
+  let idx_opt: BufferU8? = BufferU8.init(8192);
+  if idx_opt == None { return false; }
+  let mut idx: BufferU8 = match (idx_opt) { Some(v) => v, None => BufferU8.empty() };
+  let have_index: bool = load_index_file(mut idx);
+
+  let tmp_opt: BufferU8? = BufferU8.init(256);
+  if tmp_opt == None { return false; }
+  let mut tmp: BufferU8 = match (tmp_opt) { Some(v) => v, None => BufferU8.empty() };
+
+  if have_index && cache_name_for_path(&idx, path, mut tmp) {
+    return true;
+  }
+
+  let fl_opt: BufferU8? = BufferU8.init(8192);
+  if fl_opt == None { return false; }
+  let mut fl: BufferU8 = match (fl_opt) { Some(v) => v, None => BufferU8.empty() };
+  if !load_first_line_file(mut fl) {
+    return false;
+  }
+  if find_first_line_match(&fl, line_ptr, line_len, mut tmp) {
+    return true;
+  }
+  return false;
+}
+
 export fn has_syntax_for_path (path: string) -> bool {
   // Fast check for whether a compiled syntax exists for a path.
   // Does NOT load/compile regex rules (unlike `load_for_path`).
@@ -4636,9 +5019,9 @@ export fn highlight_segment_stateful (h: &Highlighter, mut st: &HLState, ptr: u6
   // Regex rules still apply for non-range tokens (and for comment/string when
   // range rules are unavailable).
   let has_re_rules: bool =
-    (h.has_comment && !range_comments) ||
-    (h.has_string && !range_strings) ||
-    h.has_preproc || h.has_number || h.has_keyword || h.has_ty || h.has_function || h.has_constant || h.has_heading || h.has_emphasis || h.has_operator;
+  (h.has_comment && !range_comments) ||
+  (h.has_string && !range_strings) ||
+  h.has_preproc || h.has_number || h.has_keyword || h.has_ty || h.has_function || h.has_constant || h.has_heading || h.has_emphasis || h.has_operator;
   if !has_re_rules {
     return true;
   }
@@ -4746,6 +5129,9 @@ test "parse_atom_cson extracts fileTypes and match rules" {
   let exts_opt: BufferU8? = BufferU8.init(64);
   assert(exts_opt != None, "exts init");
   let mut exts: BufferU8 = match (exts_opt) { Some(v) => v, None => BufferU8.empty() };
+  let first_lines_opt: BufferU8? = BufferU8.init(128);
+  assert(first_lines_opt != None, "first_lines init");
+  let mut first_lines: BufferU8 = match (first_lines_opt) { Some(v) => v, None => BufferU8.empty() };
   let rules_opt: BufferU8? = BufferU8.init(128);
   assert(rules_opt != None, "rules init");
   let mut rules: BufferU8 = match (rules_opt) { Some(v) => v, None => BufferU8.empty() };
@@ -4754,7 +5140,7 @@ test "parse_atom_cson extracts fileTypes and match rules" {
   let mut toks: BufferU8 = match (toks_opt) { Some(v) => v, None => BufferU8.empty() };
 
   let mut meta: SyntaxMeta = SyntaxMeta{ flags: 0 };
-  let ok: bool = parse_atom_cson(&buf, "test.sagec", mut exts, mut rules, mut toks, mut meta);
+  let ok: bool = parse_atom_cson(&buf, "test.sagec", mut exts, mut first_lines, mut rules, mut toks, mut meta);
   assert(ok, "parse ok");
   assert(test_exts_has(&exts, "js"), "ext js");
   assert(test_exts_has(&exts, "jsx"), "ext jsx");
@@ -4799,6 +5185,9 @@ test "parse_sublime_syntax extracts nested context rules + range flags" {
   let exts_opt: BufferU8? = BufferU8.init(64);
   assert(exts_opt != None, "exts init");
   let mut exts: BufferU8 = match (exts_opt) { Some(v) => v, None => BufferU8.empty() };
+  let first_lines_opt: BufferU8? = BufferU8.init(64);
+  assert(first_lines_opt != None, "first_lines init");
+  let mut first_lines: BufferU8 = match (first_lines_opt) { Some(v) => v, None => BufferU8.empty() };
   let rules_opt: BufferU8? = BufferU8.init(128);
   assert(rules_opt != None, "rules init");
   let mut rules: BufferU8 = match (rules_opt) { Some(v) => v, None => BufferU8.empty() };
@@ -4807,7 +5196,7 @@ test "parse_sublime_syntax extracts nested context rules + range flags" {
   let mut toks: BufferU8 = match (toks_opt) { Some(v) => v, None => BufferU8.empty() };
 
   let mut meta: SyntaxMeta = SyntaxMeta{ flags: 0 };
-  let ok: bool = parse_sublime_syntax(&buf, "test.sagec", mut exts, mut rules, mut toks, mut meta);
+  let ok: bool = parse_sublime_syntax(&buf, "test.sagec", mut exts, mut first_lines, mut rules, mut toks, mut meta);
   assert(ok, "parse ok");
   assert(test_exts_has(&exts, "tst"), "ext tst");
   assert(test_toks_has(&toks, TOK_KEYWORD), "tok keyword");
@@ -4830,6 +5219,9 @@ test "parse_atom_cson extracts begin/end range flags" {
   let exts_opt: BufferU8? = BufferU8.init(64);
   assert(exts_opt != None, "exts init");
   let mut exts: BufferU8 = match (exts_opt) { Some(v) => v, None => BufferU8.empty() };
+  let first_lines_opt: BufferU8? = BufferU8.init(64);
+  assert(first_lines_opt != None, "first_lines init");
+  let mut first_lines: BufferU8 = match (first_lines_opt) { Some(v) => v, None => BufferU8.empty() };
   let rules_opt: BufferU8? = BufferU8.init(64);
   assert(rules_opt != None, "rules init");
   let mut rules: BufferU8 = match (rules_opt) { Some(v) => v, None => BufferU8.empty() };
@@ -4838,7 +5230,7 @@ test "parse_atom_cson extracts begin/end range flags" {
   let mut toks: BufferU8 = match (toks_opt) { Some(v) => v, None => BufferU8.empty() };
 
   let mut meta: SyntaxMeta = SyntaxMeta{ flags: 0 };
-  let ok: bool = parse_atom_cson(&buf, "test.sagec", mut exts, mut rules, mut toks, mut meta);
+  let ok: bool = parse_atom_cson(&buf, "test.sagec", mut exts, mut first_lines, mut rules, mut toks, mut meta);
   assert(ok, "parse ok");
   assert((meta.flags & SYN_F_LINE_COMMENT_SLASH) != 0, "line comment flag");
   assert((meta.flags & SYN_F_BLOCK_COMMENT_C) != 0, "block comment flag");
@@ -4860,6 +5252,9 @@ test "parse_textmate_syntax extracts begin/end range flags" {
   let exts_opt: BufferU8? = BufferU8.init(64);
   assert(exts_opt != None, "exts init");
   let mut exts: BufferU8 = match (exts_opt) { Some(v) => v, None => BufferU8.empty() };
+  let first_lines_opt: BufferU8? = BufferU8.init(64);
+  assert(first_lines_opt != None, "first_lines init");
+  let mut first_lines: BufferU8 = match (first_lines_opt) { Some(v) => v, None => BufferU8.empty() };
   let rules_opt: BufferU8? = BufferU8.init(64);
   assert(rules_opt != None, "rules init");
   let mut rules: BufferU8 = match (rules_opt) { Some(v) => v, None => BufferU8.empty() };
@@ -4868,7 +5263,7 @@ test "parse_textmate_syntax extracts begin/end range flags" {
   let mut toks: BufferU8 = match (toks_opt) { Some(v) => v, None => BufferU8.empty() };
 
   let mut meta: SyntaxMeta = SyntaxMeta{ flags: 0 };
-  let ok: bool = parse_textmate_syntax(&buf, "test.sagec", mut exts, mut rules, mut toks, mut meta);
+  let ok: bool = parse_textmate_syntax(&buf, "test.sagec", mut exts, mut first_lines, mut rules, mut toks, mut meta);
   assert(ok, "parse ok");
   assert(test_exts_has(&exts, "C"), "ext C preserved");
   assert((meta.flags & SYN_F_BLOCK_COMMENT_C) != 0, "block comment flag");
@@ -4895,6 +5290,9 @@ test "parse_textmate_json extracts fileTypes + range flags" {
   let exts_opt: BufferU8? = BufferU8.init(64);
   assert(exts_opt != None, "exts init");
   let mut exts: BufferU8 = match (exts_opt) { Some(v) => v, None => BufferU8.empty() };
+  let first_lines_opt: BufferU8? = BufferU8.init(64);
+  assert(first_lines_opt != None, "first_lines init");
+  let mut first_lines: BufferU8 = match (first_lines_opt) { Some(v) => v, None => BufferU8.empty() };
   let rules_opt: BufferU8? = BufferU8.init(256);
   assert(rules_opt != None, "rules init");
   let mut rules: BufferU8 = match (rules_opt) { Some(v) => v, None => BufferU8.empty() };
@@ -4903,7 +5301,7 @@ test "parse_textmate_json extracts fileTypes + range flags" {
   let mut toks: BufferU8 = match (toks_opt) { Some(v) => v, None => BufferU8.empty() };
 
   let mut meta: SyntaxMeta = SyntaxMeta{ flags: 0 };
-  let ok: bool = parse_textmate_json(&buf, "test.sagec", mut exts, mut rules, mut toks, mut meta);
+  let ok: bool = parse_textmate_json(&buf, "test.sagec", mut exts, mut first_lines, mut rules, mut toks, mut meta);
   assert(ok, "parse ok");
   assert(test_exts_has(&exts, "tjs"), "ext tjs");
   assert(test_toks_has(&toks, TOK_KEYWORD), "tok keyword");
