@@ -1,0 +1,326 @@
+.TH SAGE\-PLUGIN\-API 3 "2026-03-05" "sage 0.1.0" "Library Functions Manual"
+.SH NAME
+sage\-plugin\-api \- JavaScript plugin API for sage
+.SH SYNOPSIS
+Plugins are ES modules loaded from the plugins directory:
+.PP
+.nf
+\fI~/.config/sage/plugins/10-example.js\fR
+
+import fs from 'sage:fs'
+
+on('open', ({ path, tab, tab_count }) => {
+  console.info('open', path, tab, tab_count)
+})
+
+command('hello', async (args) => {
+  console.log('hello', args)
+  exec(':42')
+})
+.fi
+.SH DESCRIPTION
+\fBsage\fR(1) can load JavaScript plugins powered by QuickJS.
+Each plugin runs in its own QuickJS runtime/context and is evaluated as an ES module (ESM).
+Plugins are loaded only in interactive TUI sessions (when \fBstdout\fR is a TTY).
+.PP
+Plugins can:
+.IP \(bu 2
+listen for host events (open, tab changes, searches, copy, quit),
+.IP \(bu 2
+register custom \fB:\fR commands,
+.IP \(bu 2
+execute host commands,
+.IP \(bu 2
+perform bounded filesystem I/O (plugin state + currently open local files),
+.IP \(bu 2
+run bounded child processes,
+.IP \(bu 2
+make HTTP(S) requests via a WHATWG\-style \fBfetch()\fR.
+.SH LOADING
+At startup, \fBsage\fR loads \fB*.js\fR plugins in lexicographic order from:
+.IP 1. 3
+\fB\-\-plugins\-dir\fR \fIPATH\fR / \fB.sagerc\fR \fBplugins_dir\fR (if set and \fBSAGE_PLUGINS_DIR\fR is not set),
+.IP 2. 3
+\fBSAGE_PLUGINS_DIR\fR,
+.IP 3. 3
+\fBXDG_CONFIG_HOME\fR/\fBsage/plugins\fR (usually \fI~/.config/sage/plugins\fR),
+.IP 4. 3
+\fI$HOME/.config/sage/plugins\fR.
+.PP
+Disable plugins:
+.IP \(bu 2
+\fBSAGE_NO_PLUGINS=1\fR, or
+.IP \(bu 2
+\fB\-\-no\-plugins\fR, or
+.IP \(bu 2
+\fB.sagerc\fR \fBplugins = false\fR.
+.SH MODULES
+Plugins are evaluated as ES modules:
+.IP \(bu 2
+\fBimport ... from 'sage:...'\fR imports built\-in modules provided by the host.
+.IP \(bu 2
+Relative imports are allowed only for filesystem modules under the plugin's directory tree.
+Bare imports are rejected.
+.IP \(bu 2
+Relative imports from \fBsage:*\fR modules are rejected.
+.IP \(bu 2
+Top\-level \fBawait\fR is not supported; plugins using it are disabled at load time.
+.SH GLOBALS
+The plugin bootstrap extends \fBglobalThis\fR with browser\-like primitives.
+.SS Runtime Detection
+.TP
+.B isSageRuntime
+A stable getter that returns \fBtrue\fR.
+.SS Events
+.TP
+.B EventTarget
+.TP
+.B Event
+.TP
+.B CustomEvent
+.TP
+.B MessageEvent
+Minimal DOM\-style event types.
+.PP
+The host dispatches events as \fBCustomEvent\fR instances; the payload is carried in \fBev.detail\fR.
+.TP
+.B addEventListener(type, fn)
+.TP
+.B removeEventListener(type, fn)
+.TP
+.B dispatchEvent(ev)
+EventTarget methods bound to an internal event bus.
+.TP
+.B on(type, fn)
+.TP
+.B once(type, fn)
+.TP
+.B off(type, fn)
+Convenience helpers that call \fBfn(payload)\fR where payload is:
+.IP \(bu 2
+\fBCustomEvent.detail\fR, or
+.IP \(bu 2
+\fBMessageEvent.data\fR.
+.SS Console
+.TP
+.B console
+An instance of \fBConsole\fR with methods:
+\fBlog\fR, \fBinfo\fR, \fBwarn\fR, \fBerror\fR, \fBverbose\fR, \fBdebug\fR.
+Output is written to the plugin log (see \fBENVIRONMENT\fR).
+.PP
+Logging is gated by \fBSAGE_CONSOLE_LEVEL\fR:
+.IP \(bu 2
+\fBsilent\fR/\fBnone\fR/\fBoff\fR disables logging,
+.IP \(bu 2
+\fBerror\fR, \fBwarn\fR, \fBinfo\fR/\fBlog\fR, \fBverbose\fR, \fBdebug\fR set a threshold,
+.IP \(bu 2
+numeric levels \fB\-1\fR..\fB4\fR are also accepted.
+.PP
+If \fBSAGE_CONSOLE_LEVEL\fR is unset, the default threshold is \fBwarn\fR (or \fBdebug\fR when \fBsage\fR is started with \fB\-\-verbose\fR).
+.SS Timers
+.TP
+.B queueMicrotask(fn)
+.TP
+.B setTimeout(fn, ms, ...)
+.TP
+.B clearTimeout(id)
+.TP
+.B setInterval(fn, ms, ...)
+.TP
+.B clearInterval(id)
+.TP
+.B sleep(ms)
+Timers are host\-backed.
+Callbacks are subject to the per\-event execution budget (see \fBLIMITS\fR).
+.SS Commands
+.TP
+.B command(name, fn)
+Register a custom \fB:\fR command.
+The command name is normalized (trimmed, lowercased).
+The handler is invoked as \fBfn(args)\fR where \fIargs\fR is the command tail as a string.
+Handlers may be async.
+.TP
+.B exec(cmd)
+Enqueue a host command for execution.
+\fIcmd\fR may include a leading \fB:\fR.
+Returns \fBtrue\fR on successful enqueue.
+.SS Navigator
+.TP
+.B navigator
+A browser\-like \fBNavigator\fR instance (also available via \fBsage:navigator\fR) with:
+.IP \(bu 2
+\fBnavigator.appName\fR,
+.IP \(bu 2
+\fBnavigator.appVersion\fR,
+.IP \(bu 2
+\fBnavigator.userAgent\fR.
+.SH BUILT\-IN MODULES
+The host provides built\-in ES modules under the \fBsage:\fR namespace.
+.TP
+.B sage:fs
+Bounded filesystem I/O.
+.IP \(bu 2
+\fBdataDir()\fR \- returns the plugin data directory path.
+.IP \(bu 2
+\fBexists(path)\fR \- returns \fBtrue\fR if \fIpath\fR exists and is readable by the plugin sandbox.
+.IP \(bu 2
+\fBreadFile(path, opts?)\fR \- reads a currently open local file (or a file under the plugin data dir).
+\fIopts\fR may be \fB'utf8'\fR/\fB'utf-8'\fR or \fB{ encoding: 'utf8', maxBytes }\fR.
+.IP \(bu 2
+\fBreadDataFile(name, opts?)\fR \- reads a file from the plugin data directory by relative name.
+.IP \(bu 2
+\fBwriteFile(name, data)\fR / \fBappendFile(name, data)\fR \- write/append a file in the plugin data directory.
+.IP \(bu 2
+\fBreaddir()\fR \- list files in the plugin data directory.
+.IP
+Reads default to 256KiB and are capped at 4MiB.
+Writes are capped at 4MiB per call.
+.TP
+.B sage:path
+Minimal POSIX\-style path helpers:
+\fBisAbsolute\fR, \fBnormalize\fR, \fBjoin\fR, \fBdirname\fR, \fBbasename\fR, \fBextname\fR, \fBresolve\fR.
+.TP
+.B sage:process
+Process helpers:
+.IP \(bu 2
+\fBpid\fR, \fBppid\fR,
+.IP \(bu 2
+\fBcwd()\fR,
+.IP \(bu 2
+\fBexec(cmd, { timeoutMs?, maxBytes? }?)\fR \- run \fB/bin/sh \-c\fR \fIcmd\fR.
+.IP
+\fBexec()\fR resolves with:
+.IP
+\fB{ code, stdout, stderr, timedOut, truncated, signal }\fR.
+.IP
+On timeout or truncation, it rejects with an Error object carrying the same properties.
+.TP
+.B sage:env
+Environment variable helpers:
+\fBget(name)\fR, \fBset(name, value, { overwrite? }?)\fR, \fBunset(name)\fR.
+.TP
+.B sage:navigator
+Exports the \fBnavigator\fR instance (default export) and \fBNavigator\fR (named export).
+.TP
+.B sage:performance
+\fBperformance.now()\fR and \fBperformance.timeOrigin\fR (plus \fBinstallGlobals()\fR).
+.TP
+.B sage:crypto
+\fBcrypto.getRandomValues(...)\fR and \fBcrypto.randomUUID()\fR (plus \fBinstallGlobals()\fR).
+.TP
+.B sage:uuid
+UUID helpers:
+\fBv4()\fR and \fBv7([unixMs])\fR.
+.TP
+.B sage:url
+WHATWG\-style \fBURL\fR and \fBURLSearchParams\fR (plus \fBinstallGlobals()\fR).
+.TP
+.B sage:core/dom
+DOM core helpers:
+\fBDOMException\fR and \fBstructuredClone\fR (plus \fBinstallGlobals()\fR).
+.TP
+.B sage:core/web
+Host\-free WHATWG\-style web primitives:
+\fBHeaders\fR, \fBRequest\fR, \fBResponse\fR, \fBFormData\fR, \fBBlob\fR, \fBReadableStream\fR,
+\fBAbortController\fR, \fBAbortSignal\fR, \fBTextEncoder\fR, \fBTextDecoder\fR (plus \fBinstallGlobals()\fR).
+.TP
+.B sage:fetch
+WHATWG\-style \fBfetch\fR backed by the native host (plus \fBinstallGlobals()\fR).
+.IP
+Extra options on \fBfetch(input, init)\fR:
+.IP \(bu 2
+\fBtimeoutMs\fR (default: 30000),
+.IP \(bu 2
+\fBmaxBytes\fR (default: 16777216),
+.IP \(bu 2
+\fBfollowRedirects\fR (default: true).
+.SH EVENTS
+Host events are delivered as \fBCustomEvent\fR instances.
+When using \fBon\fR/\fBonce\fR, handlers receive the payload directly.
+.TP
+.B open
+\fB{ path, tab, tab_count }\fR.
+.TP
+.B tab_change
+\fB{ from, to, tab_count }\fR.
+.TP
+.B search
+\fB{ query, regex, ignore_case }\fR.
+.TP
+.B copy
+\fB{ bytes }\fR (copied selection bytes).
+.TP
+.B quit
+No payload.
+.SH LIMITS
+For robustness, plugin execution is bounded.
+When a plugin exceeds a limit, \fBsage\fR disables only that plugin for the rest of the session.
+.TP
+.B SAGE_PLUGIN_LOAD_TIMEOUT_MS
+Plugin bootstrap/load execution budget in milliseconds (default: 500).
+.TP
+.B SAGE_PLUGIN_EVENT_TIMEOUT_MS
+Per\-event execution budget in milliseconds (default: 50).
+.TP
+.B SAGE_PLUGIN_MEM_LIMIT_MB
+QuickJS memory limit in MiB (default: 64).
+.TP
+.B SAGE_PLUGIN_STACK_LIMIT_KB
+QuickJS stack limit in KiB (default: 1024).
+.SH ENVIRONMENT
+.TP
+.B SAGE_PLUGINS_DIR
+Override the plugins directory.
+.TP
+.B SAGE_NO_PLUGINS
+If set, disables plugin loading (safe mode).
+.TP
+.B SAGE_PLUGIN_LOG
+Override the plugin log file path.
+.TP
+.B SAGE_PLUGIN_LOG_STDERR
+If set, write plugin logs to \fBstderr\fR (debug only; may corrupt the TUI).
+.TP
+.B SAGE_CONSOLE_LEVEL
+Console threshold (see \fBGLOBALS\fR).
+.TP
+.B SSL_CERT_FILE
+Path to a PEM CA bundle used by HTTPS fetch.
+.TP
+.B SAGE_FETCH_INSECURE
+If set to a non\-zero value, disables HTTPS certificate verification.
+.SH FILES
+.TP
+.I ~/.config/sage/plugins/
+Default plugins directory.
+.TP
+.I ~/.cache/sage/plugins.log
+Default plugin log file.
+.TP
+.I ~/.local/state/sage/plugins/
+Default plugin data root directory (\fBXDG_STATE_HOME\fR overrides).
+.PP
+Each plugin gets its own data directory based on its filename (sanitized, \fB.js\fR removed).
+.SH EXAMPLES
+.TP
+Log all host events
+.PP
+.nf
+\fI~/.config/sage/plugins/00-log-events.js\fR
+
+on('open', (p) => console.info('open', p))
+on('tab_change', (p) => console.info('tab_change', p))
+on('search', (p) => console.info('search', p))
+on('copy', (p) => console.info('copy', p.bytes && p.bytes.length))
+on('quit', () => console.info('quit'))
+.fi
+.TP
+Register a command
+.PP
+.nf
+command('hi', async (args) => {
+  console.log('hi', args)
+})
+.fi
+.SH SEE ALSO
+\fBsage\fR(1), \fBsage\fR(7)

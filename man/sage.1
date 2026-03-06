@@ -1,4 +1,4 @@
-.TH SAGE 1 "2026-02-18" "sage 0.1.0" "User Commands"
+.TH SAGE 1 "2026-03-05" "sage 0.1.0" "User Commands"
 .SH NAME
 sage \- a fast, ergonomic terminal pager
 .SH SYNOPSIS
@@ -263,8 +263,14 @@ Base directory for config files (used for syntax sources).
 .B XDG_CACHE_HOME
 Base directory for cache files (used for compiled syntax caches).
 .TP
+.B SAGE_SYNTAX_CACHE_DIR
+Override the syntax cache directory.
+.TP
 .B SAGE_NO_PLUGINS
 If set, disables plugin loading (safe mode).
+.TP
+.B SAGE_CONSOLE_LEVEL
+Console logging threshold for JavaScript plugins (see \fBsage\-plugin\-api\fR(3)).
 .TP
 .B SAGE_PLUGINS_DIR
 Override the plugins directory (loads \fB*.js\fR in lexicographic order).
@@ -338,5 +344,6 @@ By default, \fBsage\fR sanitizes control bytes to reduce terminal injection risk
 .PP
 \fB\-\-raw\fR disables sanitization and may execute terminal control sequences from content; only use it on trusted input.
 .SH BUGS
-\fBsage\fR is a work in progress.
 If you hit incorrect rendering or terminal incompatibilities, try disabling features (\fB\-\-no\-alt\-screen\fR, \fB\-\-no\-mouse\fR, \fB\-\-no\-ansi\fR) and report the behavior.
+.SH SEE ALSO
+\fBsage\fR(7), \fBsage\-plugin\-api\fR(3)

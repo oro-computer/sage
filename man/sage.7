@@ -1,0 +1,109 @@
+.TH SAGE 7 "2026-03-05" "sage 0.1.0" "Miscellaneous Information Manual"
+.SH NAME
+sage \- concepts, configuration, and security notes
+.SH DESCRIPTION
+\fBsage\fR(1) is a terminal pager focused on fast navigation, incremental search, and an ergonomic TUI.
+This page documents higher\-level concepts: inputs, tabs, syntax selection, configuration, and plugin/runtime behavior.
+.SH INPUTS
+\fBsage\fR can open:
+.IP \(bu 2
+local file paths,
+.IP \(bu 2
+directories (expanded to direct child files; non\-recursive),
+.IP \(bu 2
+stdin (use \fB\-\fR, or pipe into \fBsage\fR),
+.IP \(bu 2
+network paths: \fBhttp://\fR, \fBhttps://\fR, and \fBssh://\fR.
+.PP
+When stdin is a pipe, \fBsage\fR reads keys from \fI/dev/tty\fR so it remains interactive.
+.PP
+Network paths are treated as read\-only content.
+For syntax selection, \fBsage\fR ignores URL query strings and fragments.
+If a URL path has no usable extension, \fBsage\fR may use the HTTP \fBContent\-Type\fR header as a syntax hint.
+.SH TABS
+Opening multiple inputs creates a tab bar.
+Tabs are 1\-indexed; \fB0\fR selects the last tab.
+See \fBsage\fR(1) for tab keybindings and \fB:\fR commands.
+.SH SEARCH VS FIND
+.SS Search (within one tab)
+\fB/\fR (or \fBCtrl\-F\fR) starts incremental search within the active tab.
+Use \fBn\fR and \fBp\fR for next/previous match.
+.SS Find (across open tabs)
+\fBCtrl\-K\fR opens a "find" modal that searches across currently open tabs.
+.PP
+For local file tabs, \fBsage\fR shells out to an external tool (see \fBFIND TOOL\fR).
+For network tabs, \fBsage\fR scans the in\-memory content internally.
+.PP
+Selecting a result (Enter or click) jumps to the file and location and highlights the selected match in the destination tab.
+.SS Find Tool
+The find tool is configurable via \fB.sagerc\fR \fBfind_cmd\fR.
+If unset, \fBsage\fR uses a smart default:
+.IP \(bu 2
+if \fBrg\fR exists: \fBrg \-\-vimgrep \-\- <query> <...files>\fR
+.IP \(bu 2
+else if \fBag\fR exists: \fBag \-\-vimgrep \-\- <query> <...files>\fR
+.IP \(bu 2
+else if \fBslg\fR exists: \fBslg \-\- <query> <...files>\fR
+.IP \(bu 2
+else: \fBgrep \-inH \-\- <query> <...files>\fR
+.PP
+Find output is parsed as either \fBvimgrep\fR (\fIpath:line:col:text\fR) or grep\-style (\fIpath:line:text\fR) so result navigation can jump precisely.
+.SH SYNTAX SELECTION
+When syntax highlighting is enabled, \fBsage\fR selects a syntax key using (in order):
+.IP 1. 3
+\fBsyntax_map\fR overrides from \fB.sagerc\fR,
+.IP 2. 3
+compiled syntax index matches for the path (including "first\-line" patterns from syntax sources),
+.IP 3. 3
+a network syntax hint (for example from HTTP \fBContent\-Type\fR) when available.
+.PP
+For network paths, query strings and fragments do not participate in syntax selection.
+.SH SYNTAX CACHE LAYOUT
+\fBsage\fR uses compiled syntax caches:
+.IP \(bu 2
+User cache: \fBXDG_CACHE_HOME\fR/\fBsage/syntax\fR (default: \fI~/.cache/sage/syntax\fR)
+.IP \(bu 2
+User sources: \fBXDG_CONFIG_HOME\fR/\fBsage/syntax\fR (default: \fI~/.config/sage/syntax\fR)
+.PP
+\fBsage \-\-compile\-cache\fR compiles user sources into the user cache.
+.PP
+For portability, \fBsage\fR also supports "bundled" syntax caches:
+.IP \(bu 2
+Build layout: \fI<root>/bin/sage\fR with \fI<root>/syntax/\fR next to it
+.IP \(bu 2
+Installed layout: \fI<prefix>/bin/sage\fR with \fI<prefix>/share/sage/syntax/\fR
+.PP
+To override cache lookup explicitly, set \fBSAGE_SYNTAX_CACHE_DIR\fR.
+.SH CONFIGURATION
+\fBsage\fR reads \fB.sagerc\fR (TOML) unless \fB\-\-no\-rc\fR is provided.
+Order:
+.IP 1. 3
+\fBSAGERC\fR (explicit path via env var)
+.IP 2. 3
+\fI./.sagerc\fR
+.IP 3. 3
+\fI$HOME/.sagerc\fR
+.PP
+Command line flags always override config values.
+See \fB.sagerc.example\fR for supported keys.
+.SH PLUGINS
+\fBsage\fR can load JavaScript plugins (QuickJS) for automation and customization.
+Plugin scripts are loaded only in interactive TUI sessions and can register events and custom \fB:\fR commands.
+.PP
+See \fBsage\-plugin\-api\fR(3) for the runtime surface, built\-in modules, events, and limits.
+.SH SECURITY
+By default, \fBsage\fR sanitizes control bytes to reduce terminal injection risk.
+It can optionally pass through ANSI SGR sequences (for colored \fBman\fR output and diffs).
+.PP
+\fB\-\-raw\fR disables sanitization and may execute terminal control sequences from content; use it only on trusted input.
+.SH DISTRIBUTION
+The \fIbuild/\fR directory is intended to be distributable.
+It contains the \fBsage\fR binary, bundled syntax caches, and an installation Makefile.
+.PP
+Typical installation from a build directory:
+.PP
+.nf
+make \-C build install PREFIX=/usr/local
+.fi
+.SH SEE ALSO
+\fBsage\fR(1), \fBsage\-plugin\-api\fR(3)

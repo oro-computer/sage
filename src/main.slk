@@ -5632,10 +5632,10 @@ fn find_push_u64_dec (mut s: &std::strings::String, n: i64) -> bool {
   }
 
   let mut digits: u8[32] = [
-    0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0
+  0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0
   ];
   var dn: i64 = 0;
   while x != 0 && dn < 32 {
@@ -5655,13 +5655,13 @@ fn find_push_u64_dec (mut s: &std::strings::String, n: i64) -> bool {
 }
 
 fn find_push_result_line (
-  mut out: &std::strings::String,
-  fmt: int,
-  path: string,
-  line1: i64,
-  col1: i64,
-  snippet_ptr: u64,
-  snippet_len: i64
+mut out: &std::strings::String,
+fmt: int,
+path: string,
+line1: i64,
+col1: i64,
+snippet_ptr: u64,
+snippet_len: i64
 ) -> bool {
   if out.push_string(path) != None { return false; }
   if out.push_u8(58) != None { return false; } // ':'
@@ -5680,13 +5680,13 @@ fn find_push_result_line (
 }
 
 fn find_scan_file_lines (
-  file: &MappedFile,
-  fmt: int,
-  path: string,
-  q_ptr: u64,
-  q_len: i64,
-  mut out: &std::strings::String,
-  total0: i64
+file: &MappedFile,
+fmt: int,
+path: string,
+q_ptr: u64,
+q_len: i64,
+mut out: &std::strings::String,
+total0: i64
 ) -> i64? {
   var total: i64 = total0;
   if file.ptr == 0 || file.len <= 0 || q_ptr == 0 || q_len <= 0 {
