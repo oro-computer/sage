@@ -22,19 +22,21 @@ man -l man/sage.1
 ## Usage
 
 ```sh
-./build/bin/sage <path> [path ...]  # files or directories (dirs expand to child files)
-./build/bin/sage src/               # open all files in a directory (non-recursive)
-cat <path> | ./build/bin/sage
-./build/bin/sage --index-only <path>
-./build/bin/sage --compile-cache    # compile syntax cache (see below)
-./build/bin/sage --verbose --compile-cache
-./build/bin/sage --verbose --list-syntax
-./build/bin/sage -i <path>        # case-insensitive search
-./build/bin/sage -R <path>        # regex search (std::regex)
-./build/bin/sage --color never <path>
-./build/bin/sage --theme ocean <path>
-./build/bin/sage --no-alt-screen <path>
-./build/bin/sage --no-rc <path>
+sage <path> [path ...]  # files or directories (dirs expand to child files)
+sage src/               # open all files in a directory (non-recursive)
+sage https://...        # open a URL
+sage ssh://...          # open a path through ssh
+cat <path> | bin/sage
+sage --index-only <path>
+sage --compile-cache    # compile syntax cache (see below)
+sage --verbose --compile-cache
+sage --verbose --list-syntax
+sage -i <path>        # case-insensitive search
+sage -R <path>        # regex search (std::regex)
+sage --color never <path>
+sage --theme ocean <path>
+sage --no-alt-screen <path>
+sage --no-rc <path>
 ```
 
 ## Keys

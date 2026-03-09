@@ -151,6 +151,9 @@ struct SageQjs {
   size_t plugins_len;
   size_t plugins_cap;
 
+  SageQjsPlugin repl;
+  int repl_inited;
+
   uint64_t next_fetch_id;
   uint64_t next_timer_id;
 
@@ -5329,6 +5332,7 @@ SageQjs *sage_qjs_new(int64_t verbose) {
   q->plugins = NULL;
   q->plugins_len = 0;
   q->plugins_cap = 0;
+  q->repl_inited = 0;
   q->next_fetch_id = 1;
   q->next_timer_id = 1;
   q->exec_cmds = NULL;
@@ -5817,6 +5821,12 @@ void sage_qjs_free(SageQjs *q) {
   if (!q) {
     return;
   }
+  if (q->repl_inited) {
+    sage_qjs_plugin_close(&q->repl);
+    free(q->repl.path);
+    q->repl.path = NULL;
+    q->repl_inited = 0;
+  }
   if (q->plugins) {
     for (size_t i = 0; i < q->plugins_len; i++) {
       SageQjsPlugin *p = &q->plugins[i];
@@ -6024,6 +6034,44 @@ int64_t sage_qjs_command(SageQjs *q, const char *name, const char *args) {
     sage_qjs_end_budget(p);
   }
 
+  if (q->repl_inited) {
+    SageQjsPlugin *p = &q->repl;
+    if (p->ctx && !p->disabled && !JS_IsUndefined(p->cmd_fn)) {
+      JSContext *ctx = p->ctx;
+      JSValue n = JS_NewString(ctx, name);
+      JSValue av = JS_NewString(ctx, a);
+      JSValue argv[2] = {n, av};
+      sage_qjs_begin_budget(p, p->event_timeout_ms);
+      JSValue ret = JS_Call(ctx, p->cmd_fn, JS_UNDEFINED, 2, argv);
+      JS_FreeValue(ctx, n);
+      JS_FreeValue(ctx, av);
+
+      if (p->timed_out) {
+        if (JS_IsException(ret)) {
+          sage_qjs_dump_exception(p);
+        }
+        JS_FreeValue(ctx, ret);
+        sage_qjs_end_budget(p);
+        sage_qjs_plugin_disable(p, "command timed out");
+      } else if (JS_IsException(ret)) {
+        sage_qjs_end_budget(p);
+        sage_qjs_dump_exception(p);
+        JS_FreeValue(ctx, ret);
+        sage_qjs_plugin_disable(p, "command threw");
+      } else {
+        if (JS_ToBool(ctx, ret)) {
+          handled = 1;
+        }
+        JS_FreeValue(ctx, ret);
+
+        if (!p->disabled) {
+          sage_qjs_drain_jobs(p);
+        }
+        sage_qjs_end_budget(p);
+      }
+    }
+  }
+
   return handled ? 1 : 0;
 }
 
@@ -6043,6 +6091,10 @@ void sage_qjs_set_timeouts_ms(SageQjs *q, int64_t load_ms, int64_t event_ms) {
       p->load_timeout_ms = q->load_timeout_ms;
       p->event_timeout_ms = q->event_timeout_ms;
     }
+  }
+  if (q->repl_inited) {
+    q->repl.load_timeout_ms = q->load_timeout_ms;
+    q->repl.event_timeout_ms = q->event_timeout_ms;
   }
 }
 
@@ -6091,6 +6143,9 @@ void sage_qjs_set_limits(SageQjs *q, int64_t mem_limit_bytes,
         }
       }
     }
+    if (q->repl_inited && q->repl.rt) {
+      JS_SetMemoryLimit(q->repl.rt, (size_t)q->mem_limit_bytes);
+    }
   }
   if (stack_limit_bytes >= 0) {
     q->stack_limit_bytes = (uint64_t)stack_limit_bytes;
@@ -6101,6 +6156,9 @@ void sage_qjs_set_limits(SageQjs *q, int64_t mem_limit_bytes,
           JS_SetMaxStackSize(p->rt, (size_t)q->stack_limit_bytes);
         }
       }
+    }
+    if (q->repl_inited && q->repl.rt) {
+      JS_SetMaxStackSize(q->repl.rt, (size_t)q->stack_limit_bytes);
     }
   }
 }
@@ -6161,7 +6219,117 @@ int64_t sage_qjs_poll(SageQjs *q) {
     sage_qjs_plugin_poll_fetches(p);
     sage_qjs_plugin_poll_timers(p);
   }
+  if (q->repl_inited) {
+    SageQjsPlugin *p = &q->repl;
+    if (p->ctx && !p->disabled) {
+      sage_qjs_plugin_poll_procs(p);
+      sage_qjs_plugin_poll_fetches(p);
+      sage_qjs_plugin_poll_timers(p);
+    }
+  }
   return 0;
+}
+
+static int sage_qjs_repl_ensure(SageQjs *q) {
+  if (!q) {
+    return -1;
+  }
+  if (q->disabled) {
+    return -1;
+  }
+  if (!q->bootstrap_source) {
+    FILE *out = sage_qjs_log_stream(q);
+    fputs("sage[plugin] bootstrap not initialized; cannot eval\n", out);
+    fflush(out);
+    q->had_error = 1;
+    return -1;
+  }
+
+  SageQjsPlugin *p = &q->repl;
+  if (q->repl_inited && p->ctx && !p->disabled) {
+    return 0;
+  }
+
+  if (!q->repl_inited) {
+    memset(p, 0, sizeof(*p));
+    p->host = q;
+    p->path = strdup("<eval>");
+    if (!p->path) {
+      q->had_error = 1;
+      return -1;
+    }
+    q->repl_inited = 1;
+  } else {
+    // Reset any previous state (keep `path` for logging).
+    sage_qjs_plugin_close(p);
+    p->host = q;
+  }
+
+  if (sage_qjs_plugin_init_runtime(p) != 0) {
+    q->had_error = 1;
+    return -1;
+  }
+
+  if (sage_qjs_plugin_eval_bootstrap(p) != 0) {
+    q->had_error = 1;
+    return -1;
+  }
+
+  return 0;
+}
+
+int64_t sage_qjs_eval(SageQjs *q, const char *source) {
+  if (!q || !source) {
+    return 1;
+  }
+  if (q->disabled) {
+    return 1;
+  }
+  if (!*source) {
+    return 1;
+  }
+
+  if (sage_qjs_repl_ensure(q) != 0) {
+    return 1;
+  }
+
+  SageQjsPlugin *p = &q->repl;
+  if (!p->ctx || p->disabled) {
+    return 1;
+  }
+
+  JSContext *ctx = p->ctx;
+  sage_qjs_begin_budget(p, p->event_timeout_ms);
+  JSValue val = JS_Eval(ctx, source, strlen(source), "<sage-eval>",
+                        JS_EVAL_TYPE_GLOBAL);
+
+  if (p->timed_out) {
+    if (JS_IsException(val)) {
+      sage_qjs_dump_exception(p);
+    }
+    JS_FreeValue(ctx, val);
+    sage_qjs_end_budget(p);
+    sage_qjs_plugin_disable(p, "eval timed out");
+    return 1;
+  }
+
+  if (JS_IsException(val)) {
+    sage_qjs_end_budget(p);
+    sage_qjs_dump_exception(p);
+    JS_FreeValue(ctx, val);
+    return 1;
+  }
+
+  JS_FreeValue(ctx, val);
+  if (p->disabled) {
+    sage_qjs_end_budget(p);
+    return 1;
+  }
+
+  sage_qjs_drain_jobs(p);
+  sage_qjs_end_budget(p);
+
+  return p->disabled ? 1 : 0;
 }
 
 int64_t sage_qjs_eval_bootstrap(SageQjs *q, const char *source) {
@@ -6454,6 +6622,18 @@ int64_t sage_qjs_emit_open(SageQjs *q, const char *path, int64_t tab,
     JS_SetPropertyStr(ctx, payload, "tab_count", JS_NewInt64(ctx, tab_count));
     sage_qjs_plugin_emit_event(p, "open", payload);
   }
+  if (q->repl_inited) {
+    SageQjsPlugin *p = &q->repl;
+    if (p->ctx && !p->disabled) {
+      JSContext *ctx = p->ctx;
+      JSValue payload = JS_NewObject(ctx);
+      JS_SetPropertyStr(ctx, payload, "path",
+                        JS_NewString(ctx, path ? path : ""));
+      JS_SetPropertyStr(ctx, payload, "tab", JS_NewInt64(ctx, tab));
+      JS_SetPropertyStr(ctx, payload, "tab_count", JS_NewInt64(ctx, tab_count));
+      sage_qjs_plugin_emit_event(p, "open", payload);
+    }
+  }
   return 0;
 }
 
@@ -6477,6 +6657,17 @@ int64_t sage_qjs_emit_tab_change(SageQjs *q, int64_t from, int64_t to,
     JS_SetPropertyStr(ctx, payload, "to", JS_NewInt64(ctx, to));
     JS_SetPropertyStr(ctx, payload, "tab_count", JS_NewInt64(ctx, tab_count));
     sage_qjs_plugin_emit_event(p, "tab_change", payload);
+  }
+  if (q->repl_inited) {
+    SageQjsPlugin *p = &q->repl;
+    if (p->ctx && !p->disabled) {
+      JSContext *ctx = p->ctx;
+      JSValue payload = JS_NewObject(ctx);
+      JS_SetPropertyStr(ctx, payload, "from", JS_NewInt64(ctx, from));
+      JS_SetPropertyStr(ctx, payload, "to", JS_NewInt64(ctx, to));
+      JS_SetPropertyStr(ctx, payload, "tab_count", JS_NewInt64(ctx, tab_count));
+      sage_qjs_plugin_emit_event(p, "tab_change", payload);
+    }
   }
   return 0;
 }
@@ -6504,6 +6695,19 @@ int64_t sage_qjs_emit_search(SageQjs *q, const char *query, int64_t regex,
                       JS_NewBool(ctx, ignore_case != 0));
     sage_qjs_plugin_emit_event(p, "search", payload);
   }
+  if (q->repl_inited) {
+    SageQjsPlugin *p = &q->repl;
+    if (p->ctx && !p->disabled) {
+      JSContext *ctx = p->ctx;
+      JSValue payload = JS_NewObject(ctx);
+      JS_SetPropertyStr(ctx, payload, "query",
+                        JS_NewString(ctx, query ? query : ""));
+      JS_SetPropertyStr(ctx, payload, "regex", JS_NewBool(ctx, regex != 0));
+      JS_SetPropertyStr(ctx, payload, "ignore_case",
+                        JS_NewBool(ctx, ignore_case != 0));
+      sage_qjs_plugin_emit_event(p, "search", payload);
+    }
+  }
   return 0;
 }
 
@@ -6525,6 +6729,15 @@ int64_t sage_qjs_emit_copy(SageQjs *q, int64_t bytes) {
     JS_SetPropertyStr(ctx, payload, "bytes", JS_NewInt64(ctx, bytes));
     sage_qjs_plugin_emit_event(p, "copy", payload);
   }
+  if (q->repl_inited) {
+    SageQjsPlugin *p = &q->repl;
+    if (p->ctx && !p->disabled) {
+      JSContext *ctx = p->ctx;
+      JSValue payload = JS_NewObject(ctx);
+      JS_SetPropertyStr(ctx, payload, "bytes", JS_NewInt64(ctx, bytes));
+      sage_qjs_plugin_emit_event(p, "copy", payload);
+    }
+  }
   return 0;
 }
 
@@ -6544,6 +6757,12 @@ int64_t sage_qjs_emit_quit(SageQjs *q) {
     // Note: emit frees the payload when it's non-undefined; so pass undefined
     // and leave ownership untouched.
     sage_qjs_plugin_emit_event(p, "quit", JS_UNDEFINED);
+  }
+  if (q->repl_inited) {
+    SageQjsPlugin *p = &q->repl;
+    if (p->ctx && !p->disabled) {
+      sage_qjs_plugin_emit_event(p, "quit", JS_UNDEFINED);
+    }
   }
   return 0;
 }

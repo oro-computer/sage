@@ -1,0 +1,68 @@
+%YAML 1.2
+---
+# Minimal Diff/Patch syntax for `sage` (subset-friendly).
+#
+# Goals:
+# - Robust readability for git unified diffs and common `diff -u` output
+# - Clear added/removed line highlighting while staying within Sage's TOK_*
+#   theme mapping (string/preproc/heading/keyword/comment)
+name: Diff
+scope: source.diff
+version: 2
+
+file_extensions:
+  - diff
+  - patch
+  - udiff
+  - rej
+
+first_line_match: |-
+  (?xi:
+    ^ diff \b
+  | ^ Index: \s
+  | ^ @@ \s
+  | ^ \*{3} \s+ \S+ \s+ \d{4}-\d{2}-\d{2}   # context diff header w/ date
+  | ^ --- \s+ \S+ \s+ \d{4}-\d{2}-\d{2}     # unified diff header w/ date
+  )
+
+contexts:
+  main:
+    # Unified diff + git.
+    - match: '^diff\b.*$'
+      scope: markup.heading.diff
+    - match: '^index\s+.*$'
+      scope: markup.heading.diff
+    - match: '^@@.*@@.*$'
+      scope: markup.heading.diff
+    - match: '^(?:\+\+\+|---)\s+.*$'
+      scope: markup.heading.diff
+
+    # Context diff.
+    - match: '^\*{7,}.*$'
+      scope: markup.heading.diff
+    - match: '^\*{3}\s+.*$'
+      scope: markup.heading.diff
+
+    # Merge conflict markers.
+    - match: '^(?:<{7}.*|={7}.*|>{7}.*)$'
+      scope: markup.heading.diff
+
+    # Metadata lines.
+    - match: '^(?:new file mode|deleted file mode|old mode|new mode|rename from|rename to|copy from|copy to|similarity index|dissimilarity index)\b.*$'
+      scope: keyword.control.diff
+    - match: '^(?:Binary files|GIT binary patch)\b.*$'
+      scope: keyword.control.diff
+
+    # Special markers.
+    - match: '^\\ No newline at end of file.*$'
+      scope: comment.line.diff
+
+    # Added/removed lines (exclude file header markers "+++ " / "--- ").
+    - match: '^\+(?!\+\+\s).*$'
+      scope: string.line.diff
+    - match: '^-(?!--\s).*$'
+      scope: meta.preprocessor.line.diff
+
+    # Context diff "changed" lines.
+    - match: '^!.*$'
+      scope: keyword.control.diff

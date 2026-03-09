@@ -4248,24 +4248,19 @@ fn find_first_line_match (idx: &BufferU8, line_ptr: u64, line_len: i64, mut out_
 
 fn load_index_file (mut out: &BufferU8) -> bool {
   out.clear();
-  let cache_home_opt: string? = xdg_cache_home();
-  if cache_home_opt != None {
-    let cache_home: string = match (cache_home_opt) { Some(v) => v, None => "" };
-    let cache_syntax_opt: string? = join2(cache_home, "/sage/syntax/index.bin");
-    if cache_syntax_opt != None {
-      let path: string = match (cache_syntax_opt) { Some(v) => v, None => "" };
-      let ok: bool = read_file_all(path, mut out);
-      free_joined(path);
-      free_joined(cache_home);
-      if ok {
-        return true;
-      }
-    } else {
-      free_joined(cache_home);
-    }
-  }
 
-  // Fallback: bundled cache directory override.
+  // Merge user + bundled caches (user entries override bundled keys).
+  let user_opt: BufferU8? = BufferU8.init(8192);
+  if user_opt == None { return false; }
+  let mut user: BufferU8 = match (user_opt) { Some(v) => v, None => BufferU8.empty() };
+  let bundled_opt: BufferU8? = BufferU8.init(8192);
+  if bundled_opt == None { return false; }
+  let mut bundled: BufferU8 = match (bundled_opt) { Some(v) => v, None => BufferU8.empty() };
+
+  var have_user: bool = false;
+  var have_bundled: bool = false;
+
+  // Read bundled cache index (build/installed layout).
   let dir_opt: string? = env_get_string(CACHE_DIR_OVERRIDE_ENV);
   if dir_opt != None {
     let dir: string = match (dir_opt) { Some(v) => v, None => "" };
@@ -4274,38 +4269,80 @@ fn load_index_file (mut out: &BufferU8) -> bool {
       free_joined(dir);
       if path_opt != None {
         let path2: string = match (path_opt) { Some(v) => v, None => "" };
-        let ok2: bool = read_file_all(path2, mut out);
+        have_bundled = read_file_all(path2, mut bundled);
         free_joined(path2);
-        return ok2;
       }
     } else {
       free_joined(dir);
     }
   }
 
-  return false;
-}
-
-fn load_first_line_file (mut out: &BufferU8) -> bool {
-  out.clear();
+  // Read user cache index (from `--compile-cache`).
   let cache_home_opt: string? = xdg_cache_home();
   if cache_home_opt != None {
     let cache_home: string = match (cache_home_opt) { Some(v) => v, None => "" };
-    let cache_syntax_opt: string? = join2(cache_home, "/sage/syntax/first_line.bin");
+    let cache_syntax_opt: string? = join2(cache_home, "/sage/syntax/index.bin");
     if cache_syntax_opt != None {
       let path: string = match (cache_syntax_opt) { Some(v) => v, None => "" };
-      let ok: bool = read_file_all(path, mut out);
+      have_user = read_file_all(path, mut user);
       free_joined(path);
       free_joined(cache_home);
-      if ok {
-        return true;
-      }
     } else {
       free_joined(cache_home);
     }
   }
 
-  // Fallback: bundled cache directory override.
+  let ub = user.as_bytes();
+  let bb = bundled.as_bytes();
+  let user_ok: bool = have_user && ub.ptr != 0 && ub.len >= 16 && u64_at(ub.ptr, 0) == MAGIC_INDEX && u32_at(ub.ptr, 8) == SYNTAX_VERSION;
+  let bundled_ok: bool = have_bundled && bb.ptr != 0 && bb.len >= 16 && u64_at(bb.ptr, 0) == MAGIC_INDEX && u32_at(bb.ptr, 8) == SYNTAX_VERSION;
+
+  if bundled_ok && !user_ok {
+    return out.push_ptr_len(bb.ptr, bb.len) == None;
+  }
+  if user_ok && !bundled_ok {
+    return out.push_ptr_len(ub.ptr, ub.len) == None;
+  }
+  if !user_ok && !bundled_ok {
+    return false;
+  }
+
+  let bundled_count: u32 = u32_at(bb.ptr, 12);
+  let user_count: u32 = u32_at(ub.ptr, 12);
+  let merged_count: u32 = bundled_count + user_count;
+
+  buf_push_u64_le(mut out, MAGIC_INDEX);
+  buf_push_u32_le(mut out, SYNTAX_VERSION);
+  buf_push_u32_le(mut out, merged_count);
+
+  // Entries are `[k_len][k_bytes][f_len][f_bytes]`.
+  // For key lookups, `find_in_index` returns the *last* match, so append
+  // user entries after bundled entries to let user overrides win.
+  if (bb.len - 16) > 0 {
+    if out.push_ptr_len(bb.ptr + 16, bb.len - 16) != None { return false; }
+  }
+  if (ub.len - 16) > 0 {
+    if out.push_ptr_len(ub.ptr + 16, ub.len - 16) != None { return false; }
+  }
+
+  return true;
+}
+
+fn load_first_line_file (mut out: &BufferU8) -> bool {
+  out.clear();
+
+  // Merge user + bundled first-line patterns (user patterns checked first).
+  let user_opt: BufferU8? = BufferU8.init(8192);
+  if user_opt == None { return false; }
+  let mut user: BufferU8 = match (user_opt) { Some(v) => v, None => BufferU8.empty() };
+  let bundled_opt: BufferU8? = BufferU8.init(8192);
+  if bundled_opt == None { return false; }
+  let mut bundled: BufferU8 = match (bundled_opt) { Some(v) => v, None => BufferU8.empty() };
+
+  var have_user: bool = false;
+  var have_bundled: bool = false;
+
+  // Read bundled patterns (build/installed layout).
   let dir_opt: string? = env_get_string(CACHE_DIR_OVERRIDE_ENV);
   if dir_opt != None {
     let dir: string = match (dir_opt) { Some(v) => v, None => "" };
@@ -4314,16 +4351,62 @@ fn load_first_line_file (mut out: &BufferU8) -> bool {
       free_joined(dir);
       if path_opt != None {
         let path2: string = match (path_opt) { Some(v) => v, None => "" };
-        let ok2: bool = read_file_all(path2, mut out);
+        have_bundled = read_file_all(path2, mut bundled);
         free_joined(path2);
-        return ok2;
       }
     } else {
       free_joined(dir);
     }
   }
 
-  return false;
+  // Read user patterns (from `--compile-cache`).
+  let cache_home_opt: string? = xdg_cache_home();
+  if cache_home_opt != None {
+    let cache_home: string = match (cache_home_opt) { Some(v) => v, None => "" };
+    let cache_syntax_opt: string? = join2(cache_home, "/sage/syntax/first_line.bin");
+    if cache_syntax_opt != None {
+      let path: string = match (cache_syntax_opt) { Some(v) => v, None => "" };
+      have_user = read_file_all(path, mut user);
+      free_joined(path);
+      free_joined(cache_home);
+    } else {
+      free_joined(cache_home);
+    }
+  }
+
+  let ub = user.as_bytes();
+  let bb = bundled.as_bytes();
+  let user_ok: bool = have_user && ub.ptr != 0 && ub.len >= 16 && u64_at(ub.ptr, 0) == MAGIC_INDEX && u32_at(ub.ptr, 8) == SYNTAX_VERSION;
+  let bundled_ok: bool = have_bundled && bb.ptr != 0 && bb.len >= 16 && u64_at(bb.ptr, 0) == MAGIC_INDEX && u32_at(bb.ptr, 8) == SYNTAX_VERSION;
+
+  if bundled_ok && !user_ok {
+    return out.push_ptr_len(bb.ptr, bb.len) == None;
+  }
+  if user_ok && !bundled_ok {
+    return out.push_ptr_len(ub.ptr, ub.len) == None;
+  }
+  if !user_ok && !bundled_ok {
+    return false;
+  }
+
+  let user_count: u32 = u32_at(ub.ptr, 12);
+  let bundled_count: u32 = u32_at(bb.ptr, 12);
+  let merged_count: u32 = user_count + bundled_count;
+
+  buf_push_u64_le(mut out, MAGIC_INDEX);
+  buf_push_u32_le(mut out, SYNTAX_VERSION);
+  buf_push_u32_le(mut out, merged_count);
+
+  // `find_first_line_match` returns the *first* matching pattern, so put user
+  // patterns first to let them override bundled ones.
+  if (ub.len - 16) > 0 {
+    if out.push_ptr_len(ub.ptr + 16, ub.len - 16) != None { return false; }
+  }
+  if (bb.len - 16) > 0 {
+    if out.push_ptr_len(bb.ptr + 16, bb.len - 16) != None { return false; }
+  }
+
+  return true;
 }
 
 fn load_syntax_file (file_name: string, mut out: &BufferU8) -> bool {

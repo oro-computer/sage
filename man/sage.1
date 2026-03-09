@@ -60,7 +60,7 @@ Disable UI colors (same as \fB\-\-color never\fR).
 UI theme: \fBdefault\fR, \fBocean\fR, \fBlight\fR.
 .TP
 .B \-\-syntax
-Enable syntax highlighting for file paths (default: on). Syntax highlighting is not applied to stdin (\fIPATH\fR \fB\-\fR).
+Enable syntax highlighting for file paths (default: on). Syntax highlighting is not applied to stdin (\fIPATH\fR \fB\-\fR) unless overridden with \fB:set syntax=\fR.
 .TP
 .B \-\-no\-syntax
 Disable syntax highlighting.
@@ -200,6 +200,12 @@ Jump to tab \fIN\fR (1\-indexed; \fB0\fR selects the last tab).
 .TP
 .B :t\fIN\fR
 Alias for \fB:tab\fR \fIN\fR. Also accepts \fB:t\fR \fIN\fR.
+.TP
+.B :set syntax=\fIKEY\fR
+Override syntax highlighting for the current tab. Use \fB:set syntax=\fR or \fB:set syntax=auto\fR to clear.
+.TP
+.B :eval \fIJAVASCRIPT\fR
+Evaluate JavaScript in Sage's embedded runtime. Multiple statements are allowed (separate with \fB;\fR).
 .SH SELECTION
 With mouse support enabled:
 .IP \(bu 2
@@ -211,7 +217,7 @@ Left\-drag selects text in the content area (the gutter is excluded from selecti
 .PP
 Many terminals and muxers use \fBShift\fR to bypass application mouse reporting for terminal\-native selection; use that if you prefer your terminal's selection behavior.
 .SH SYNTAX HIGHLIGHTING
-Syntax highlighting is optional and applies only when \fBsage\fR is given a file path.
+Syntax highlighting is optional and applies when \fBsage\fR is given a file path. Stdin (\fIPATH\fR \fB\-\fR) can be highlighted by setting a per\-tab override with \fB:set syntax=\fR.
 .PP
 Sources live under:
 .IP

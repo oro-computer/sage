@@ -103,6 +103,7 @@ struct TabState {
   path: string,
   top_off: i64,
   gutter_on: bool,
+  syntax_override: string?,
 }
 
 struct Theme {
@@ -425,6 +426,7 @@ let ALERT_COPIED: int = 11;
 let ALERT_COPY_TOO_BIG: int = 12;
 let ALERT_COPY_FAILED: int = 13;
 let ALERT_PLUGIN_ERROR: int = 14;
+let ALERT_BAD_SYNTAX: int = 15;
 
 let COPY_MAX_BYTES: i64 = 200000;
 let SYN_STATE_LOOKBACK_BYTES: i64 = 65536;
@@ -918,7 +920,7 @@ fn tabs_push_owned (mut tabs: &Tabs, path_owned: string) -> bool {
   if !tabs_ensure_cap(mut tabs, 1) {
     return false;
   }
-  (tabs.ptr as TabState[](tabs.cap as int))[tabs.len] = TabState{ path: path_owned, top_off: 0, gutter_on: false };
+  (tabs.ptr as TabState[](tabs.cap as int))[tabs.len] = TabState{ path: path_owned, top_off: 0, gutter_on: false, syntax_override: None };
   tabs.len = tabs.len + 1;
   return true;
 }
@@ -1123,6 +1125,10 @@ fn tabs_free (mut tabs: &Tabs) -> void {
       let p: u64 = std::runtime::mem::string_ptr(t.path);
       if p != 0 {
         std::runtime::mem::free(p);
+      }
+      if t.syntax_override != None {
+        let s: string = match (t.syntax_override) { Some(v) => v, None => "" };
+        free_joined(s);
       }
       i = i + 1;
     }
@@ -3699,6 +3705,7 @@ fn status_alert_len (alert: int) -> int {
   if alert == ALERT_COPY_TOO_BIG { return 12; } // "copy too big"
   if alert == ALERT_COPY_FAILED { return 11; }  // "copy failed"
   if alert == ALERT_PLUGIN_ERROR { return 10; } // "plugin err"
+  if alert == ALERT_BAD_SYNTAX { return 10; }   // "bad syntax"
   return 5;                    // "error"
 }
 
@@ -3950,6 +3957,8 @@ show_pct: bool
       let _ = w.push_str("copy failed");
     } else if alert == ALERT_PLUGIN_ERROR {
       let _ = w.push_str("plugin err");
+    } else if alert == ALERT_BAD_SYNTAX {
+      let _ = w.push_str("bad syntax");
     } else {
       let _ = w.push_str("error");
     }
@@ -7202,6 +7211,7 @@ export async fn main (argc: int, argv: u64) -> int {
     var active_tab: i64 = 0;
     var path: string = (tabs.ptr as TabState[](tabs.cap as int))[0].path;
     var gutter_on: bool = (tabs.ptr as TabState[](tabs.cap as int))[0].gutter_on;
+    var syntax_override: string? = (tabs.ptr as TabState[](tabs.cap as int))[0].syntax_override;
     var syntax_hint: string = "";
 
     if v_on {
@@ -7228,9 +7238,13 @@ export async fn main (argc: int, argv: u64) -> int {
     // If gutter is set to auto, now that we have file contents we can also
     // respect first-line syntax matches (shebangs, %YAML, etc).
     if cfg.gutter == GUTTER_AUTO && path != "-" {
-      let syn_path_g: string = path_for_syntax(path);
-      let fl_g: ByteSlice = first_line_slice(file.ptr, file.len);
-      gutter_on = has_syntax_for_path_or_first_line(syn_path_g, fl_g.ptr, fl_g.len);
+      if syntax_override != None {
+        gutter_on = true;
+      } else {
+        let syn_path_g: string = path_for_syntax(path);
+        let fl_g: ByteSlice = first_line_slice(file.ptr, file.len);
+        gutter_on = has_syntax_for_path_or_first_line(syn_path_g, fl_g.ptr, fl_g.len);
+      }
       let mut t0: TabState = (tabs.ptr as TabState[](tabs.cap as int))[active_tab];
       t0.gutter_on = gutter_on;
       (tabs.ptr as TabState[](tabs.cap as int))[active_tab] = t0;
@@ -7328,13 +7342,18 @@ export async fn main (argc: int, argv: u64) -> int {
     // Syntax highlighting (optional, file-based).
     var syn_active: bool = false;
     let mut syn: Highlighter = highlighter_empty();
-    if cfg.syntax && use_color && !cfg.unsafe_raw && path != "-" {
+    let has_override: bool = syntax_override != None;
+    if (cfg.syntax || has_override) && use_color && !cfg.unsafe_raw && (path != "-" || has_override) {
       let syn_path: string = path_for_syntax(path);
       let fl: ByteSlice = first_line_slice(file.ptr, file.len);
       let mapped_syntax: string = syntax_map_lookup(&cfg.syntax_map, syn_path);
 
       let mut syn_opt: Highlighter? = None;
-      if mapped_syntax != "" {
+      if has_override {
+        let key: string = match (syntax_override) { Some(v) => v, None => "" };
+        syn_opt = load_for_key(key);
+      }
+      if syn_opt == None && mapped_syntax != "" {
         syn_opt = load_for_key(mapped_syntax);
       }
       if syn_opt == None {
@@ -8546,6 +8565,7 @@ export async fn main (argc: int, argv: u64) -> int {
           let mut cur_state: TabState = (tabs.ptr as TabState[](tabs.cap as int))[active_tab];
           cur_state.top_off = top_off;
           cur_state.gutter_on = gutter_on;
+          cur_state.syntax_override = syntax_override;
           (tabs.ptr as TabState[](tabs.cap as int))[active_tab] = cur_state;
 
           // Stop the current indexer before unmapping the file.
@@ -8562,6 +8582,7 @@ export async fn main (argc: int, argv: u64) -> int {
           gutter_on = new_state.gutter_on;
           top_off = new_state.top_off;
           syntax_hint = new_syntax_hint;
+          syntax_override = new_state.syntax_override;
 
           // Replace file mapping.
           file = move file2;
@@ -8569,9 +8590,13 @@ export async fn main (argc: int, argv: u64) -> int {
 
           // Refresh gutter auto state now that we have the new file mapped.
           if cfg.gutter == GUTTER_AUTO && path != "-" {
-            let syn_path_g2: string = path_for_syntax(path);
-            let fl_g2: ByteSlice = first_line_slice(file.ptr, file.len);
-            gutter_on = has_syntax_for_path_or_first_line(syn_path_g2, fl_g2.ptr, fl_g2.len);
+            if syntax_override != None {
+              gutter_on = true;
+            } else {
+              let syn_path_g2: string = path_for_syntax(path);
+              let fl_g2: ByteSlice = first_line_slice(file.ptr, file.len);
+              gutter_on = has_syntax_for_path_or_first_line(syn_path_g2, fl_g2.ptr, fl_g2.len);
+            }
             let mut t2: TabState = (tabs.ptr as TabState[](tabs.cap as int))[active_tab];
             t2.gutter_on = gutter_on;
             (tabs.ptr as TabState[](tabs.cap as int))[active_tab] = t2;
@@ -8609,13 +8634,18 @@ export async fn main (argc: int, argv: u64) -> int {
           allow_ansi = cfg.ansi;
           syn_active = false;
           syn = highlighter_empty();
-          if cfg.syntax && use_color && !cfg.unsafe_raw && path != "-" {
+          let has_override2: bool = syntax_override != None;
+          if (cfg.syntax || has_override2) && use_color && !cfg.unsafe_raw && (path != "-" || has_override2) {
             let syn_path: string = path_for_syntax(path);
             let fl: ByteSlice = first_line_slice(file.ptr, file.len);
             let mapped_syntax: string = syntax_map_lookup(&cfg.syntax_map, syn_path);
 
             let mut syn_opt2: Highlighter? = None;
-            if mapped_syntax != "" {
+            if has_override2 {
+              let key2: string = match (syntax_override) { Some(v) => v, None => "" };
+              syn_opt2 = load_for_key(key2);
+            }
+            if syn_opt2 == None && mapped_syntax != "" {
               syn_opt2 = load_for_key(mapped_syntax);
             }
             if syn_opt2 == None {
@@ -8878,6 +8908,7 @@ export async fn main (argc: int, argv: u64) -> int {
                 let mut cur_state2: TabState = (tabs.ptr as TabState[](tabs.cap as int))[active_tab];
                 cur_state2.top_off = top_off;
                 cur_state2.gutter_on = gutter_on;
+                cur_state2.syntax_override = syntax_override;
                 (tabs.ptr as TabState[](tabs.cap as int))[active_tab] = cur_state2;
 
                 // Stop the current indexer before unmapping the file.
@@ -8894,6 +8925,7 @@ export async fn main (argc: int, argv: u64) -> int {
                 gutter_on = new_state2.gutter_on;
                 top_off = new_state2.top_off;
                 syntax_hint = new_syntax_hint2;
+                syntax_override = new_state2.syntax_override;
 
                 // Replace file mapping.
                 file = move file3;
@@ -8901,9 +8933,13 @@ export async fn main (argc: int, argv: u64) -> int {
 
                 // Refresh gutter auto state now that we have the new file mapped.
                 if cfg.gutter == GUTTER_AUTO && path != "-" {
-                  let syn_path_g3: string = path_for_syntax(path);
-                  let fl_g3: ByteSlice = first_line_slice(file.ptr, file.len);
-                  gutter_on = has_syntax_for_path_or_first_line(syn_path_g3, fl_g3.ptr, fl_g3.len);
+                  if syntax_override != None {
+                    gutter_on = true;
+                  } else {
+                    let syn_path_g3: string = path_for_syntax(path);
+                    let fl_g3: ByteSlice = first_line_slice(file.ptr, file.len);
+                    gutter_on = has_syntax_for_path_or_first_line(syn_path_g3, fl_g3.ptr, fl_g3.len);
+                  }
                   let mut t3: TabState = (tabs.ptr as TabState[](tabs.cap as int))[active_tab];
                   t3.gutter_on = gutter_on;
                   (tabs.ptr as TabState[](tabs.cap as int))[active_tab] = t3;
@@ -8941,13 +8977,18 @@ export async fn main (argc: int, argv: u64) -> int {
                 allow_ansi = cfg.ansi;
                 syn_active = false;
                 syn = highlighter_empty();
-                if cfg.syntax && use_color && !cfg.unsafe_raw && path != "-" {
+                let has_override2: bool = syntax_override != None;
+                if (cfg.syntax || has_override2) && use_color && !cfg.unsafe_raw && (path != "-" || has_override2) {
                   let syn_path: string = path_for_syntax(path);
                   let fl: ByteSlice = first_line_slice(file.ptr, file.len);
                   let mapped_syntax: string = syntax_map_lookup(&cfg.syntax_map, syn_path);
 
                   let mut syn_opt2: Highlighter? = None;
-                  if mapped_syntax != "" {
+                  if has_override2 {
+                    let key2: string = match (syntax_override) { Some(v) => v, None => "" };
+                    syn_opt2 = load_for_key(key2);
+                  }
+                  if syn_opt2 == None && mapped_syntax != "" {
                     syn_opt2 = load_for_key(mapped_syntax);
                   }
                   if syn_opt2 == None {
@@ -8978,6 +9019,198 @@ export async fn main (argc: int, argv: u64) -> int {
               }
 
               // A tab command that didn't switch (range error, single tab, or same tab).
+              need_redraw = true;
+              continue;
+            }
+
+            // Settings (very small subset): `:set syntax=<key>`
+            if eq_nocase(c_ptr, head_len, "set") {
+              if arg_ptr == 0 || arg_len <= 0 {
+                alert = 6;
+                need_redraw = true;
+                continue;
+              }
+
+              // Trim arg whitespace.
+              var s1: i64 = 0;
+              var e1: i64 = arg_len;
+              while s1 < e1 && is_ascii_ws(std::runtime::mem::load_u8(arg_ptr, s1)) { s1 = s1 + 1; }
+              while e1 > s1 && is_ascii_ws(std::runtime::mem::load_u8(arg_ptr, e1 - 1)) { e1 = e1 - 1; }
+              let a_ptr2: u64 = arg_ptr + (s1 as u64);
+              let a_len2: i64 = e1 - s1;
+              if a_len2 <= 0 {
+                alert = 6;
+                need_redraw = true;
+                continue;
+              }
+
+              // Parse name up to whitespace or '='.
+              var name_end: i64 = 0;
+              while name_end < a_len2 {
+                let ch: u8 = std::runtime::mem::load_u8(a_ptr2, name_end);
+                if is_ascii_ws(ch) || ch == 61 { // '='
+                  break;
+                }
+                name_end = name_end + 1;
+              }
+              if name_end <= 0 || !eq_nocase(a_ptr2, name_end, "syntax") {
+                alert = 6;
+                need_redraw = true;
+                continue;
+              }
+
+              // Skip whitespace before '='.
+              var i2: i64 = name_end;
+              while i2 < a_len2 && is_ascii_ws(std::runtime::mem::load_u8(a_ptr2, i2)) { i2 = i2 + 1; }
+              if i2 >= a_len2 || std::runtime::mem::load_u8(a_ptr2, i2) != 61 { // '='
+                alert = 6;
+                need_redraw = true;
+                continue;
+              }
+              i2 = i2 + 1;
+              while i2 < a_len2 && is_ascii_ws(std::runtime::mem::load_u8(a_ptr2, i2)) { i2 = i2 + 1; }
+
+              // Trim trailing whitespace for value.
+              var v_end: i64 = a_len2;
+              while v_end > i2 && is_ascii_ws(std::runtime::mem::load_u8(a_ptr2, v_end - 1)) { v_end = v_end - 1; }
+              let v_ptr: u64 = a_ptr2 + (i2 as u64);
+              let v_len: i64 = v_end - i2;
+
+              // Clear override: `:set syntax=` or `:set syntax=auto`.
+              let want_clear: bool = (v_len <= 0) || eq_nocase(v_ptr, v_len, "auto");
+              if want_clear {
+                let mut tset0: TabState = (tabs.ptr as TabState[](tabs.cap as int))[active_tab];
+                if tset0.syntax_override != None {
+                  let prev0: string = match (tset0.syntax_override) { Some(v) => v, None => "" };
+                  free_joined(prev0);
+                  tset0.syntax_override = None;
+                }
+                (tabs.ptr as TabState[](tabs.cap as int))[active_tab] = tset0;
+                syntax_override = tset0.syntax_override;
+              } else {
+                // Validate syntax key exists.
+                let key_view: string = std::runtime::mem::string_from_ptr_len(v_ptr, v_len as int);
+                let chk: Highlighter? = load_for_key(key_view);
+                if chk == None {
+                  alert = ALERT_BAD_SYNTAX;
+                  need_redraw = true;
+                  continue;
+                }
+
+                let own_opt: string? = cstr_copy_owned(key_view);
+                if own_opt == None {
+                  alert = 6;
+                  need_redraw = true;
+                  continue;
+                }
+                let own: string = match (own_opt) { Some(v) => v, None => "" };
+
+                let mut tset1: TabState = (tabs.ptr as TabState[](tabs.cap as int))[active_tab];
+                if tset1.syntax_override != None {
+                  let prev1: string = match (tset1.syntax_override) { Some(v) => v, None => "" };
+                  free_joined(prev1);
+                }
+                tset1.syntax_override = Some(own);
+                (tabs.ptr as TabState[](tabs.cap as int))[active_tab] = tset1;
+                syntax_override = tset1.syntax_override;
+              }
+
+              // In gutter-auto mode, treat an explicit syntax override as "syntax is known".
+              if cfg.gutter == GUTTER_AUTO && path != "-" {
+                if syntax_override != None {
+                  gutter_on = true;
+                } else {
+                  let syn_path_g4: string = path_for_syntax(path);
+                  let fl_g4: ByteSlice = first_line_slice(file.ptr, file.len);
+                  gutter_on = has_syntax_for_path_or_first_line(syn_path_g4, fl_g4.ptr, fl_g4.len);
+                }
+                let mut tg: TabState = (tabs.ptr as TabState[](tabs.cap as int))[active_tab];
+                tg.gutter_on = gutter_on;
+                (tabs.ptr as TabState[](tabs.cap as int))[active_tab] = tg;
+              }
+
+              // Reload syntax/highlighting for the active tab.
+              allow_ansi = cfg.ansi;
+              syn_active = false;
+              syn = highlighter_empty();
+              let has_override3: bool = syntax_override != None;
+              if (cfg.syntax || has_override3) && use_color && !cfg.unsafe_raw && (path != "-" || has_override3) {
+                let syn_path: string = path_for_syntax(path);
+                let fl: ByteSlice = first_line_slice(file.ptr, file.len);
+                let mapped_syntax: string = syntax_map_lookup(&cfg.syntax_map, syn_path);
+
+                let mut syn_opt3: Highlighter? = None;
+                if has_override3 {
+                  let key3: string = match (syntax_override) { Some(v) => v, None => "" };
+                  syn_opt3 = load_for_key(key3);
+                }
+                if syn_opt3 == None && mapped_syntax != "" {
+                  syn_opt3 = load_for_key(mapped_syntax);
+                }
+                if syn_opt3 == None {
+                  syn_opt3 = load_for_path_or_first_line(syn_path, fl.ptr, fl.len);
+                }
+                if syn_opt3 == None && syntax_hint != "" {
+                  syn_opt3 = load_for_key(syntax_hint);
+                }
+                if syn_opt3 != None {
+                  syn = match (syn_opt3) { Some(v) => v, None => syn };
+                  syn_active = true;
+                  allow_ansi = false;
+                }
+              }
+
+              // Reset syntax state to the active file's `top_off`.
+              syn_state_top = hl_state_init();
+              syn_state_off = 0;
+              if syn_active && file.ptr != 0 && file.len > 0 {
+                var start3: i64 = top_off - SYN_STATE_LOOKBACK_BYTES;
+                if start3 < 0 { start3 = 0; }
+                if start3 < top_off {
+                  hl_state_advance(&syn, mut syn_state_top, file.ptr + (start3 as u64), top_off - start3);
+                }
+                syn_state_off = top_off;
+              } else {
+                syn_state_off = top_off;
+              }
+
+              alert = 0;
+              need_redraw = true;
+              continue;
+            }
+
+            // Evaluate arbitrary JavaScript in the plugin runtime: `:eval <js...>`
+            if eq_nocase(c_ptr, head_len, "eval") {
+              if !plugins::enabled(&plug) {
+                alert = 6;
+                need_redraw = true;
+                continue;
+              }
+              if arg_ptr == 0 || arg_len <= 0 {
+                alert = 6;
+                need_redraw = true;
+                continue;
+              }
+
+              // Trim whitespace around the JS source.
+              var s2: i64 = 0;
+              var e2: i64 = arg_len;
+              while s2 < e2 && is_ascii_ws(std::runtime::mem::load_u8(arg_ptr, s2)) { s2 = s2 + 1; }
+              while e2 > s2 && is_ascii_ws(std::runtime::mem::load_u8(arg_ptr, e2 - 1)) { e2 = e2 - 1; }
+              let js_ptr: u64 = arg_ptr + (s2 as u64);
+              let js_len: i64 = e2 - s2;
+              if js_len <= 0 {
+                alert = 6;
+                need_redraw = true;
+                continue;
+              }
+
+              let js: string = std::runtime::mem::string_from_ptr_len(js_ptr, js_len as int);
+              if plugins::eval(&plug, js) {
+                alert = ALERT_PLUGIN_ERROR;
+              } else {
+                alert = 0;
+              }
               need_redraw = true;
               continue;
             }

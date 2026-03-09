@@ -7,6 +7,7 @@ import std::http;
 import std::https;
 import std::limits;
 import std::net;
+import std::process;
 import std::ssh2;
 import std::runtime::fs;
 import std::runtime::mem;
@@ -990,20 +991,27 @@ fn parse_ssh_url (input: string) -> ParsedSshUrl? {
     Some(v) => v,
     None => "",
   };
-  let hp: u64 = std::runtime::mem::string_ptr(host_s);
-  let hn: i64 = std::runtime::mem::string_len(host_s);
+  let mut hp: u64 = std::runtime::mem::string_ptr(host_s);
+  let mut hn: i64 = std::runtime::mem::string_len(host_s);
   if hp == 0 || hn <= 0 {
     url.drop();
     return None;
   }
 
-  // Reject IPv6 bracket form for now (Sage currently connects only via `SocketAddrV4`).
-  if std::runtime::mem::load_u8(hp, 0) == 91 { // '['
-    url.drop();
-    return None;
+  // Normalize IPv6 bracket form: `ssh://[::1]/path` => host "::1".
+  if hn > 2 &&
+  std::runtime::mem::load_u8(hp, 0) == 91 && // '['
+  std::runtime::mem::load_u8(hp, hn - 1) == 93 { // ']'
+    hp = hp + 1;
+    hn = hn - 2;
+    if hn <= 0 {
+      url.drop();
+      return None;
+    }
   }
 
-  let host_r: std::strings::StringResult = std::strings::String.from_string(host_s);
+  let host_view: string = std::runtime::mem::string_from_ptr_len(hp, hn as int);
+  let host_r: std::strings::StringResult = std::strings::String.from_string(host_view);
   if host_r.is_err() {
     url.drop();
     return None;
@@ -1440,9 +1448,224 @@ fn map_ssh_url (input: string, allow_binary: bool) -> MappedInput? {
   return Some(MappedInput{ file: move mapped, syntax_hint: "" });
 }
 
+fn ssh_shell_single_quote (s: string) -> std::strings::String? {
+  // Wrap `s` in single quotes suitable for a remote POSIX shell, escaping any
+  // embedded single quotes as: `'` => `'\''`.
+  let p: u64 = std::runtime::mem::string_ptr(s);
+  let n: i64 = std::runtime::mem::string_len(s);
+  if p == 0 || n < 0 {
+    return None;
+  }
+  let mut out: std::strings::String = std::strings::String.empty();
+  if out.push_u8(39) != None { out.drop(); return None; } // "'"
+  var i: i64 = 0;
+  while i < n {
+    let b: u8 = std::runtime::mem::load_u8(p, i);
+    if b == 39 { // "'"
+      if out.push_string("'\\''") != None { out.drop(); return None; }
+    } else {
+      if out.push_u8(b) != None { out.drop(); return None; }
+    }
+    i = i + 1;
+  }
+  if out.push_u8(39) != None { out.drop(); return None; } // "'"
+  return Some(out);
+}
+
+fn map_ssh_url_via_ssh_cmd (input: string, allow_binary: bool) -> MappedInput? {
+  let parts_opt: ParsedSshUrl? = parse_ssh_url(input);
+  if parts_opt == None {
+    return None;
+  }
+  let mut parts: ParsedSshUrl = parts_opt ?? ParsedSshUrl{
+    host: std::strings::String.empty(),
+    port: 0,
+    username: std::strings::String.empty(),
+    password: std::strings::String.empty(),
+    remote_path: std::strings::String.empty(),
+  };
+
+  // Password-in-URL is supported in the native libssh2 path, but the `ssh(1)`
+  // fallback is key/agent based (and should never put passwords on argv).
+  if parts.password.len > 0 {
+    parsed_ssh_url_drop(mut parts);
+    return None;
+  }
+
+  let host_s: string = parts.host.as_string();
+  if host_s == "" || parts.port <= 0 {
+    parsed_ssh_url_drop(mut parts);
+    return None;
+  }
+
+  // Destination: `user@host` (wrap IPv6 literals for OpenSSH: `user@[::1]`).
+  let mut dest: std::strings::String = std::strings::String.empty();
+  let user_s: string = parts.username.as_string();
+  if user_s != "" {
+    if dest.push_string(user_s) != None { dest.drop(); parsed_ssh_url_drop(mut parts); return None; }
+    if dest.push_u8(64) != None { dest.drop(); parsed_ssh_url_drop(mut parts); return None; } // '@'
+  }
+  let host_ptr: u64 = std::runtime::mem::string_ptr(host_s);
+  let host_len: i64 = std::runtime::mem::string_len(host_s);
+  let is_ipv6: bool = host_ptr != 0 && host_len > 0 && memchr(host_ptr, 58, host_len) != 0; // ':'
+  if is_ipv6 {
+    if dest.push_u8(91) != None { dest.drop(); parsed_ssh_url_drop(mut parts); return None; } // '['
+  }
+  if dest.push_string(host_s) != None { dest.drop(); parsed_ssh_url_drop(mut parts); return None; }
+  if is_ipv6 {
+    if dest.push_u8(93) != None { dest.drop(); parsed_ssh_url_drop(mut parts); return None; } // ']'
+  }
+
+  let rp: string = parts.remote_path.as_string();
+  if rp == "" || rp == "/" {
+    dest.drop();
+    parsed_ssh_url_drop(mut parts);
+    return None;
+  }
+  let quoted_opt: std::strings::String? = ssh_shell_single_quote(rp);
+  if quoted_opt == None {
+    dest.drop();
+    parsed_ssh_url_drop(mut parts);
+    return None;
+  }
+  let mut quoted: std::strings::String = quoted_opt ?? std::strings::String.empty();
+
+  // Remote command string: `cat -- '<path>'`.
+  let mut cmd_s: std::strings::String = std::strings::String.empty();
+  if cmd_s.push_string("cat -- ") != None { cmd_s.drop(); quoted.drop(); dest.drop(); parsed_ssh_url_drop(mut parts); return None; }
+  if cmd_s.push_string(quoted.as_string()) != None { cmd_s.drop(); quoted.drop(); dest.drop(); parsed_ssh_url_drop(mut parts); return None; }
+  quoted.drop();
+
+  let mut port_s: std::strings::String = std::strings::String.empty();
+  if !push_decimal_port(mut port_s, parts.port) { port_s.drop(); cmd_s.drop(); dest.drop(); parsed_ssh_url_drop(mut parts); return None; }
+
+  let insecure: bool = std::env::get("SAGE_SSH_INSECURE") != None;
+  var has_kh_opt: bool = false;
+  let mut kh_opt: std::strings::String = std::strings::String.empty();
+  if !insecure {
+    let kh_path_opt: std::strings::String? = ssh_known_hosts_path();
+    if kh_path_opt != None {
+      let mut kh_path: std::strings::String = kh_path_opt ?? std::strings::String.empty();
+      if kh_opt.push_string("UserKnownHostsFile=") != None { kh_opt.drop(); kh_path.drop(); port_s.drop(); cmd_s.drop(); dest.drop(); parsed_ssh_url_drop(mut parts); return None; }
+      if kh_opt.push_string(kh_path.as_string()) != None { kh_opt.drop(); kh_path.drop(); port_s.drop(); cmd_s.drop(); dest.drop(); parsed_ssh_url_drop(mut parts); return None; }
+      kh_path.drop();
+      has_kh_opt = true;
+    }
+  }
+
+  // Identity file hints (keep paths alive until after `cmd.output()` since
+  // `std::process::Command` stores string pointers, not copies).
+  var id_paths: std::strings::String[4] = [
+  std::strings::String.empty(),
+  std::strings::String.empty(),
+  std::strings::String.empty(),
+  std::strings::String.empty(),
+  ];
+  var id_len: i64 = 0;
+  let home_opt: string? = std::env::home_dir();
+  if home_opt != None {
+    let home: string = match (home_opt) { Some(v) => v, None => "" };
+    if home != "" {
+      var keys: string[4] = ["id_ed25519", "id_rsa", "id_ecdsa", "id_dsa"];
+      var i2: i64 = 0;
+      while i2 < 4 {
+        if id_len >= 4 { break; }
+        let name: string = keys[i2 as int];
+        let mut priv_path: std::strings::String = std::strings::String.empty();
+        if priv_path.push_string(home) != None { priv_path.drop(); break; }
+        if priv_path.push_string("/.ssh/") != None { priv_path.drop(); break; }
+        if priv_path.push_string(name) != None { priv_path.drop(); break; }
+        if path_exists(priv_path.as_string()) {
+          id_paths[id_len as int] = move priv_path;
+          id_len = id_len + 1;
+        } else {
+          priv_path.drop();
+        }
+        i2 = i2 + 1;
+      }
+    }
+  }
+
+  let mut cmd: std::process::Command = std::process::Command.init("ssh");
+  cmd.stdin(std::process::Stdio::Null);
+
+  if cmd.arg("-q") != None { port_s.drop(); cmd_s.drop(); dest.drop(); if has_kh_opt { kh_opt.drop(); } parsed_ssh_url_drop(mut parts); return None; }
+  if cmd.arg("-T") != None { port_s.drop(); cmd_s.drop(); dest.drop(); if has_kh_opt { kh_opt.drop(); } parsed_ssh_url_drop(mut parts); return None; }
+  if cmd.arg("-p") != None { port_s.drop(); cmd_s.drop(); dest.drop(); if has_kh_opt { kh_opt.drop(); } parsed_ssh_url_drop(mut parts); return None; }
+  if cmd.arg(port_s.as_string()) != None { port_s.drop(); cmd_s.drop(); dest.drop(); if has_kh_opt { kh_opt.drop(); } parsed_ssh_url_drop(mut parts); return None; }
+
+  if cmd.arg("-o") != None { port_s.drop(); cmd_s.drop(); dest.drop(); if has_kh_opt { kh_opt.drop(); } parsed_ssh_url_drop(mut parts); return None; }
+  if cmd.arg("BatchMode=yes") != None { port_s.drop(); cmd_s.drop(); dest.drop(); if has_kh_opt { kh_opt.drop(); } parsed_ssh_url_drop(mut parts); return None; }
+  if cmd.arg("-o") != None { port_s.drop(); cmd_s.drop(); dest.drop(); if has_kh_opt { kh_opt.drop(); } parsed_ssh_url_drop(mut parts); return None; }
+  if cmd.arg("LogLevel=ERROR") != None { port_s.drop(); cmd_s.drop(); dest.drop(); if has_kh_opt { kh_opt.drop(); } parsed_ssh_url_drop(mut parts); return None; }
+  if cmd.arg("-o") != None { port_s.drop(); cmd_s.drop(); dest.drop(); if has_kh_opt { kh_opt.drop(); } parsed_ssh_url_drop(mut parts); return None; }
+  if cmd.arg("ConnectTimeout=5") != None { port_s.drop(); cmd_s.drop(); dest.drop(); if has_kh_opt { kh_opt.drop(); } parsed_ssh_url_drop(mut parts); return None; }
+
+  if insecure {
+    if cmd.arg("-o") != None { port_s.drop(); cmd_s.drop(); dest.drop(); if has_kh_opt { kh_opt.drop(); } parsed_ssh_url_drop(mut parts); return None; }
+    if cmd.arg("StrictHostKeyChecking=no") != None { port_s.drop(); cmd_s.drop(); dest.drop(); if has_kh_opt { kh_opt.drop(); } parsed_ssh_url_drop(mut parts); return None; }
+    if cmd.arg("-o") != None { port_s.drop(); cmd_s.drop(); dest.drop(); if has_kh_opt { kh_opt.drop(); } parsed_ssh_url_drop(mut parts); return None; }
+    if cmd.arg("UserKnownHostsFile=/dev/null") != None { port_s.drop(); cmd_s.drop(); dest.drop(); if has_kh_opt { kh_opt.drop(); } parsed_ssh_url_drop(mut parts); return None; }
+  } else {
+    if cmd.arg("-o") != None { port_s.drop(); cmd_s.drop(); dest.drop(); if has_kh_opt { kh_opt.drop(); } parsed_ssh_url_drop(mut parts); return None; }
+    if cmd.arg("StrictHostKeyChecking=yes") != None { port_s.drop(); cmd_s.drop(); dest.drop(); if has_kh_opt { kh_opt.drop(); } parsed_ssh_url_drop(mut parts); return None; }
+    if has_kh_opt {
+      if cmd.arg("-o") != None { port_s.drop(); cmd_s.drop(); dest.drop(); kh_opt.drop(); parsed_ssh_url_drop(mut parts); return None; }
+      if cmd.arg(kh_opt.as_string()) != None { port_s.drop(); cmd_s.drop(); dest.drop(); kh_opt.drop(); parsed_ssh_url_drop(mut parts); return None; }
+    }
+  }
+
+  // Add identity hints via `-i` (optional).
+  var j: i64 = 0;
+  while j < id_len {
+    if cmd.arg("-i") != None { port_s.drop(); cmd_s.drop(); dest.drop(); if has_kh_opt { kh_opt.drop(); } parsed_ssh_url_drop(mut parts); return None; }
+    if cmd.arg(id_paths[j as int].as_string()) != None { port_s.drop(); cmd_s.drop(); dest.drop(); if has_kh_opt { kh_opt.drop(); } parsed_ssh_url_drop(mut parts); return None; }
+    j = j + 1;
+  }
+
+  if cmd.arg(dest.as_string()) != None { port_s.drop(); cmd_s.drop(); dest.drop(); if has_kh_opt { kh_opt.drop(); } parsed_ssh_url_drop(mut parts); return None; }
+  if cmd.arg(cmd_s.as_string()) != None { port_s.drop(); cmd_s.drop(); dest.drop(); if has_kh_opt { kh_opt.drop(); } parsed_ssh_url_drop(mut parts); return None; }
+
+  let out_r: std::process::OutputResult = cmd.output();
+
+  port_s.drop();
+  cmd_s.drop();
+  dest.drop();
+  if has_kh_opt { kh_opt.drop(); }
+  var k: i64 = 0;
+  while k < id_len {
+    let mut s: std::strings::String = id_paths[k as int];
+    s.drop();
+    id_paths[k as int] = s;
+    k = k + 1;
+  }
+  parsed_ssh_url_drop(mut parts);
+
+  if out_r.is_err() { return None; }
+  let mut out: std::process::Output = match (out_r) { Ok(v) => v, Err(_) => std::process::Output{ status: std::process::ExitStatus{ bits: 0 }, stdout: std::strings::String.empty(), stderr: std::strings::String.empty() } };
+  if !out.status.success() {
+    out.stdout.drop();
+    out.stderr.drop();
+    return None;
+  }
+
+  let mapped_opt: MappedFile? = spool_bytes_to_tmp_map(out.stdout.as_string(), allow_binary);
+  out.stdout.drop();
+  out.stderr.drop();
+  if mapped_opt == None {
+    return None;
+  }
+  let mut mapped: MappedFile = match (mapped_opt) { Some(v) => v, None => MappedFile{ ptr: 0, len: 0 } };
+  return Some(MappedInput{ file: move mapped, syntax_hint: "" });
+}
+
 export fn map_url (input: string, allow_binary: bool) -> MappedInput? {
   if has_prefix_case_insensitive(input, "ssh://") {
-    return map_ssh_url(input, allow_binary);
+    let native_opt: MappedInput? = map_ssh_url(input, allow_binary);
+    if native_opt != None {
+      return native_opt;
+    }
+    return map_ssh_url_via_ssh_cmd(input, allow_binary);
   }
 
   let cur_r: std::strings::StringResult = std::strings::String.from_string(input);

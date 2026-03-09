@@ -51,10 +51,12 @@ Find output is parsed as either \fBvimgrep\fR (\fIpath:line:col:text\fR) or grep
 .SH SYNTAX SELECTION
 When syntax highlighting is enabled, \fBsage\fR selects a syntax key using (in order):
 .IP 1. 3
-\fBsyntax_map\fR overrides from \fB.sagerc\fR,
+\fB:set syntax=\fR per\-tab overrides,
 .IP 2. 3
-compiled syntax index matches for the path (including "first\-line" patterns from syntax sources),
+\fBsyntax_map\fR overrides from \fB.sagerc\fR,
 .IP 3. 3
+compiled syntax index matches for the path (including "first\-line" patterns from syntax sources),
+.IP 4. 3
 a network syntax hint (for example from HTTP \fBContent\-Type\fR) when available.
 .PP
 For network paths, query strings and fragments do not participate in syntax selection.

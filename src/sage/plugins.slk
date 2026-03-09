@@ -29,6 +29,7 @@ export ext sage_qjs_add_builtin_module = fn (Qjs, u64, i64, u64, i64) -> i64;
 export ext sage_qjs_take_error = fn (Qjs) -> i64;
 export ext sage_qjs_eval_bootstrap = fn (Qjs, string) -> i64;
 export ext sage_qjs_eval_file = fn (Qjs, string) -> i64;
+export ext sage_qjs_eval = fn (Qjs, string) -> i64;
 export ext sage_qjs_emit_open = fn (Qjs, string, i64, i64) -> i64;
 export ext sage_qjs_emit_tab_change = fn (Qjs, i64, i64, i64) -> i64;
 export ext sage_qjs_emit_search = fn (Qjs, string, i64, i64) -> i64;
@@ -586,6 +587,18 @@ export fn poll (p: &Plugins) -> bool {
   let rc: i64 = sage_qjs_poll(p.q);
   if rc != 0 { return true; }
   return sage_qjs_take_error(p.q) != 0;
+}
+
+// Evaluate arbitrary JS in a persistent runtime (used by `:eval`).
+export fn eval (p: &Plugins, src: string) -> bool {
+  if p.q == 0 { return true; }
+  let own_opt: string? = cstr_copy_owned(src);
+  if own_opt == None { return true; }
+  let own: string = match (own_opt) { Some(v) => v, None => "" };
+  let rc: i64 = sage_qjs_eval(p.q, own);
+  free_joined(own);
+  let had_err: bool = sage_qjs_take_error(p.q) != 0;
+  return rc != 0 || had_err;
 }
 
 // Commands
