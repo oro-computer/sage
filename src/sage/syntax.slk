@@ -521,10 +521,10 @@ fn write_i64_dec (fd: int, n: i64) -> void {
   }
 
   let mut digits: u8[32] = [
-  0, 0, 0, 0, 0, 0, 0, 0,
-  0, 0, 0, 0, 0, 0, 0, 0,
-  0, 0, 0, 0, 0, 0, 0, 0,
-  0, 0, 0, 0, 0, 0, 0, 0
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0
   ];
   var dn: i64 = 0;
   while x != 0 && dn < 32 {
@@ -902,13 +902,13 @@ fn pack_push_checked (mut pack: &BufferU8, ptr: u64, len: i64) -> i64? {
 }
 
 fn parse_sublime_syntax (
-bytes: &BufferU8,
-cache_name: string,
-mut out_exts: &BufferU8,
-mut out_first_line: &BufferU8,
-mut out_rules: &BufferU8,
-mut out_rule_toks: &BufferU8,
-mut meta: &SyntaxMeta
+  bytes: &BufferU8,
+  cache_name: string,
+  mut out_exts: &BufferU8,
+  mut out_first_line: &BufferU8,
+  mut out_rules: &BufferU8,
+  mut out_rule_toks: &BufferU8,
+  mut meta: &SyntaxMeta
 ) -> bool {
   // Produces:
   // - out_exts: NUL-separated lowercased keys.
@@ -1517,13 +1517,13 @@ fn tm_is_ascii_ws (b: u8) -> bool {
 }
 
 fn parse_textmate_syntax (
-bytes: &BufferU8,
-cache_name: string,
-mut out_exts: &BufferU8,
-mut out_first_line: &BufferU8,
-mut out_rules: &BufferU8,
-mut out_rule_toks: &BufferU8,
-mut meta: &SyntaxMeta
+  bytes: &BufferU8,
+  cache_name: string,
+  mut out_exts: &BufferU8,
+  mut out_first_line: &BufferU8,
+  mut out_rules: &BufferU8,
+  mut out_rule_toks: &BufferU8,
+  mut meta: &SyntaxMeta
 ) -> bool {
   out_exts.clear();
   out_first_line.clear();
@@ -1866,13 +1866,13 @@ mut meta: &SyntaxMeta
 // Our Atom/CSON parser already extracts the subset we support (fileTypes +
 // match rules + begin/end range flags), so reuse it for `.tmLanguage.json`.
 fn parse_textmate_json (
-bytes: &BufferU8,
-cache_name: string,
-mut out_exts: &BufferU8,
-mut out_first_line: &BufferU8,
-mut out_rules: &BufferU8,
-mut out_rule_toks: &BufferU8,
-mut meta: &SyntaxMeta
+  bytes: &BufferU8,
+  cache_name: string,
+  mut out_exts: &BufferU8,
+  mut out_first_line: &BufferU8,
+  mut out_rules: &BufferU8,
+  mut out_rule_toks: &BufferU8,
+  mut meta: &SyntaxMeta
 ) -> bool {
   return parse_atom_cson(bytes, cache_name, mut out_exts, mut out_first_line, mut out_rules, mut out_rule_toks, mut meta);
 }
@@ -2039,13 +2039,13 @@ fn cson_decode_string (ptr: u64, len: i64, mut scratch: &BufferU8) -> Span {
 }
 
 fn parse_atom_cson (
-bytes: &BufferU8,
-cache_name: string,
-mut out_exts: &BufferU8,
-mut out_first_line: &BufferU8,
-mut out_rules: &BufferU8,
-mut out_rule_toks: &BufferU8,
-mut meta: &SyntaxMeta
+  bytes: &BufferU8,
+  cache_name: string,
+  mut out_exts: &BufferU8,
+  mut out_first_line: &BufferU8,
+  mut out_rules: &BufferU8,
+  mut out_rule_toks: &BufferU8,
+  mut meta: &SyntaxMeta
 ) -> bool {
   out_exts.clear();
   out_first_line.clear();
@@ -2755,21 +2755,21 @@ fn buf_count_nul_terms (b: &BufferU8) -> i64 {
 }
 
 fn compile_cache_scan_dir (
-dir_path: string,
-rel_prefix: string,
-cache_syntax: string,
-verbose: bool,
-mut file_buf: &BufferU8,
-mut exts: &BufferU8,
-mut first_lines: &BufferU8,
-mut rules: &BufferU8,
-mut toks: &BufferU8,
-mut name_scratch: &BufferU8,
-entries_ptr: u64,
-entries_cap: i64,
-first_ptr: u64,
-first_cap: i64,
-mut stats: &CompileStats
+  dir_path: string,
+  rel_prefix: string,
+  cache_syntax: string,
+  verbose: bool,
+  mut file_buf: &BufferU8,
+  mut exts: &BufferU8,
+  mut first_lines: &BufferU8,
+  mut rules: &BufferU8,
+  mut toks: &BufferU8,
+  mut name_scratch: &BufferU8,
+  entries_ptr: u64,
+  entries_cap: i64,
+  first_ptr: u64,
+  first_cap: i64,
+  mut stats: &CompileStats
 ) -> void {
   let dir: u64 = std::runtime::posix::fs::opendir(dir_path);
   if dir == 0 {
@@ -4067,10 +4067,10 @@ fn strip_extended_regex (src_ptr: u64, src_len: i64, mut out: &BufferU8) -> void
 }
 
 fn parse_first_line_pattern (
-src_ptr: u64,
-src_len: i64,
-mut pat_scratch: &BufferU8,
-mut flags_scratch: &BufferU8
+  src_ptr: u64,
+  src_len: i64,
+  mut pat_scratch: &BufferU8,
+  mut flags_scratch: &BufferU8
 ) -> FirstLinePattern {
   pat_scratch.clear();
   flags_scratch.clear();

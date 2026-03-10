@@ -10,6 +10,7 @@ import std::net;
 import std::process;
 import std::ssh2;
 import std::runtime::fs;
+import std::runtime::io;
 import std::runtime::mem;
 import std::runtime::posix::fs;
 import std::runtime::posix::net;
@@ -21,6 +22,129 @@ import { MappedFile } from "./file.slk";
 import { MappedInput } from "./mapped.slk";
 
 let SO_RCVTIMEO: int = 20; // linux: SO_RCVTIMEO
+
+fn fd_write_all (fd: int, ptr: u64, len: i64) -> bool {
+  if fd < 0 || ptr == 0 || len <= 0 {
+    return true;
+  }
+  var off: i64 = 0;
+  while off < len {
+    let w: int = std::runtime::posix::fs::write(fd, ptr + (off as u64), len - off);
+    if w <= 0 {
+      return false;
+    }
+    off = off + (w as i64);
+  }
+  return true;
+}
+
+fn fd_write_str (fd: int, s: string) -> bool {
+  let p: u64 = std::runtime::mem::string_ptr(s);
+  let n: i64 = std::runtime::mem::string_len(s);
+  return fd_write_all(fd, p, n);
+}
+
+fn fd_write_u8 (fd: int, b: u8) -> bool {
+  if fd < 0 {
+    return false;
+  }
+  let mem: u64 = std::runtime::mem::alloc(1);
+  if mem == 0 {
+    return false;
+  }
+  std::runtime::mem::store_u8(mem, 0, b);
+  let ok: bool = std::runtime::posix::fs::write(fd, mem, 1) == 1;
+  std::runtime::mem::free(mem);
+  return ok;
+}
+
+fn tty_prompt_secret (prompt: string) -> std::strings::String? {
+  let fd_r: std::runtime::io::IntResult = std::runtime::io::tty_open();
+  if fd_r.is_err() {
+    return None;
+  }
+  let fd: int = std::runtime::io::IntResult.ok_value(fd_r) ?? -1;
+  if fd < 0 {
+    return None;
+  }
+
+  let _ = fd_write_str(fd, prompt);
+
+  let h_r: std::runtime::io::U64Result = std::runtime::io::tty_raw_enter(fd);
+  if h_r.is_err() {
+    let _ = std::runtime::posix::fs::close(fd);
+    return None;
+  }
+  let handle: u64 = match (h_r) { Ok(v) => v, Err(_) => 0 };
+  if handle == 0 {
+    let _ = std::runtime::posix::fs::close(fd);
+    return None;
+  }
+
+  let buf_r = std::buffer::BufferU8.init(64);
+  if buf_r.is_err() {
+    let _ = std::runtime::io::tty_raw_leave(handle);
+    let _ = std::runtime::posix::fs::close(fd);
+    return None;
+  }
+  let mut buf: std::buffer::BufferU8 = match (buf_r) { Ok(v) => v, Err(_) => std::buffer::BufferU8.empty() };
+
+  let tmp: u64 = std::runtime::mem::alloc(1);
+  if tmp == 0 {
+    buf.drop();
+    let _ = std::runtime::io::tty_raw_leave(handle);
+    let _ = std::runtime::posix::fs::close(fd);
+    return None;
+  }
+
+  var canceled: bool = false;
+  while true {
+    let n: int = std::runtime::posix::fs::read(fd, tmp, 1);
+    if n <= 0 {
+      canceled = true;
+      break;
+    }
+
+    let b: u8 = std::runtime::mem::load_u8(tmp, 0);
+    if b == 10 || b == 13 { // '\n' or '\r'
+      break;
+    }
+    if b == 3 || b == 4 || b == 27 { // Ctrl-C / Ctrl-D / Esc
+      canceled = true;
+      break;
+    }
+    if b == 127 || b == 8 { // DEL / BS
+      if buf.len > 0 {
+        let _ = buf.pop();
+      }
+      continue;
+    }
+    if buf.push(b) != None {
+      canceled = true;
+      break;
+    }
+  }
+
+  std::runtime::mem::free(tmp);
+  let _ = std::runtime::io::tty_raw_leave(handle);
+  let _ = fd_write_u8(fd, 10); // '\n'
+
+  if canceled {
+    buf.drop();
+    let _ = std::runtime::posix::fs::close(fd);
+    return None;
+  }
+
+  let out_r: std::strings::StringResult = std::strings::String.from_buffer_u8(mut buf);
+  if out_r.is_err() {
+    buf.drop();
+    let _ = std::runtime::posix::fs::close(fd);
+    return None;
+  }
+  let mut out: std::strings::String = match (out_r) { Ok(v) => v, Err(_) => std::strings::String.empty() };
+  let _ = std::runtime::posix::fs::close(fd);
+  return Some(out);
+}
 
 fn ascii_lower (b: u8) -> u8 {
   if b >= 65 && b <= 90 {
@@ -54,11 +178,383 @@ fn has_prefix_case_insensitive (s: string, prefix: string) -> bool {
 }
 
 export fn is_network_path (path: string) -> bool {
-  return has_prefix_case_insensitive(path, "http://") || has_prefix_case_insensitive(path, "https://") || has_prefix_case_insensitive(path, "ssh://");
+  return has_prefix_case_insensitive(path, "http://") || has_prefix_case_insensitive(path, "https://") || has_prefix_case_insensitive(path, "ssh://") || has_prefix_case_insensitive(path, "git://");
 }
 
 export fn is_ssh_path (path: string) -> bool {
   return has_prefix_case_insensitive(path, "ssh://");
+}
+
+fn query_param_decode (query: string, key: string) -> std::strings::String? {
+  let qp: u64 = std::runtime::mem::string_ptr(query);
+  let qn: i64 = std::runtime::mem::string_len(query);
+  if qp == 0 || qn <= 0 {
+    return None;
+  }
+
+  var i: i64 = 0;
+  while i < qn {
+    // segment: [i, seg_end)
+    var seg_end: i64 = i;
+    while seg_end < qn && std::runtime::mem::load_u8(qp, seg_end) != 38 { // '&'
+      seg_end = seg_end + 1;
+    }
+
+    // split on '=' within the segment
+    var eq: i64 = i;
+    while eq < seg_end && std::runtime::mem::load_u8(qp, eq) != 61 { // '='
+      eq = eq + 1;
+    }
+
+    let k_len: i64 = eq - i;
+    if k_len > 0 {
+      let k_view: string = std::runtime::mem::string_from_ptr_len(qp + (i as u64), k_len as int);
+      if k_view == key {
+        if eq + 1 >= seg_end {
+          return Some(std::strings::String.empty());
+        }
+        let v_view: string = std::runtime::mem::string_from_ptr_len(qp + ((eq + 1) as u64), (seg_end - (eq + 1)) as int);
+        return percent_decode_component(v_view);
+      }
+    }
+
+    i = seg_end + 1;
+  }
+
+  return None;
+}
+
+fn find_last_dot_git_slash (path: string) -> i64 {
+  let p: u64 = std::runtime::mem::string_ptr(path);
+  let n: i64 = std::runtime::mem::string_len(path);
+  if p == 0 || n < 5 {
+    return -1;
+  }
+
+  var idx: i64 = -1;
+  var i: i64 = 0;
+  while i <= (n - 5) {
+    if std::runtime::mem::load_u8(p, i) == 46 && // '.'
+    std::runtime::mem::load_u8(p, i + 1) == 103 && // 'g'
+    std::runtime::mem::load_u8(p, i + 2) == 105 && // 'i'
+    std::runtime::mem::load_u8(p, i + 3) == 116 && // 't'
+    std::runtime::mem::load_u8(p, i + 4) == 47 { // '/'
+      idx = i;
+    }
+    i = i + 1;
+  }
+
+  return idx;
+}
+
+fn rm_rf_tmp_dir (path: string) -> void {
+  if path == "" || !has_prefix_case_insensitive(path, "/tmp/sage-git") {
+    return;
+  }
+  let mut cmd: std::process::Command = std::process::Command.init("rm");
+  cmd.stdin(std::process::Stdio::Null);
+  cmd.stdout(std::process::Stdio::Null);
+  cmd.stderr(std::process::Stdio::Null);
+  let _ = cmd.arg("-rf");
+  let _ = cmd.arg(path);
+  let out_r: std::process::OutputResult = cmd.output();
+  if !out_r.is_err() {
+    let mut out: std::process::Output = match (out_r) {
+      Ok(v) => v,
+      Err(_) => std::process::Output{ status: std::process::ExitStatus{ bits: 0 }, stdout: std::strings::String.empty(), stderr: std::strings::String.empty() },
+    };
+    out.stdout.drop();
+    out.stderr.drop();
+  }
+}
+
+fn mktemp_git_dir_path () -> std::strings::String? {
+  let tmpl_r = std::strings::String.from_string("/tmp/sage-gitXXXXXX");
+  if tmpl_r.is_err() {
+    return None;
+  }
+  let mut tmpl: std::strings::String = match (tmpl_r) { Ok(v) => v, Err(_) => std::strings::String.empty() };
+  if tmpl.len <= 0 {
+    return None;
+  }
+
+  let fd_r: std::runtime::fs::IntResult = std::runtime::fs::mkstemp(tmpl.ptr);
+  if fd_r.is_err() {
+    tmpl.drop();
+    return None;
+  }
+  let fd: int = std::runtime::fs::IntResult.ok_value(fd_r) ?? -1;
+  if fd >= 0 {
+    let _ = std::runtime::posix::fs::close(fd);
+  }
+  let _ = std::runtime::posix::fs::unlink(tmpl.as_string());
+
+  return Some(tmpl);
+}
+
+fn map_git_url (input: string, allow_binary: bool) -> MappedInput? {
+  // Format:
+  //   git://host/<repo>.git/<path/to/file>[?ref=<rev>]
+  //
+  // We intentionally require the repository boundary to be `... .git/ ...` so
+  // the URL remains unambiguous without additional escaping rules.
+  let url_r = StdURL.parse(input);
+  if url_r.is_err() {
+    return None;
+  }
+  let mut url: StdURL = match (url_r) { Ok(v) => v, Err(_) => StdURL.empty() };
+
+  if url.scheme() != "git" {
+    url.drop();
+    return None;
+  }
+
+  let host_opt: string? = url.host();
+  if host_opt == None {
+    url.drop();
+    return None;
+  }
+  let host_s: string = match (host_opt) { Some(v) => v, None => "" };
+  if host_s == "" {
+    url.drop();
+    return None;
+  }
+  let host_r: std::strings::StringResult = std::strings::String.from_string(host_s);
+  if host_r.is_err() {
+    url.drop();
+    return None;
+  }
+  let mut host_owned: std::strings::String = match (host_r) { Ok(v) => v, Err(_) => std::strings::String.empty() };
+
+  let path_enc: string = url.path();
+  let p: u64 = std::runtime::mem::string_ptr(path_enc);
+  let n: i64 = std::runtime::mem::string_len(path_enc);
+  if p == 0 || n <= 0 {
+    host_owned.drop();
+    url.drop();
+    return None;
+  }
+
+  let idx: i64 = find_last_dot_git_slash(path_enc);
+  if idx < 0 {
+    host_owned.drop();
+    url.drop();
+    return None;
+  }
+
+  let repo_len: i64 = idx + 4; // include ".git"
+  let file_off: i64 = idx + 5; // skip ".git/"
+  if repo_len <= 0 || file_off >= n {
+    host_owned.drop();
+    url.drop();
+    return None;
+  }
+
+  let repo_view: string = std::runtime::mem::string_from_ptr_len(p, repo_len as int);
+  let file_view: string = std::runtime::mem::string_from_ptr_len(p + (file_off as u64), (n - file_off) as int);
+  if file_view == "" {
+    url.drop();
+    return None;
+  }
+
+  let repo_path_opt: std::strings::String? = percent_decode_component(repo_view);
+  if repo_path_opt == None {
+    host_owned.drop();
+    url.drop();
+    return None;
+  }
+  let mut repo_path: std::strings::String = repo_path_opt ?? std::strings::String.empty();
+
+  let file_path_opt: std::strings::String? = percent_decode_component(file_view);
+  if file_path_opt == None {
+    host_owned.drop();
+    repo_path.drop();
+    url.drop();
+    return None;
+  }
+  let mut file_path: std::strings::String = file_path_opt ?? std::strings::String.empty();
+
+  let port_opt: int? = url.port();
+  var port: int = 9418;
+  if port_opt != None {
+    port = match (port_opt) { Some(v) => v, None => port };
+  }
+
+  let query_opt: string? = url.query();
+
+  // ref (optional)
+  var ref_s: string = "HEAD";
+  let mut ref_owned: std::strings::String = std::strings::String.empty();
+  if query_opt != None {
+    let q: string = match (query_opt) { Some(v) => v, None => "" };
+    let r1: std::strings::String? = query_param_decode(q, "ref");
+    let r2: std::strings::String? = if r1 == None { query_param_decode(q, "rev") } else { None };
+    let r_opt: std::strings::String? = if r1 != None { r1 } else { r2 };
+    if r_opt != None {
+      ref_owned = r_opt ?? std::strings::String.empty();
+      if ref_owned.len > 0 {
+        ref_s = ref_owned.as_string();
+      }
+    }
+  }
+
+  url.drop();
+
+  // repo url: git://host[:port]/...repo.git
+  let mut repo_url: std::strings::String = std::strings::String.empty();
+  if repo_url.push_string("git://") != None { repo_url.drop(); host_owned.drop(); repo_path.drop(); file_path.drop(); ref_owned.drop(); return None; }
+  if repo_url.push_string(host_owned.as_string()) != None { repo_url.drop(); host_owned.drop(); repo_path.drop(); file_path.drop(); ref_owned.drop(); return None; }
+  if port_opt != None && port > 0 && port != 9418 {
+    if repo_url.push_u8(58) != None { repo_url.drop(); host_owned.drop(); repo_path.drop(); file_path.drop(); ref_owned.drop(); return None; } // ':'
+    if !push_decimal_port(mut repo_url, port) { repo_url.drop(); host_owned.drop(); repo_path.drop(); file_path.drop(); ref_owned.drop(); return None; }
+  }
+  if repo_url.push_string(repo_path.as_string()) != None { repo_url.drop(); host_owned.drop(); repo_path.drop(); file_path.drop(); ref_owned.drop(); return None; }
+  host_owned.drop();
+  repo_path.drop();
+
+  // Create a temporary bare repo, fetch the requested ref, then `git show`.
+  let tmp_opt: std::strings::String? = mktemp_git_dir_path();
+  if tmp_opt == None {
+    repo_url.drop();
+    file_path.drop();
+    ref_owned.drop();
+    return None;
+  }
+  let mut tmpdir: std::strings::String = tmp_opt ?? std::strings::String.empty();
+
+  // git init --bare <tmpdir>
+  let mut init_cmd: std::process::Command = std::process::Command.init("git");
+  init_cmd.stdin(std::process::Stdio::Null);
+  let _ = init_cmd.arg("init");
+  let _ = init_cmd.arg("--bare");
+  let _ = init_cmd.arg(tmpdir.as_string());
+  let init_out_r: std::process::OutputResult = init_cmd.output();
+  if init_out_r.is_err() {
+    rm_rf_tmp_dir(tmpdir.as_string());
+    tmpdir.drop();
+    repo_url.drop();
+    file_path.drop();
+    ref_owned.drop();
+    return None;
+  }
+  let mut init_out: std::process::Output = match (init_out_r) {
+    Ok(v) => v,
+    Err(_) => std::process::Output{ status: std::process::ExitStatus{ bits: 0 }, stdout: std::strings::String.empty(), stderr: std::strings::String.empty() },
+  };
+  let init_ok: bool = init_out.status.success();
+  init_out.stdout.drop();
+  init_out.stderr.drop();
+  if !init_ok {
+    rm_rf_tmp_dir(tmpdir.as_string());
+    tmpdir.drop();
+    repo_url.drop();
+    file_path.drop();
+    ref_owned.drop();
+    return None;
+  }
+
+  // git --git-dir <tmpdir> fetch --depth=1 --no-tags <repo_url> <ref>
+  var fetched: bool = false;
+  var attempt: int = 0;
+  while attempt < 2 {
+    let mut fetch_cmd: std::process::Command = std::process::Command.init("git");
+    fetch_cmd.stdin(std::process::Stdio::Null);
+    let _ = fetch_cmd.arg("--git-dir");
+    let _ = fetch_cmd.arg(tmpdir.as_string());
+    let _ = fetch_cmd.arg("fetch");
+    if attempt == 0 {
+      let _ = fetch_cmd.arg("--depth=1");
+    }
+    let _ = fetch_cmd.arg("--no-tags");
+    let _ = fetch_cmd.arg(repo_url.as_string());
+    let _ = fetch_cmd.arg(ref_s);
+    let out_r: std::process::OutputResult = fetch_cmd.output();
+    if !out_r.is_err() {
+      let mut out: std::process::Output = match (out_r) {
+        Ok(v) => v,
+        Err(_) => std::process::Output{ status: std::process::ExitStatus{ bits: 0 }, stdout: std::strings::String.empty(), stderr: std::strings::String.empty() },
+      };
+      if out.status.success() {
+        fetched = true;
+      }
+      out.stdout.drop();
+      out.stderr.drop();
+      if fetched { break; }
+    }
+    attempt = attempt + 1;
+  }
+
+  if !fetched {
+    rm_rf_tmp_dir(tmpdir.as_string());
+    tmpdir.drop();
+    repo_url.drop();
+    file_path.drop();
+    ref_owned.drop();
+    return None;
+  }
+
+  // Build "FETCH_HEAD:<path>".
+  let mut spec: std::strings::String = std::strings::String.empty();
+  if spec.push_string("FETCH_HEAD:") != None { spec.drop(); rm_rf_tmp_dir(tmpdir.as_string()); tmpdir.drop(); repo_url.drop(); file_path.drop(); ref_owned.drop(); return None; }
+  if spec.push_string(file_path.as_string()) != None { spec.drop(); rm_rf_tmp_dir(tmpdir.as_string()); tmpdir.drop(); repo_url.drop(); file_path.drop(); ref_owned.drop(); return None; }
+  file_path.drop();
+  repo_url.drop();
+  ref_owned.drop();
+
+  let mut show_cmd: std::process::Command = std::process::Command.init("git");
+  show_cmd.stdin(std::process::Stdio::Null);
+  show_cmd.stdout(std::process::Stdio::Pipe);
+  show_cmd.stderr(std::process::Stdio::Null);
+  let _ = show_cmd.arg("--git-dir");
+  let _ = show_cmd.arg(tmpdir.as_string());
+  let _ = show_cmd.arg("show");
+  let _ = show_cmd.arg(spec.as_string());
+
+  let child_r: std::process::ChildResult = show_cmd.spawn();
+  spec.drop();
+  if child_r.is_err() {
+    rm_rf_tmp_dir(tmpdir.as_string());
+    tmpdir.drop();
+    return None;
+  }
+  let mut child: std::process::Child = match (child_r) { Ok(v) => v, Err(_) => std::process::Child.invalid() };
+
+  let stdout_fd: int = child.take_stdout() ?? -1;
+  if stdout_fd < 0 {
+    child.wait();
+    rm_rf_tmp_dir(tmpdir.as_string());
+    tmpdir.drop();
+    return None;
+  }
+
+  let mapped_opt: MappedFile? = spool_fd_to_tmp_map(stdout_fd, allow_binary);
+  let _ = std::runtime::posix::fs::close(stdout_fd);
+
+  let status_r: std::process::WaitResult = child.wait();
+  rm_rf_tmp_dir(tmpdir.as_string());
+  tmpdir.drop();
+
+  if status_r.is_err() {
+    if mapped_opt != None {
+      let mut mf: MappedFile = match (mapped_opt) { Some(v) => v, None => MappedFile{ ptr: 0, len: 0 } };
+      mf.drop();
+    }
+    return None;
+  }
+  let status: std::process::ExitStatus = match (status_r) { Ok(v) => v, Err(_) => std::process::ExitStatus{ bits: 0 } };
+  if !status.success() {
+    if mapped_opt != None {
+      let mut mf2: MappedFile = match (mapped_opt) { Some(v) => v, None => MappedFile{ ptr: 0, len: 0 } };
+      mf2.drop();
+    }
+    return None;
+  }
+
+  if mapped_opt == None {
+    return None;
+  }
+  let mut mapped: MappedFile = match (mapped_opt) { Some(v) => v, None => MappedFile{ ptr: 0, len: 0 } };
+  return Some(MappedInput{ file: move mapped, syntax_hint: "" });
 }
 
 fn hex_nibble (b: u8) -> int? {
@@ -436,11 +932,11 @@ fn dns_skip_name (msg_ptr: u64, msg_len: i64, start: i64) -> i64? {
 
 fn dns_query_a_v4_value (host: string, nameserver_ip_value: int) -> int? {
   let ns_addr: std::net::SocketAddrV4 = std::net::SocketAddrV4.from_ipv4_value(nameserver_ip_value, 53);
-  let sock_r: std::net::UdpSocketResult = std::net::UdpSocket.connect_v4(ns_addr);
+  let sock_r: std::net::UDPSocketResult = std::net::UDPSocket.connect_v4(ns_addr);
   if sock_r.is_err() {
     return None;
   }
-  let mut sock: std::net::UdpSocket = match (sock_r) { Ok(v) => v, Err(_) => std::net::UdpSocket.invalid() };
+  let mut sock: std::net::UDPSocket = match (sock_r) { Ok(v) => v, Err(_) => std::net::UDPSocket.invalid() };
 
   // Best-effort timeout to avoid hanging indefinitely.
   set_recv_timeout_ms(sock.fd, 2000);
@@ -650,7 +1146,7 @@ fn resolve_host_ipv4_value (host: string) -> int? {
   return dns_query_a_v4_value(host, ns2);
 }
 
-fn http_write_request_http10_tcp (stream: &std::net::TcpStream, target: string, host: string) -> bool {
+fn http_write_request_http10_tcp (stream: &std::net::TCPStream, target: string, host: string) -> bool {
   let mut req: std::strings::String = std::strings::String.empty();
   if req.push_string("GET ") != None { req.drop(); return false; }
   if req.push_string(target) != None { req.drop(); return false; }
@@ -677,7 +1173,7 @@ fn http_write_request_http10_tls (sess: &std::tls::Session, target: string, host
   if req.push_string("Connection: close\x0D\x0A") != None { req.drop(); return false; }
   if req.push_string("\x0D\x0A") != None { req.drop(); return false; }
 
-  let w_err: std::tls::TlsFailed? = sess.write_all(std::arrays::ByteSlice{ ptr: req.ptr, len: req.len });
+  let w_err: std::tls::TLSFailed? = sess.write_all(std::arrays::ByteSlice{ ptr: req.ptr, len: req.len });
   req.drop();
   return w_err == None;
 }
@@ -749,6 +1245,90 @@ fn spool_bytes_to_tmp_map (bytes: string, allow_binary: bool) -> MappedFile? {
   }
 
   return map_fd_readonly(fd, data_len);
+}
+
+fn spool_fd_to_tmp_map (in_fd: int, allow_binary: bool) -> MappedFile? {
+  if in_fd < 0 {
+    return None;
+  }
+
+  let tmpl_r = std::strings::String.from_string("/tmp/sageXXXXXX");
+  if tmpl_r.is_err() {
+    return None;
+  }
+  let mut tmpl: std::strings::String = match (tmpl_r) { Ok(v) => v, Err(_) => std::strings::String.empty() };
+  if tmpl.len <= 0 {
+    return None;
+  }
+
+  let fd_r: std::runtime::fs::IntResult = std::runtime::fs::mkstemp(tmpl.ptr);
+  if fd_r.is_err() {
+    tmpl.drop();
+    return None;
+  }
+  let fd: int = std::runtime::fs::IntResult.ok_value(fd_r) ?? -1;
+  if fd < 0 {
+    tmpl.drop();
+    return None;
+  }
+
+  let _ = std::runtime::posix::fs::unlink(tmpl.as_string());
+  tmpl.drop();
+
+  let buf_r = std::buffer::BufferU8.init(32768);
+  if buf_r.is_err() {
+    let _ = std::runtime::posix::fs::close(fd);
+    return None;
+  }
+  let mut buf: std::buffer::BufferU8 = match (buf_r) { Ok(v) => v, Err(_) => std::buffer::BufferU8.empty() };
+
+  var total: i64 = 0;
+  var scanned: i64 = 0;
+  while true {
+    let n: int = std::runtime::posix::fs::read(in_fd, buf.ptr, buf.cap);
+    if n < 0 {
+      buf.drop();
+      let _ = std::runtime::posix::fs::close(fd);
+      return None;
+    }
+    if n == 0 {
+      break;
+    }
+
+    let nn: i64 = n as i64;
+    if nn > 0 && total > (std::limits::I64_MAX - nn) {
+      buf.drop();
+      let _ = std::runtime::posix::fs::close(fd);
+      return None;
+    }
+
+    if !allow_binary && scanned < 1024 {
+      let take: i64 = if nn < (1024 - scanned) { nn } else { 1024 - scanned };
+      if take > 0 && memchr(buf.ptr, 0, take) != 0 {
+        buf.drop();
+        let _ = std::runtime::posix::fs::close(fd);
+        return None;
+      }
+      scanned = scanned + take;
+    }
+
+    // Write all bytes.
+    var off: i64 = 0;
+    while off < nn {
+      let w: int = std::runtime::posix::fs::write(fd, buf.ptr + (off as u64), nn - off);
+      if w <= 0 {
+        buf.drop();
+        let _ = std::runtime::posix::fs::close(fd);
+        return None;
+      }
+      off = off + (w as i64);
+    }
+
+    total = total + nn;
+  }
+
+  buf.drop();
+  return map_fd_readonly(fd, total);
 }
 
 let SCHEME_HTTP: int = 0;
@@ -1086,21 +1666,94 @@ fn ssh_known_hosts_path () -> std::strings::String? {
   return Some(out);
 }
 
-fn ssh_default_username () -> string? {
+fn copy_first_token_owned (s: string) -> std::strings::String? {
+  let p: u64 = std::runtime::mem::string_ptr(s);
+  let n: i64 = std::runtime::mem::string_len(s);
+  if p == 0 || n <= 0 {
+    return None;
+  }
+  var i: i64 = 0;
+  while i < n && is_ascii_ws(std::runtime::mem::load_u8(p, i)) {
+    i = i + 1;
+  }
+  var j: i64 = i;
+  while j < n && !is_ascii_ws(std::runtime::mem::load_u8(p, j)) {
+    j = j + 1;
+  }
+  let len: i64 = j - i;
+  if len <= 0 {
+    return None;
+  }
+
+  let view: string = std::runtime::mem::string_from_ptr_len(p + (i as u64), len as int);
+  let r: std::strings::StringResult = std::strings::String.from_string(view);
+  if r.is_err() {
+    return None;
+  }
+  let mut out: std::strings::String = match (r) { Ok(v) => v, Err(_) => std::strings::String.empty() };
+  return Some(out);
+}
+
+fn ssh_default_username () -> std::strings::String? {
   let user_opt: string? = std::env::get("USER");
   if user_opt != None {
     let user: string = match (user_opt) { Some(v) => v, None => "" };
     if user != "" {
-      return Some(user);
+      return copy_first_token_owned(user);
     }
   }
   let logname_opt: string? = std::env::get("LOGNAME");
   if logname_opt != None {
     let logname: string = match (logname_opt) { Some(v) => v, None => "" };
     if logname != "" {
-      return Some(logname);
+      return copy_first_token_owned(logname);
     }
   }
+
+  // Fallbacks for minimal environments where USER/LOGNAME aren't set.
+  let mut cmd: std::process::Command = std::process::Command.init("id");
+  cmd.stdin(std::process::Stdio::Null);
+  let _ = cmd.arg("-un");
+  let out_r: std::process::OutputResult = cmd.output();
+  if !out_r.is_err() {
+    let mut out: std::process::Output = match (out_r) {
+      Ok(v) => v,
+      Err(_) => std::process::Output{ status: std::process::ExitStatus{ bits: 0 }, stdout: std::strings::String.empty(), stderr: std::strings::String.empty() },
+    };
+    if out.status.success() {
+      let tok_opt: std::strings::String? = copy_first_token_owned(out.stdout.as_string());
+      out.stdout.drop();
+      out.stderr.drop();
+      if tok_opt != None {
+        return tok_opt;
+      }
+    } else {
+      out.stdout.drop();
+      out.stderr.drop();
+    }
+  }
+
+  let mut cmd2: std::process::Command = std::process::Command.init("whoami");
+  cmd2.stdin(std::process::Stdio::Null);
+  let out_r2: std::process::OutputResult = cmd2.output();
+  if !out_r2.is_err() {
+    let mut out2: std::process::Output = match (out_r2) {
+      Ok(v) => v,
+      Err(_) => std::process::Output{ status: std::process::ExitStatus{ bits: 0 }, stdout: std::strings::String.empty(), stderr: std::strings::String.empty() },
+    };
+    if out2.status.success() {
+      let tok_opt2: std::strings::String? = copy_first_token_owned(out2.stdout.as_string());
+      out2.stdout.drop();
+      out2.stderr.drop();
+      if tok_opt2 != None {
+        return tok_opt2;
+      }
+    } else {
+      out2.stdout.drop();
+      out2.stderr.drop();
+    }
+  }
+
   return None;
 }
 
@@ -1132,7 +1785,7 @@ fn ssh_agent_auth (sess: &std::ssh2::Session, username: string) -> bool {
       break;
     }
     let id: std::ssh2::AgentIdentity = match (id_opt) { Some(v) => v, None => std::ssh2::AgentIdentity{ ptr: 0 } };
-    let err: std::ssh2::Ssh2Failed? = agent.userauth(username, id);
+    let err: std::ssh2::SSH2Failed? = agent.userauth(username, id);
     if err == None {
       agent.drop();
       return true;
@@ -1148,7 +1801,7 @@ fn path_exists (path: string) -> bool {
   return std::runtime::posix::fs::access(path, 0) == 0;
 }
 
-fn ssh_keyfile_auth (sess: &std::ssh2::Session, username: string) -> bool {
+fn ssh_keyfile_auth (sess: &std::ssh2::Session, username: string, host: string) -> bool {
   let home_opt: string? = std::env::home_dir();
   if home_opt == None {
     return false;
@@ -1157,6 +1810,20 @@ fn ssh_keyfile_auth (sess: &std::ssh2::Session, username: string) -> bool {
   if home == "" {
     return false;
   }
+
+  var cand_priv: std::strings::String[4] = [
+    std::strings::String.empty(),
+    std::strings::String.empty(),
+    std::strings::String.empty(),
+    std::strings::String.empty(),
+  ];
+  var cand_pub: std::strings::String[4] = [
+    std::strings::String.empty(),
+    std::strings::String.empty(),
+    std::strings::String.empty(),
+    std::strings::String.empty(),
+  ];
+  var cand_len: i64 = 0;
 
   var keys: string[4] = ["id_ed25519", "id_rsa", "id_ecdsa", "id_dsa"];
   var i: i64 = 0;
@@ -1174,11 +1841,32 @@ fn ssh_keyfile_auth (sess: &std::ssh2::Session, username: string) -> bool {
     if pub_path.push_string(".pub") != None { priv_path.drop(); pub_path.drop(); return false; }
 
     if path_exists(priv_path.as_string()) && path_exists(pub_path.as_string()) {
-      let err: std::ssh2::Ssh2Failed? = sess.userauth_publickey_fromfile(username, pub_path.as_string(), priv_path.as_string(), None);
-      pub_path.drop();
-      priv_path.drop();
+      // First try without passphrase.
+      let err: std::ssh2::SSH2Failed? = sess.userauth_publickey_fromfile(username, pub_path.as_string(), priv_path.as_string(), None);
       if err == None {
+        pub_path.drop();
+        priv_path.drop();
+        var k0: i64 = 0;
+        while k0 < cand_len {
+          let mut a0: std::strings::String = cand_priv[k0 as int];
+          let mut b0: std::strings::String = cand_pub[k0 as int];
+          a0.drop();
+          b0.drop();
+          cand_priv[k0 as int] = a0;
+          cand_pub[k0 as int] = b0;
+          k0 = k0 + 1;
+        }
         return true;
+      }
+
+      // Keep for interactive passphrase prompt.
+      if cand_len < 4 {
+        cand_priv[cand_len as int] = move priv_path;
+        cand_pub[cand_len as int] = move pub_path;
+        cand_len = cand_len + 1;
+      } else {
+        pub_path.drop();
+        priv_path.drop();
       }
     } else {
       pub_path.drop();
@@ -1186,6 +1874,60 @@ fn ssh_keyfile_auth (sess: &std::ssh2::Session, username: string) -> bool {
     }
 
     i = i + 1;
+  }
+
+  // Prompt for passphrase as needed.
+  var j: i64 = 0;
+  while j < cand_len {
+    let priv_s: string = cand_priv[j as int].as_string();
+    let pub_s: string = cand_pub[j as int].as_string();
+
+    let mut prompt: std::strings::String = std::strings::String.empty();
+    if prompt.push_string("sage: passphrase for ") != None { prompt.drop(); break; }
+    if prompt.push_string(priv_s) != None { prompt.drop(); break; }
+    if prompt.push_string(" (") != None { prompt.drop(); break; }
+    if prompt.push_string(username) != None { prompt.drop(); break; }
+    if prompt.push_u8(64) != None { prompt.drop(); break; } // '@'
+    if prompt.push_string(host) != None { prompt.drop(); break; }
+    if prompt.push_string(") [empty to skip]: ") != None { prompt.drop(); break; }
+
+    let pass_opt: std::strings::String? = tty_prompt_secret(prompt.as_string());
+    prompt.drop();
+    if pass_opt != None {
+      let mut pass: std::strings::String = pass_opt ?? std::strings::String.empty();
+      if pass.len > 0 {
+        let err3: std::ssh2::SSH2Failed? = sess.userauth_publickey_fromfile(username, pub_s, priv_s, Some(pass.as_string()));
+        if err3 == None {
+          pass.drop();
+          var k2: i64 = 0;
+          while k2 < cand_len {
+            let mut a2: std::strings::String = cand_priv[k2 as int];
+            let mut b2: std::strings::String = cand_pub[k2 as int];
+            a2.drop();
+            b2.drop();
+            cand_priv[k2 as int] = a2;
+            cand_pub[k2 as int] = b2;
+            k2 = k2 + 1;
+          }
+          return true;
+        }
+      }
+      pass.drop();
+    }
+
+    j = j + 1;
+  }
+
+  // Cleanup candidate paths.
+  var k: i64 = 0;
+  while k < cand_len {
+    let mut a: std::strings::String = cand_priv[k as int];
+    let mut b: std::strings::String = cand_pub[k as int];
+    a.drop();
+    b.drop();
+    cand_priv[k as int] = a;
+    cand_pub[k as int] = b;
+    k = k + 1;
   }
 
   return false;
@@ -1225,7 +1967,7 @@ fn spool_sftp_handle_to_tmp_map (h: &std::ssh2::SftpHandle, allow_binary: bool) 
   var total: i64 = 0;
   var scanned: i64 = 0;
   while true {
-    let r: std::ssh2::Ssh2I64Result = h.read(std::arrays::ByteSlice{ ptr: buf.ptr, len: buf.cap });
+    let r: std::ssh2::SSH2I64Result = h.read(std::arrays::ByteSlice{ ptr: buf.ptr, len: buf.cap });
     if r.is_err() {
       buf.drop();
       let _ = std::runtime::posix::fs::close(fd);
@@ -1296,12 +2038,12 @@ fn map_ssh_url (input: string, allow_binary: bool) -> MappedInput? {
   }
 
   let addr: std::net::SocketAddrV4 = std::net::SocketAddrV4.from_ipv4_value(ip_value, parts.port);
-  let stream_r: std::net::TcpStreamResult = std::net::TcpStream.connect(addr);
+  let stream_r: std::net::TCPStreamResult = std::net::TCPStream.connect(addr);
   if stream_r.is_err() {
     parsed_ssh_url_drop(mut parts);
     return None;
   }
-  let mut stream: std::net::TcpStream = match (stream_r) { Ok(v) => v, Err(_) => std::net::TcpStream.invalid() };
+  let mut stream: std::net::TCPStream = match (stream_r) { Ok(v) => v, Err(_) => std::net::TCPStream.invalid() };
 
   let sess_r: std::ssh2::SessionResult = std::ssh2::Session.init();
   if sess_r.is_err() {
@@ -1312,7 +2054,7 @@ fn map_ssh_url (input: string, allow_binary: bool) -> MappedInput? {
   let mut sess: std::ssh2::Session = match (sess_r) { Ok(v) => v, Err(_) => std::ssh2::Session.invalid() };
   sess.set_blocking(true);
 
-  let hs_err: std::ssh2::Ssh2Failed? = sess.handshake(&stream);
+  let hs_err: std::ssh2::SSH2Failed? = sess.handshake(&stream);
   if hs_err != None {
     sess.drop();
     stream.close();
@@ -1341,7 +2083,7 @@ fn map_ssh_url (input: string, allow_binary: bool) -> MappedInput? {
       return None;
     }
     let mut kh_path: std::strings::String = kh_path_opt ?? std::strings::String.empty();
-    let load_r: std::ssh2::Ssh2IntResult = kh.read_file(kh_path.as_string());
+    let load_r: std::ssh2::SSH2IntResult = kh.read_file(kh_path.as_string());
     kh_path.drop();
     if load_r.is_err() {
       kh.drop();
@@ -1374,20 +2116,24 @@ fn map_ssh_url (input: string, allow_binary: bool) -> MappedInput? {
   // Auth.
   var username: string = parts.username.as_string();
   if username == "" {
-    let def_opt: string? = ssh_default_username();
+    let def_opt: std::strings::String? = ssh_default_username();
     if def_opt == None {
       sess.drop();
       stream.close();
       parsed_ssh_url_drop(mut parts);
       return None;
     }
-    username = match (def_opt) { Some(v) => v, None => "" };
+    let mut def: std::strings::String = def_opt ?? std::strings::String.empty();
+    let mut prev: std::strings::String = parts.username;
+    prev.drop();
+    parts.username = move def;
+    username = parts.username.as_string();
   }
 
   var authed: bool = false;
   let password: string = parts.password.as_string();
   if password != "" {
-    let err: std::ssh2::Ssh2Failed? = sess.userauth_password(username, password);
+    let err: std::ssh2::SSH2Failed? = sess.userauth_password(username, password);
     if err == None {
       authed = true;
     }
@@ -1396,7 +2142,33 @@ fn map_ssh_url (input: string, allow_binary: bool) -> MappedInput? {
     authed = ssh_agent_auth(&sess, username);
   }
   if !authed {
-    authed = ssh_keyfile_auth(&sess, username);
+    authed = ssh_keyfile_auth(&sess, username, host_s);
+  }
+  if !authed {
+    let mut prompt: std::strings::String = std::strings::String.empty();
+    if prompt.push_string("sage: ssh password for ") != None { prompt.drop(); }
+    else if prompt.push_string(username) != None { prompt.drop(); }
+    else if prompt.push_u8(64) != None { prompt.drop(); }
+    else if prompt.push_string(host_s) != None { prompt.drop(); }
+    else if prompt.push_string(": ") != None { prompt.drop(); }
+    else {
+      let pass_opt: std::strings::String? = tty_prompt_secret(prompt.as_string());
+      prompt.drop();
+      if pass_opt != None {
+        let mut pass: std::strings::String = pass_opt ?? std::strings::String.empty();
+        if pass.len > 0 {
+          let err3: std::ssh2::SSH2Failed? = sess.userauth_password(username, pass.as_string());
+          if err3 == None {
+            pass.drop();
+            authed = true;
+          } else {
+            pass.drop();
+          }
+        } else {
+          pass.drop();
+        }
+      }
+    }
   }
   if !authed {
     sess.drop();
@@ -1498,6 +2270,17 @@ fn map_ssh_url_via_ssh_cmd (input: string, allow_binary: bool) -> MappedInput? {
     return None;
   }
 
+  // Fill default username for consistency with the native SSH path.
+  if parts.username.len == 0 {
+    let def_opt: std::strings::String? = ssh_default_username();
+    if def_opt != None {
+      let mut def: std::strings::String = def_opt ?? std::strings::String.empty();
+      let mut prev: std::strings::String = parts.username;
+      prev.drop();
+      parts.username = move def;
+    }
+  }
+
   // Destination: `user@host` (wrap IPv6 literals for OpenSSH: `user@[::1]`).
   let mut dest: std::strings::String = std::strings::String.empty();
   let user_s: string = parts.username.as_string();
@@ -1553,13 +2336,13 @@ fn map_ssh_url_via_ssh_cmd (input: string, allow_binary: bool) -> MappedInput? {
     }
   }
 
-  // Identity file hints (keep paths alive until after `cmd.output()` since
+  // Identity file hints (keep paths alive until after `cmd.spawn()` since
   // `std::process::Command` stores string pointers, not copies).
   var id_paths: std::strings::String[4] = [
-  std::strings::String.empty(),
-  std::strings::String.empty(),
-  std::strings::String.empty(),
-  std::strings::String.empty(),
+    std::strings::String.empty(),
+    std::strings::String.empty(),
+    std::strings::String.empty(),
+    std::strings::String.empty(),
   ];
   var id_len: i64 = 0;
   let home_opt: string? = std::env::home_dir();
@@ -1587,15 +2370,15 @@ fn map_ssh_url_via_ssh_cmd (input: string, allow_binary: bool) -> MappedInput? {
   }
 
   let mut cmd: std::process::Command = std::process::Command.init("ssh");
-  cmd.stdin(std::process::Stdio::Null);
+  cmd.stdin(std::process::Stdio::Inherit);
+  cmd.stdout(std::process::Stdio::Pipe);
+  cmd.stderr(std::process::Stdio::Inherit);
 
   if cmd.arg("-q") != None { port_s.drop(); cmd_s.drop(); dest.drop(); if has_kh_opt { kh_opt.drop(); } parsed_ssh_url_drop(mut parts); return None; }
   if cmd.arg("-T") != None { port_s.drop(); cmd_s.drop(); dest.drop(); if has_kh_opt { kh_opt.drop(); } parsed_ssh_url_drop(mut parts); return None; }
   if cmd.arg("-p") != None { port_s.drop(); cmd_s.drop(); dest.drop(); if has_kh_opt { kh_opt.drop(); } parsed_ssh_url_drop(mut parts); return None; }
   if cmd.arg(port_s.as_string()) != None { port_s.drop(); cmd_s.drop(); dest.drop(); if has_kh_opt { kh_opt.drop(); } parsed_ssh_url_drop(mut parts); return None; }
 
-  if cmd.arg("-o") != None { port_s.drop(); cmd_s.drop(); dest.drop(); if has_kh_opt { kh_opt.drop(); } parsed_ssh_url_drop(mut parts); return None; }
-  if cmd.arg("BatchMode=yes") != None { port_s.drop(); cmd_s.drop(); dest.drop(); if has_kh_opt { kh_opt.drop(); } parsed_ssh_url_drop(mut parts); return None; }
   if cmd.arg("-o") != None { port_s.drop(); cmd_s.drop(); dest.drop(); if has_kh_opt { kh_opt.drop(); } parsed_ssh_url_drop(mut parts); return None; }
   if cmd.arg("LogLevel=ERROR") != None { port_s.drop(); cmd_s.drop(); dest.drop(); if has_kh_opt { kh_opt.drop(); } parsed_ssh_url_drop(mut parts); return None; }
   if cmd.arg("-o") != None { port_s.drop(); cmd_s.drop(); dest.drop(); if has_kh_opt { kh_opt.drop(); } parsed_ssh_url_drop(mut parts); return None; }
@@ -1626,7 +2409,7 @@ fn map_ssh_url_via_ssh_cmd (input: string, allow_binary: bool) -> MappedInput? {
   if cmd.arg(dest.as_string()) != None { port_s.drop(); cmd_s.drop(); dest.drop(); if has_kh_opt { kh_opt.drop(); } parsed_ssh_url_drop(mut parts); return None; }
   if cmd.arg(cmd_s.as_string()) != None { port_s.drop(); cmd_s.drop(); dest.drop(); if has_kh_opt { kh_opt.drop(); } parsed_ssh_url_drop(mut parts); return None; }
 
-  let out_r: std::process::OutputResult = cmd.output();
+  let child_r: std::process::ChildResult = cmd.spawn();
 
   port_s.drop();
   cmd_s.drop();
@@ -1641,17 +2424,37 @@ fn map_ssh_url_via_ssh_cmd (input: string, allow_binary: bool) -> MappedInput? {
   }
   parsed_ssh_url_drop(mut parts);
 
-  if out_r.is_err() { return None; }
-  let mut out: std::process::Output = match (out_r) { Ok(v) => v, Err(_) => std::process::Output{ status: std::process::ExitStatus{ bits: 0 }, stdout: std::strings::String.empty(), stderr: std::strings::String.empty() } };
-  if !out.status.success() {
-    out.stdout.drop();
-    out.stderr.drop();
+  if child_r.is_err() {
+    return None;
+  }
+  let mut child: std::process::Child = match (child_r) { Ok(v) => v, Err(_) => std::process::Child.invalid() };
+
+  let stdout_fd: int = child.take_stdout() ?? -1;
+  if stdout_fd < 0 {
+    child.wait();
     return None;
   }
 
-  let mapped_opt: MappedFile? = spool_bytes_to_tmp_map(out.stdout.as_string(), allow_binary);
-  out.stdout.drop();
-  out.stderr.drop();
+  let mapped_opt: MappedFile? = spool_fd_to_tmp_map(stdout_fd, allow_binary);
+  let _ = std::runtime::posix::fs::close(stdout_fd);
+
+  let status_r: std::process::WaitResult = child.wait();
+  if status_r.is_err() {
+    if mapped_opt != None {
+      let mut mf: MappedFile = match (mapped_opt) { Some(v) => v, None => MappedFile{ ptr: 0, len: 0 } };
+      mf.drop();
+    }
+    return None;
+  }
+  let status: std::process::ExitStatus = match (status_r) { Ok(v) => v, Err(_) => std::process::ExitStatus{ bits: 0 } };
+  if !status.success() {
+    if mapped_opt != None {
+      let mut mf2: MappedFile = match (mapped_opt) { Some(v) => v, None => MappedFile{ ptr: 0, len: 0 } };
+      mf2.drop();
+    }
+    return None;
+  }
+
   if mapped_opt == None {
     return None;
   }
@@ -1666,6 +2469,9 @@ export fn map_url (input: string, allow_binary: bool) -> MappedInput? {
       return native_opt;
     }
     return map_ssh_url_via_ssh_cmd(input, allow_binary);
+  }
+  if has_prefix_case_insensitive(input, "git://") {
+    return map_git_url(input, allow_binary);
   }
 
   let cur_r: std::strings::StringResult = std::strings::String.from_string(input);
@@ -1710,13 +2516,13 @@ export fn map_url (input: string, allow_binary: bool) -> MappedInput? {
     let addr: std::net::SocketAddrV4 = std::net::SocketAddrV4.from_ipv4_value(ip_value, parts.port);
 
     if parts.scheme == SCHEME_HTTP {
-      let stream_r: std::net::TcpStreamResult = std::net::TcpStream.connect(addr);
+      let stream_r: std::net::TCPStreamResult = std::net::TCPStream.connect(addr);
       if stream_r.is_err() {
         parsed_url_drop(mut parts);
         cur.drop();
         return None;
       }
-      let stream: std::net::TcpStream = match (stream_r) { Ok(v) => v, Err(_) => std::net::TcpStream.invalid() };
+      let stream: std::net::TCPStream = match (stream_r) { Ok(v) => v, Err(_) => std::net::TCPStream.invalid() };
       let mut conn: std::http::Connection = std::http::Connection.from_stream(stream);
 
       let ok_w: bool = http_write_request_http10_tcp(&conn.stream, parts.target.as_string(), parts.host_header.as_string());
@@ -1798,7 +2604,7 @@ export fn map_url (input: string, allow_binary: bool) -> MappedInput? {
       let mut conn2: std::https::Connection = match (conn_r2) {
         Ok(v) => v,
         Err(_) => std::https::Connection{
-          stream: std::net::TcpStream.invalid(),
+          stream: std::net::TCPStream.invalid(),
           session: std::tls::Session.invalid(),
           closed: true,
           max_header_bytes: std::http::DEFAULT_MAX_HEADER_BYTES,

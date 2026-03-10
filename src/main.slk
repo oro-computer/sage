@@ -3,6 +3,7 @@ package sage;
 import { Args } from "std/args";
 import std::runtime::mem;
 import std::runtime::env;
+import std::runtime::fs;
 import std::runtime::posix::fs;
 import std::runtime::io;
 import std::runtime::posix::io;
@@ -101,6 +102,7 @@ struct IndexState {
 
 struct TabState {
   path: string,
+  stdin_spool_path: string?,
   top_off: i64,
   gutter_on: bool,
   syntax_override: string?,
@@ -430,6 +432,10 @@ let ALERT_BAD_SYNTAX: int = 15;
 
 let COPY_MAX_BYTES: i64 = 200000;
 let SYN_STATE_LOOKBACK_BYTES: i64 = 65536;
+let DIFF_CTX_LOOKBACK_BYTES: i64 = 262144;
+let DIFF_CTX_SEARCH_BACK_BYTES: i64 = 4194304;
+let DIFF_MAX_FILE_TABS: i64 = 256;
+let DIFF_PATH_RESOLVE_MAX_UP: i64 = 8;
 let DOUBLE_CLICK_NS: i64 = 350000000; // 350ms
 let WORD_QUERY_MAX: i64 = 256;
 let FIRST_LINE_MAX: i64 = 1024;
@@ -920,7 +926,7 @@ fn tabs_push_owned (mut tabs: &Tabs, path_owned: string) -> bool {
   if !tabs_ensure_cap(mut tabs, 1) {
     return false;
   }
-  (tabs.ptr as TabState[](tabs.cap as int))[tabs.len] = TabState{ path: path_owned, top_off: 0, gutter_on: false, syntax_override: None };
+  (tabs.ptr as TabState[](tabs.cap as int))[tabs.len] = TabState{ path: path_owned, stdin_spool_path: None, top_off: 0, gutter_on: false, syntax_override: None };
   tabs.len = tabs.len + 1;
   return true;
 }
@@ -1125,6 +1131,11 @@ fn tabs_free (mut tabs: &Tabs) -> void {
       let p: u64 = std::runtime::mem::string_ptr(t.path);
       if p != 0 {
         std::runtime::mem::free(p);
+      }
+      if t.stdin_spool_path != None {
+        let sp: string = match (t.stdin_spool_path) { Some(v) => v, None => "" };
+        let _ = std::runtime::posix::fs::unlink(sp);
+        free_joined(sp);
       }
       if t.syntax_override != None {
         let s: string = match (t.syntax_override) { Some(v) => v, None => "" };
@@ -1484,10 +1495,10 @@ fn write_i64_dec (fd: int, n: i64) -> void {
   }
 
   let mut digits: u8[32] = [
-  0, 0, 0, 0, 0, 0, 0, 0,
-  0, 0, 0, 0, 0, 0, 0, 0,
-  0, 0, 0, 0, 0, 0, 0, 0,
-  0, 0, 0, 0, 0, 0, 0, 0
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0
   ];
   var dn: i64 = 0;
   while x != 0 && dn < 32 {
@@ -2684,6 +2695,1131 @@ fn csi_sgr_len (ptr: u64, rem: i64) -> i64 {
   return 0;
 }
 
+fn buffer_has_csi_sgr (ptr: u64, len: i64) -> bool {
+  if ptr == 0 || len <= 0 {
+    return false;
+  }
+  let scan: i64 = min_i64(len, 8192);
+  var i: i64 = 0;
+  while i < scan {
+    if std::runtime::mem::load_u8(ptr, i) == 27 { // ESC
+      let rem: i64 = scan - i;
+      if csi_sgr_len(ptr + (i as u64), rem) > 0 {
+        return true;
+      }
+    }
+    i = i + 1;
+  }
+  return false;
+}
+
+fn tab_may_use_syntax (path: string, allow_ansi: bool, file_ptr: u64, file_len: i64, has_override: bool) -> bool {
+  if has_override {
+    return true;
+  }
+  if path != "-" {
+    return true;
+  }
+  // For stdin, preserve existing ANSI output behavior (man pages, `git diff --color=always`, etc):
+  // if the stream contains SGR sequences and `--ansi` is enabled, don't apply syntax highlighting.
+  if allow_ansi && buffer_has_csi_sgr(file_ptr, file_len) {
+    return false;
+  }
+  return true;
+}
+
+fn map_input_for_tab (t: &TabState, allow_binary: bool) -> MappedInput? {
+  if t.path != "-" {
+    return map_input(t.path, allow_binary);
+  }
+  if t.stdin_spool_path != None {
+    let p: string = match (t.stdin_spool_path) { Some(v) => v, None => "" };
+    return map_input(p, allow_binary);
+  }
+  return map_input("-", allow_binary);
+}
+
+fn gutter_default_for_path (cfg: &Config, path: string) -> bool {
+  if cfg.gutter == GUTTER_ALWAYS {
+    return true;
+  }
+  if cfg.gutter == GUTTER_NEVER {
+    return false;
+  }
+  if path != "-" {
+    return has_syntax_for_path(path_for_syntax(path));
+  }
+  return false;
+}
+
+fn tab_ensure_stdin_spool_path (mut t: &TabState, data_ptr: u64, data_len: i64) -> bool {
+  if t.path != "-" {
+    return true;
+  }
+  if t.stdin_spool_path != None {
+    return true;
+  }
+  if data_ptr == 0 || data_len < 0 {
+    return false;
+  }
+
+  let tmpl_r = std::strings::String.from_string("/tmp/sage-stdin-XXXXXX");
+  if tmpl_r.is_err() {
+    return false;
+  }
+  let mut tmpl: std::strings::String = match (tmpl_r) { Ok(v) => v, Err(_) => std::strings::String.empty() };
+  if tmpl.len <= 0 {
+    return false;
+  }
+
+  let fd_r: std::runtime::fs::IntResult = std::runtime::fs::mkstemp(tmpl.ptr);
+  if fd_r.is_err() {
+    tmpl.drop();
+    return false;
+  }
+  let fd: int = std::runtime::fs::IntResult.ok_value(fd_r) ?? -1;
+  if fd < 0 {
+    tmpl.drop();
+    return false;
+  }
+
+  var off: i64 = 0;
+  while off < data_len {
+    let w: int = std::runtime::posix::fs::write(fd, data_ptr + (off as u64), data_len - off);
+    if w <= 0 {
+      let _ = std::runtime::posix::fs::close(fd);
+      let tmp_path: string = tmpl.as_string();
+      let _ = std::runtime::posix::fs::unlink(tmp_path);
+      tmpl.drop();
+      return false;
+    }
+    off = off + (w as i64);
+  }
+  let _ = std::runtime::posix::fs::close(fd);
+
+  let tmp_path2: string = tmpl.as_string();
+  let own_opt: string? = cstr_copy_owned(tmp_path2);
+  if own_opt == None {
+    let _ = std::runtime::posix::fs::unlink(tmp_path2);
+    tmpl.drop();
+    return false;
+  }
+  let own: string = match (own_opt) { Some(v) => v, None => "" };
+  tmpl.drop();
+  t.stdin_spool_path = Some(own);
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// Diff "injection" highlighting: when viewing a unified diff, we syntax-highlight
+// the code inside hunks based on the file paths in the diff headers.
+
+struct DiffCtx {
+  in_hunk: bool,
+  path_a_ptr: u64,
+  path_a_len: i64,
+  path_b_ptr: u64,
+  path_b_len: i64,
+
+  // Current physical line context (for wrapped segments):
+  line_marker: u8,   // '+', '-', ' ' (hunk lines) or other
+  line_is_code: bool // true when inside a hunk and marker is +|-|space
+}
+
+fn diff_ctx_empty () -> DiffCtx {
+  return DiffCtx{
+    in_hunk: false,
+    path_a_ptr: 0,
+    path_a_len: 0,
+    path_b_ptr: 0,
+    path_b_len: 0,
+    line_marker: 0,
+    line_is_code: false,
+  };
+}
+
+struct DiffSynCache {
+  path_ptr: u64,
+  path_len: i64,
+  active: bool,
+  syn: Highlighter,
+}
+
+fn diff_syn_cache_empty () -> DiffSynCache {
+  return DiffSynCache{ path_ptr: 0, path_len: 0, active: false, syn: highlighter_empty() };
+}
+
+fn diff_syn_cache_reset (mut c: &DiffSynCache) -> void {
+  c.path_ptr = 0;
+  c.path_len = 0;
+  c.active = false;
+  c.syn = highlighter_empty();
+}
+
+fn diff_syn_cache_ensure (mut c: &DiffSynCache, path_ptr: u64, path_len: i64) -> void {
+  if path_ptr == 0 || path_len <= 0 {
+    c.path_ptr = 0;
+    c.path_len = 0;
+    c.active = false;
+    return;
+  }
+  if c.path_ptr == path_ptr && c.path_len == path_len {
+    return;
+  }
+
+  let path: string = std::runtime::mem::string_from_ptr_len(path_ptr, path_len as int);
+  let syn_opt: Highlighter? = load_for_path(path);
+  if syn_opt != None {
+    c.syn = match (syn_opt) { Some(v) => v, None => c.syn };
+    c.active = true;
+  } else {
+    c.syn = highlighter_empty();
+    c.active = false;
+  }
+  c.path_ptr = path_ptr;
+  c.path_len = path_len;
+}
+
+fn bytes_has_prefix (ptr: u64, len: i64, prefix: string) -> bool {
+  let p_ptr: u64 = std::runtime::mem::string_ptr(prefix);
+  let p_len: i64 = std::runtime::mem::string_len(prefix);
+  if ptr == 0 || len < p_len || p_ptr == 0 || p_len <= 0 {
+    return false;
+  }
+  var i: i64 = 0;
+  while i < p_len {
+    if std::runtime::mem::load_u8(ptr, i) != std::runtime::mem::load_u8(p_ptr, i) {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+fn bytes_eq (ptr: u64, len: i64, s: string) -> bool {
+  let s_ptr: u64 = std::runtime::mem::string_ptr(s);
+  let s_len: i64 = std::runtime::mem::string_len(s);
+  if ptr == 0 || s_ptr == 0 || len != s_len {
+    return false;
+  }
+  var i: i64 = 0;
+  while i < len {
+    if std::runtime::mem::load_u8(ptr, i) != std::runtime::mem::load_u8(s_ptr, i) {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+fn is_hws (b: u8) -> bool {
+  return b == 32 || b == 9;
+}
+
+fn diff_looks_like (ptr: u64, len: i64) -> bool {
+  if ptr == 0 || len <= 0 {
+    return false;
+  }
+  let scan: i64 = min_i64(len, 8192);
+  var off: i64 = 0;
+  var saw_old: bool = false;
+  var lines: int = 0;
+  while off < scan && lines < 32 {
+    let rem: i64 = scan - off;
+    let nl_ptr: u64 = if rem > 0 { memchr(ptr + (off as u64), 10, rem) } else { 0 };
+    var line_len: i64 = 0;
+    if nl_ptr != 0 {
+      line_len = (nl_ptr - (ptr + (off as u64))) as i64;
+    } else {
+      line_len = rem;
+    }
+    if line_len > 0 && std::runtime::mem::load_u8(ptr + (off as u64), line_len - 1) == 13 {
+      line_len = line_len - 1;
+    }
+
+    if line_len > 0 {
+      let line_ptr: u64 = ptr + (off as u64);
+      if bytes_has_prefix(line_ptr, line_len, "diff --git ") {
+        return true;
+      }
+      if bytes_has_prefix(line_ptr, line_len, "Index: ") {
+        return true;
+      }
+      if bytes_has_prefix(line_ptr, line_len, "--- ") {
+        saw_old = true;
+      } else if saw_old && bytes_has_prefix(line_ptr, line_len, "+++ ") {
+        return true;
+      }
+    }
+
+    if nl_ptr == 0 {
+      break;
+    }
+    off = ((nl_ptr - ptr) as i64) + 1;
+    lines = lines + 1;
+  }
+  return false;
+}
+
+struct DiffToken {
+  ptr: u64,
+  len: i64,
+  next: i64,
+}
+
+fn diff_parse_token (line_ptr: u64, line_len: i64, start: i64) -> DiffToken {
+  var i: i64 = start;
+  while i < line_len && is_hws(std::runtime::mem::load_u8(line_ptr, i)) {
+    i = i + 1;
+  }
+  let s: i64 = i;
+  while i < line_len && !is_hws(std::runtime::mem::load_u8(line_ptr, i)) {
+    i = i + 1;
+  }
+  let n: i64 = i - s;
+  if n <= 0 {
+    return DiffToken{ ptr: 0, len: 0, next: i };
+  }
+  return DiffToken{ ptr: line_ptr + (s as u64), len: n, next: i };
+}
+
+fn diff_path_strip (ptr: u64, len: i64) -> ByteSlice {
+  if ptr == 0 || len <= 0 {
+    return ByteSlice{ ptr: 0, len: 0 };
+  }
+  if bytes_eq(ptr, len, "/dev/null") {
+    return ByteSlice{ ptr: 0, len: 0 };
+  }
+  if len >= 2 {
+    let a0: u8 = std::runtime::mem::load_u8(ptr, 0);
+    let a1: u8 = std::runtime::mem::load_u8(ptr, 1);
+    if (a0 == 97 || a0 == 98) && a1 == 47 { // a/ or b/
+      return ByteSlice{ ptr: ptr + 2, len: len - 2 };
+    }
+  }
+  return ByteSlice{ ptr: ptr, len: len };
+}
+
+fn diff_ctx_process_line_start (line_ptr: u64, line_len: i64, mut ctx: &DiffCtx) -> void {
+  if line_ptr == 0 || line_len <= 0 {
+    return;
+  }
+
+  if bytes_has_prefix(line_ptr, line_len, "diff --git ") {
+    ctx.in_hunk = false;
+    let t1: DiffToken = diff_parse_token(line_ptr, line_len, 11);
+    let t2: DiffToken = diff_parse_token(line_ptr, line_len, t1.next);
+    let a: ByteSlice = diff_path_strip(t1.ptr, t1.len);
+    let b: ByteSlice = diff_path_strip(t2.ptr, t2.len);
+    ctx.path_a_ptr = a.ptr;
+    ctx.path_a_len = a.len;
+    ctx.path_b_ptr = b.ptr;
+    ctx.path_b_len = b.len;
+    return;
+  }
+
+  if bytes_has_prefix(line_ptr, line_len, "--- ") {
+    // File header lines only occur outside hunks; avoid misinterpreting
+    // real code lines like "++ i" / "-- foo" inside hunks as diff headers.
+    if !ctx.in_hunk {
+      ctx.in_hunk = false;
+      let t: DiffToken = diff_parse_token(line_ptr, line_len, 4);
+      let a2: ByteSlice = diff_path_strip(t.ptr, t.len);
+      ctx.path_a_ptr = a2.ptr;
+      ctx.path_a_len = a2.len;
+      return;
+    }
+  }
+
+  if bytes_has_prefix(line_ptr, line_len, "+++ ") {
+    if !ctx.in_hunk {
+      ctx.in_hunk = false;
+      let t3: DiffToken = diff_parse_token(line_ptr, line_len, 4);
+      let b2: ByteSlice = diff_path_strip(t3.ptr, t3.len);
+      ctx.path_b_ptr = b2.ptr;
+      ctx.path_b_len = b2.len;
+      return;
+    }
+  }
+
+  if line_len >= 2 {
+    let b0: u8 = std::runtime::mem::load_u8(line_ptr, 0);
+    let b1: u8 = std::runtime::mem::load_u8(line_ptr, 1);
+    if b0 == 64 && b1 == 64 { // "@@"
+      ctx.in_hunk = true;
+      return;
+    }
+  }
+}
+
+fn diff_ctx_set_line_meta (line_ptr: u64, line_len: i64, mut ctx: &DiffCtx) -> void {
+  if line_ptr == 0 || line_len <= 0 {
+    ctx.line_marker = 0;
+    ctx.line_is_code = false;
+    return;
+  }
+  let m: u8 = std::runtime::mem::load_u8(line_ptr, 0);
+  ctx.line_marker = m;
+  ctx.line_is_code = ctx.in_hunk && (m == 43 || m == 45 || m == 32); // +, -, space
+}
+
+fn diff_prefix_score (prefix: string, paths: &VecU64, slash_only: bool) -> i64? {
+  if paths.ptr == 0 || paths.len <= 0 {
+    return Some(0);
+  }
+
+  let count: i64 = paths.len / 2;
+  var score: i64 = 0;
+  var i: i64 = 0;
+  while i < count {
+    let p_ptr: u64 = paths.get(i * 2);
+    let p_len: i64 = paths.get((i * 2) + 1) as i64;
+    if p_ptr == 0 || p_len <= 0 {
+      i = i + 1;
+      continue;
+    }
+    if slash_only {
+      let slash_ptr: u64 = memchr(p_ptr, 47, p_len); // '/'
+      if slash_ptr == 0 {
+        i = i + 1;
+        continue;
+      }
+    }
+
+    let rel: string = std::runtime::mem::string_from_ptr_len(p_ptr, p_len as int);
+    let cand_opt: string? = join2(prefix, rel);
+    if cand_opt == None {
+      return None;
+    }
+    let cand: string = match (cand_opt) { Some(v) => v, None => "" };
+    let fd: int = std::runtime::posix::fs::open(cand, std::runtime::posix::fs::O_RDONLY, 0) as int;
+    if fd >= 0 {
+      let _ = std::runtime::posix::fs::close(fd);
+      score = score + 1;
+    }
+    free_joined(cand);
+    i = i + 1;
+  }
+
+  return Some(score);
+}
+
+fn diff_choose_base_prefix (diff_ptr: u64, diff_len: i64) -> string? {
+  if diff_ptr == 0 || diff_len <= 0 {
+    return None;
+  }
+
+  // Collect file paths from the diff headers as (ptr,len) pairs. Prefer paths
+  // with a '/' when scoring so monorepos resolve to the correct subdir.
+  let paths_opt: VecU64? = VecU64.init(128);
+  if paths_opt == None {
+    return None;
+  }
+  let mut paths: VecU64 = match (paths_opt) { Some(v) => v, None => VecU64.empty() };
+  var saw_slash: bool = false;
+
+  let mut ctx: DiffCtx = diff_ctx_empty();
+  var pos: i64 = 0;
+  var pushed: i64 = 0;
+  while pos < diff_len && pushed < 64 {
+    let rem: i64 = diff_len - pos;
+    let nl_ptr: u64 = if rem > 0 { memchr(diff_ptr + (pos as u64), 10, rem) } else { 0 };
+    var line_len: i64 = if nl_ptr != 0 { (nl_ptr - (diff_ptr + (pos as u64))) as i64 } else { rem };
+    if line_len > 0 && std::runtime::mem::load_u8(diff_ptr + (pos as u64), line_len - 1) == 13 {
+      line_len = line_len - 1;
+    }
+
+    let line_ptr: u64 = diff_ptr + (pos as u64);
+    let is_git_hdr: bool = bytes_has_prefix(line_ptr, line_len, "diff --git ");
+    let is_unified_new: bool = bytes_has_prefix(line_ptr, line_len, "+++ ");
+
+    diff_ctx_process_line_start(line_ptr, line_len, mut ctx);
+    if is_git_hdr || is_unified_new {
+      var p_ptr: u64 = ctx.path_b_ptr;
+      var p_len: i64 = ctx.path_b_len;
+      if p_ptr == 0 || p_len <= 0 {
+        p_ptr = ctx.path_a_ptr;
+        p_len = ctx.path_a_len;
+      }
+      if p_ptr != 0 && p_len > 0 {
+        let view: string = std::runtime::mem::string_from_ptr_len(p_ptr, p_len as int);
+        if view != "-" && !is_network_path(view) {
+          let e1 = paths.push(p_ptr);
+          if e1 != None { paths.drop(); return None; }
+          let e2 = paths.push(p_len as u64);
+          if e2 != None { paths.drop(); return None; }
+          pushed = pushed + 1;
+          if !saw_slash && memchr(p_ptr, 47, p_len) != 0 {
+            saw_slash = true;
+          }
+        }
+      }
+    }
+
+    if nl_ptr == 0 {
+      break;
+    }
+    pos = ((nl_ptr - diff_ptr) as i64) + 1;
+  }
+
+  if paths.len <= 0 {
+    paths.drop();
+    return None;
+  }
+
+  var best: string? = None;
+  var best_score: i64 = 0;
+
+  var pfx: string = "./";
+  var pfx_owned: bool = false;
+  var up: i64 = 0;
+  while up <= DIFF_PATH_RESOLVE_MAX_UP {
+    let sc0_opt: i64? = diff_prefix_score(pfx, &paths, saw_slash);
+    if sc0_opt == None {
+      if best != None { let b0: string = match (best) { Some(v) => v, None => "" }; free_joined(b0); }
+      if pfx_owned { free_joined(pfx); }
+      paths.drop();
+      return None;
+    }
+    let sc0: i64 = match (sc0_opt) { Some(v) => v, None => 0 };
+    if sc0 > best_score {
+      let cp0_opt: string? = cstr_copy_owned(pfx);
+      if cp0_opt != None {
+        if best != None {
+          let b1: string = match (best) { Some(v) => v, None => "" };
+          free_joined(b1);
+        }
+        best = cp0_opt;
+        best_score = sc0;
+      }
+    }
+
+    let dir: u64 = std::runtime::posix::fs::opendir(pfx);
+    if dir != 0 {
+      var scanned: i64 = 0;
+      while scanned < 256 {
+        let name_cstr: u64 = std::runtime::posix::fs::readdir_name_owned(dir);
+        if name_cstr == 0 {
+          break;
+        }
+        let name_len: i64 = cstr_len_max(name_cstr, 4096);
+        let name: string = std::runtime::mem::string_from_ptr_len(name_cstr, name_len as int);
+        if name == "." || name == ".." {
+          std::runtime::mem::free(name_cstr);
+          continue;
+        }
+
+        let base_opt: string? = join2(pfx, name);
+        std::runtime::mem::free(name_cstr);
+        if base_opt == None {
+          let _ = std::runtime::posix::fs::closedir(dir);
+          if best != None { let b2: string = match (best) { Some(v) => v, None => "" }; free_joined(b2); }
+          if pfx_owned { free_joined(pfx); }
+          paths.drop();
+          return None;
+        }
+        let base: string = match (base_opt) { Some(v) => v, None => "" };
+        let dirp_opt: string? = join2(base, "/");
+        free_joined(base);
+        if dirp_opt == None {
+          let _ = std::runtime::posix::fs::closedir(dir);
+          if best != None { let b3: string = match (best) { Some(v) => v, None => "" }; free_joined(b3); }
+          if pfx_owned { free_joined(pfx); }
+          paths.drop();
+          return None;
+        }
+        let dirp: string = match (dirp_opt) { Some(v) => v, None => "" };
+
+        let sc1_opt: i64? = diff_prefix_score(dirp, &paths, saw_slash);
+        if sc1_opt == None {
+          free_joined(dirp);
+          let _ = std::runtime::posix::fs::closedir(dir);
+          if best != None { let b4: string = match (best) { Some(v) => v, None => "" }; free_joined(b4); }
+          if pfx_owned { free_joined(pfx); }
+          paths.drop();
+          return None;
+        }
+        let sc1: i64 = match (sc1_opt) { Some(v) => v, None => 0 };
+        if sc1 > best_score {
+          let cp1_opt: string? = cstr_copy_owned(dirp);
+          if cp1_opt != None {
+            if best != None {
+              let b5: string = match (best) { Some(v) => v, None => "" };
+              free_joined(b5);
+            }
+            best = cp1_opt;
+            best_score = sc1;
+          }
+        }
+        free_joined(dirp);
+        scanned = scanned + 1;
+      }
+      let _ = std::runtime::posix::fs::closedir(dir);
+    }
+
+    if up == DIFF_PATH_RESOLVE_MAX_UP {
+      break;
+    }
+    let next_opt: string? = join2(pfx, "../");
+    if next_opt == None {
+      if best != None { let b6: string = match (best) { Some(v) => v, None => "" }; free_joined(b6); }
+      if pfx_owned { free_joined(pfx); }
+      paths.drop();
+      return None;
+    }
+    let next: string = match (next_opt) { Some(v) => v, None => "" };
+    if pfx_owned { free_joined(pfx); }
+    pfx = next;
+    pfx_owned = true;
+    up = up + 1;
+  }
+
+  if pfx_owned { free_joined(pfx); }
+  paths.drop();
+
+  if best_score <= 0 {
+    if best != None {
+      let b7: string = match (best) { Some(v) => v, None => "" };
+      free_joined(b7);
+    }
+    return None;
+  }
+  return best;
+}
+
+fn diff_add_file_tabs (cfg: &Config, mut tabs: &Tabs, diff_ptr: u64, diff_len: i64) -> bool {
+  if diff_ptr == 0 || diff_len <= 0 {
+    return true;
+  }
+  if tabs.ptr == 0 {
+    return false;
+  }
+
+  let mut ctx: DiffCtx = diff_ctx_empty();
+  var pos: i64 = 0;
+  var added: i64 = 0;
+  var base_prefix: string? = diff_choose_base_prefix(diff_ptr, diff_len);
+
+  while pos < diff_len && added < DIFF_MAX_FILE_TABS {
+    let rem: i64 = diff_len - pos;
+    let nl_ptr: u64 = if rem > 0 { memchr(diff_ptr + (pos as u64), 10, rem) } else { 0 };
+    var line_len: i64 = if nl_ptr != 0 { (nl_ptr - (diff_ptr + (pos as u64))) as i64 } else { rem };
+
+    // Trim CR in CRLF.
+    if line_len > 0 && std::runtime::mem::load_u8(diff_ptr + (pos as u64), line_len - 1) == 13 {
+      line_len = line_len - 1;
+    }
+
+    let line_ptr: u64 = diff_ptr + (pos as u64);
+    let is_git_hdr: bool = bytes_has_prefix(line_ptr, line_len, "diff --git ");
+    let is_unified_new: bool = bytes_has_prefix(line_ptr, line_len, "+++ ");
+
+    diff_ctx_process_line_start(line_ptr, line_len, mut ctx);
+
+    if is_git_hdr || is_unified_new {
+      var p_ptr: u64 = ctx.path_b_ptr;
+      var p_len: i64 = ctx.path_b_len;
+      if p_ptr == 0 || p_len <= 0 {
+        p_ptr = ctx.path_a_ptr;
+        p_len = ctx.path_a_len;
+      }
+
+      if p_ptr != 0 && p_len > 0 {
+        let view: string = std::runtime::mem::string_from_ptr_len(p_ptr, p_len as int);
+        let own_opt: string? = cstr_copy_owned(view);
+        if own_opt == None {
+          if base_prefix != None {
+            let bp0: string = match (base_prefix) { Some(v) => v, None => "" };
+            free_joined(bp0);
+            base_prefix = None;
+          }
+          return false;
+        }
+        var own: string = match (own_opt) { Some(v) => v, None => "" };
+
+        // Skip missing local paths (deleted files, patches applied elsewhere).
+        var ok_path: bool = true;
+        if own != "-" && !is_network_path(own) {
+          ok_path = false;
+
+          // First try a cached repo/subdir prefix discovered from earlier files.
+          if base_prefix != None {
+            let bp: string = match (base_prefix) { Some(v) => v, None => "" };
+            let cand_opt: string? = join2(bp, own);
+            if cand_opt == None {
+              free_joined(own);
+              free_joined(bp);
+              base_prefix = None;
+              return false;
+            }
+            let cand: string = match (cand_opt) { Some(v) => v, None => "" };
+            let fd0: int = std::runtime::posix::fs::open(cand, std::runtime::posix::fs::O_RDONLY, 0) as int;
+            if fd0 >= 0 {
+              let _ = std::runtime::posix::fs::close(fd0);
+              ok_path = true;
+              free_joined(own);
+              own = cand;
+            } else {
+              free_joined(cand);
+            }
+          }
+
+          // Try as-is (relative to cwd).
+          if !ok_path {
+            let fd1: int = std::runtime::posix::fs::open(own, std::runtime::posix::fs::O_RDONLY, 0) as int;
+            if fd1 >= 0 {
+              let _ = std::runtime::posix::fs::close(fd1);
+              ok_path = true;
+            }
+          }
+
+          // For relative paths, try resolving by walking up parent directories.
+          let op: u64 = std::runtime::mem::string_ptr(own);
+          let on: i64 = std::runtime::mem::string_len(own);
+          let is_abs: bool = op != 0 && on > 0 && std::runtime::mem::load_u8(op, 0) == 47; // '/'
+          if !ok_path && !is_abs {
+            var prefix: string = "../";
+            var prefix_owned: bool = false;
+            var up: i64 = 0;
+            while up < DIFF_PATH_RESOLVE_MAX_UP {
+              let cand_opt2: string? = join2(prefix, own);
+              if cand_opt2 == None {
+                if prefix_owned { free_joined(prefix); }
+                free_joined(own);
+                if base_prefix != None {
+                  let bp2: string = match (base_prefix) { Some(v) => v, None => "" };
+                  free_joined(bp2);
+                  base_prefix = None;
+                }
+                return false;
+              }
+              let cand2: string = match (cand_opt2) { Some(v) => v, None => "" };
+              let fd2: int = std::runtime::posix::fs::open(cand2, std::runtime::posix::fs::O_RDONLY, 0) as int;
+              if fd2 >= 0 {
+                let _ = std::runtime::posix::fs::close(fd2);
+                ok_path = true;
+                free_joined(own);
+                own = cand2;
+                break;
+              }
+              free_joined(cand2);
+
+              let next_opt: string? = join2(prefix, "../");
+              if next_opt == None {
+                if prefix_owned { free_joined(prefix); }
+                free_joined(own);
+                if base_prefix != None {
+                  let bp3: string = match (base_prefix) { Some(v) => v, None => "" };
+                  free_joined(bp3);
+                  base_prefix = None;
+                }
+                return false;
+              }
+              let next: string = match (next_opt) { Some(v) => v, None => "" };
+              if prefix_owned { free_joined(prefix); }
+              prefix = next;
+              prefix_owned = true;
+              up = up + 1;
+            }
+            if prefix_owned { free_joined(prefix); }
+          }
+
+          // Final fallback: search for the file within immediate child directories
+          // of this directory and its parents (useful for monorepos).
+          if !ok_path && !is_abs {
+            var pfx2: string = "./";
+            var pfx2_owned: bool = false;
+            var up2: i64 = 0;
+            while up2 <= DIFF_PATH_RESOLVE_MAX_UP {
+              let dir: u64 = std::runtime::posix::fs::opendir(pfx2);
+              if dir != 0 {
+                var scanned: i64 = 0;
+                while scanned < 512 {
+                  let name_cstr: u64 = std::runtime::posix::fs::readdir_name_owned(dir);
+                  if name_cstr == 0 {
+                    break;
+                  }
+                  let name_len: i64 = cstr_len_max(name_cstr, 4096);
+                  let name: string = std::runtime::mem::string_from_ptr_len(name_cstr, name_len as int);
+                  if name == "." || name == ".." {
+                    std::runtime::mem::free(name_cstr);
+                    continue;
+                  }
+
+                  let base_opt: string? = join2(pfx2, name);
+                  std::runtime::mem::free(name_cstr);
+                  if base_opt == None {
+                    let _ = std::runtime::posix::fs::closedir(dir);
+                    if pfx2_owned { free_joined(pfx2); }
+                    free_joined(own);
+                    if base_prefix != None {
+                      let bp4: string = match (base_prefix) { Some(v) => v, None => "" };
+                      free_joined(bp4);
+                      base_prefix = None;
+                    }
+                    return false;
+                  }
+                  let base: string = match (base_opt) { Some(v) => v, None => "" };
+
+                  let dirp_opt: string? = join2(base, "/");
+                  free_joined(base);
+                  if dirp_opt == None {
+                    let _ = std::runtime::posix::fs::closedir(dir);
+                    if pfx2_owned { free_joined(pfx2); }
+                    free_joined(own);
+                    if base_prefix != None {
+                      let bp5: string = match (base_prefix) { Some(v) => v, None => "" };
+                      free_joined(bp5);
+                      base_prefix = None;
+                    }
+                    return false;
+                  }
+                  let dirp: string = match (dirp_opt) { Some(v) => v, None => "" };
+
+                  let cand_opt3: string? = join2(dirp, own);
+                  if cand_opt3 == None {
+                    free_joined(dirp);
+                    let _ = std::runtime::posix::fs::closedir(dir);
+                    if pfx2_owned { free_joined(pfx2); }
+                    free_joined(own);
+                    if base_prefix != None {
+                      let bp6: string = match (base_prefix) { Some(v) => v, None => "" };
+                      free_joined(bp6);
+                      base_prefix = None;
+                    }
+                    return false;
+                  }
+                  let cand3: string = match (cand_opt3) { Some(v) => v, None => "" };
+
+                  let fd3: int = std::runtime::posix::fs::open(cand3, std::runtime::posix::fs::O_RDONLY, 0) as int;
+                  if fd3 >= 0 {
+                    let _ = std::runtime::posix::fs::close(fd3);
+                    ok_path = true;
+                    free_joined(own);
+                    own = cand3;
+                    free_joined(dirp);
+                    break;
+                  }
+                  free_joined(cand3);
+                  free_joined(dirp);
+                  scanned = scanned + 1;
+                }
+                let _ = std::runtime::posix::fs::closedir(dir);
+              }
+
+              if ok_path {
+                break;
+              }
+              if up2 == DIFF_PATH_RESOLVE_MAX_UP {
+                break;
+              }
+              let next2_opt: string? = join2(pfx2, "../");
+              if next2_opt == None {
+                if pfx2_owned { free_joined(pfx2); }
+                free_joined(own);
+                if base_prefix != None {
+                  let bp7: string = match (base_prefix) { Some(v) => v, None => "" };
+                  free_joined(bp7);
+                  base_prefix = None;
+                }
+                return false;
+              }
+              let next2: string = match (next2_opt) { Some(v) => v, None => "" };
+              if pfx2_owned { free_joined(pfx2); }
+              pfx2 = next2;
+              pfx2_owned = true;
+              up2 = up2 + 1;
+            }
+            if pfx2_owned { free_joined(pfx2); }
+          }
+        }
+
+        if ok_path {
+          let idx: i64 = tabs.len;
+          let rc: int = tabs_push_owned_unique(mut tabs, own);
+          if rc < 0 {
+            free_joined(own);
+            if base_prefix != None {
+              let bp8: string = match (base_prefix) { Some(v) => v, None => "" };
+              free_joined(bp8);
+              base_prefix = None;
+            }
+            return false;
+          }
+          if rc == 1 {
+            let mut tnew: TabState = (tabs.ptr as TabState[](tabs.cap as int))[idx];
+            tnew.gutter_on = gutter_default_for_path(cfg, tnew.path);
+            (tabs.ptr as TabState[](tabs.cap as int))[idx] = tnew;
+            added = added + 1;
+          }
+        } else {
+          free_joined(own);
+        }
+      }
+    }
+
+    if nl_ptr == 0 {
+      break;
+    }
+    pos = ((nl_ptr - diff_ptr) as i64) + 1;
+  }
+
+  if base_prefix != None {
+    let bp9: string = match (base_prefix) { Some(v) => v, None => "" };
+    free_joined(bp9);
+    base_prefix = None;
+  }
+  return true;
+}
+
+fn diff_find_section_start (file_ptr: u64, file_len: i64, target_off: i64) -> i64 {
+  if file_ptr == 0 || file_len <= 0 {
+    return 0;
+  }
+  var cur: i64 = clamp_i64(target_off, 0, file_len);
+  var min_off: i64 = cur - DIFF_CTX_SEARCH_BACK_BYTES;
+  if min_off < 0 { min_off = 0; }
+
+  // If we're mid-line, start from the beginning of this line.
+  if cur > 0 && std::runtime::mem::load_u8(file_ptr, cur - 1) != 10 {
+    let nl_ptr0: u64 = memrchr(file_ptr + (min_off as u64), 10, cur - min_off);
+    if nl_ptr0 != 0 {
+      cur = ((nl_ptr0 - file_ptr) as i64) + 1;
+    } else {
+      cur = min_off;
+    }
+  }
+
+  var scan_end: i64 = cur;
+  var fallback_old: i64 = -1;
+  while scan_end > min_off {
+    // Determine the start of the current candidate line.
+    let nl_ptr: u64 = memrchr(file_ptr + (min_off as u64), 10, scan_end - min_off);
+    let line_start: i64 = if nl_ptr != 0 { ((nl_ptr - file_ptr) as i64) + 1 } else { min_off };
+
+    let rem: i64 = file_len - line_start;
+    if rem >= 11 && bytes_has_prefix(file_ptr + (line_start as u64), rem, "diff --git ") {
+      return line_start;
+    }
+    if fallback_old < 0 && rem >= 4 && bytes_has_prefix(file_ptr + (line_start as u64), rem, "--- ") {
+      // Unified diffs may lack "diff --git". Keep the nearest "---" as a
+      // fallback, but prefer git-style headers when available.
+      fallback_old = line_start;
+    }
+
+    if line_start <= min_off {
+      break;
+    }
+    scan_end = line_start - 1;
+  }
+
+  if fallback_old >= 0 {
+    return fallback_old;
+  }
+  return 0;
+}
+
+fn diff_ctx_scan_from_line_start (file_ptr: u64, file_len: i64, start_off: i64, target_off: i64, mut ctx: &DiffCtx) -> void {
+  if file_ptr == 0 || file_len <= 0 {
+    return;
+  }
+
+  var pos: i64 = clamp_i64(start_off, 0, file_len);
+  let target: i64 = clamp_i64(target_off, 0, file_len);
+
+  while pos < file_len && pos <= target {
+    // Determine whether there's a newline before the target offset.
+    let to_target: i64 = target - pos;
+    let search_len: i64 = min_i64(file_len - pos, to_target);
+    let nl_ptr: u64 = if search_len > 0 { memchr(file_ptr + (pos as u64), 10, search_len) } else { 0 };
+
+    // Grab a bounded slice of the line for header parsing.
+    let cap: i64 = min_i64(file_len - pos, 8192);
+    let nl2_ptr: u64 = if cap > 0 { memchr(file_ptr + (pos as u64), 10, cap) } else { 0 };
+    var line_len: i64 = if nl2_ptr != 0 { (nl2_ptr - (file_ptr + (pos as u64))) as i64 } else { cap };
+    if line_len > 0 && std::runtime::mem::load_u8(file_ptr + (pos as u64), line_len - 1) == 13 {
+      line_len = line_len - 1;
+    }
+
+    let line_ptr: u64 = file_ptr + (pos as u64);
+    diff_ctx_process_line_start(line_ptr, line_len, mut ctx);
+
+    if nl_ptr == 0 {
+      // Target offset is within this line.
+      diff_ctx_set_line_meta(line_ptr, line_len, mut ctx);
+      return;
+    }
+
+    // Advance to the next line start.
+    let nl_off: i64 = (nl_ptr - file_ptr) as i64;
+    pos = nl_off + 1;
+  }
+
+  ctx.line_marker = 0;
+  ctx.line_is_code = false;
+}
+
+fn diff_ctx_align (file_ptr: u64, file_len: i64, target_off: i64, mut ctx: &DiffCtx) -> void {
+  ctx.in_hunk = false;
+  ctx.path_a_ptr = 0;
+  ctx.path_a_len = 0;
+  ctx.path_b_ptr = 0;
+  ctx.path_b_len = 0;
+  ctx.line_marker = 0;
+  ctx.line_is_code = false;
+
+  let start: i64 = diff_find_section_start(file_ptr, file_len, target_off);
+  diff_ctx_scan_from_line_start(file_ptr, file_len, start, target_off, mut ctx);
+}
+
+fn diff_ctx_advance (file_ptr: u64, file_len: i64, from_off: i64, to_off: i64, mut ctx: &DiffCtx) -> void {
+  if file_ptr == 0 || file_len <= 0 {
+    return;
+  }
+  let from0: i64 = clamp_i64(from_off, 0, file_len);
+  let to0: i64 = clamp_i64(to_off, 0, file_len);
+  if to0 <= from0 {
+    return;
+  }
+
+  // If `to` is still within the same physical line, nothing to do.
+  let nl_ptr0: u64 = memchr(file_ptr + (from0 as u64), 10, to0 - from0);
+  if nl_ptr0 == 0 {
+    return;
+  }
+
+  // Start scanning at the next physical line.
+  let next_line: i64 = ((nl_ptr0 - file_ptr) as i64) + 1;
+  diff_ctx_scan_from_line_start(file_ptr, file_len, next_line, to_off, mut ctx);
+}
+
+fn diff_ctx_on_physical_line_start (file_ptr: u64, file_len: i64, line_off: i64, mut ctx: &DiffCtx) -> void {
+  if file_ptr == 0 || file_len <= 0 {
+    return;
+  }
+  if line_off < 0 || line_off >= file_len {
+    ctx.line_marker = 0;
+    ctx.line_is_code = false;
+    return;
+  }
+
+  let cap: i64 = min_i64(file_len - line_off, 8192);
+  let nl_ptr: u64 = if cap > 0 { memchr(file_ptr + (line_off as u64), 10, cap) } else { 0 };
+  var line_len: i64 = if nl_ptr != 0 { (nl_ptr - (file_ptr + (line_off as u64))) as i64 } else { cap };
+  if line_len > 0 && std::runtime::mem::load_u8(file_ptr + (line_off as u64), line_len - 1) == 13 {
+    line_len = line_len - 1;
+  }
+
+  let line_ptr: u64 = file_ptr + (line_off as u64);
+  diff_ctx_process_line_start(line_ptr, line_len, mut ctx);
+  diff_ctx_set_line_meta(line_ptr, line_len, mut ctx);
+}
+
+struct StyleScratch {
+  ptr: u64,
+  cap: i64,
+}
+
+fn style_scratch_empty () -> StyleScratch {
+  return StyleScratch{ ptr: 0, cap: 0 };
+}
+
+fn ensure_style_scratch (mut sc: &StyleScratch, need: i64) -> bool {
+  if need <= 0 {
+    return true;
+  }
+  if sc.ptr != 0 && sc.cap >= need {
+    return true;
+  }
+  if sc.ptr != 0 {
+    std::runtime::mem::free(sc.ptr);
+    sc.ptr = 0;
+    sc.cap = 0;
+  }
+  var new_cap: i64 = need;
+  if new_cap < 8192 { new_cap = 8192; }
+  let p: u64 = std::runtime::mem::alloc(new_cap);
+  if p == 0 {
+    return false;
+  }
+  sc.ptr = p;
+  sc.cap = new_cap;
+  return true;
+}
+
+fn diff_inject_overlay (
+  ctx: &DiffCtx,
+  line_ptr: u64,
+  line_len: i64,
+  is_line_start: bool,
+  styles: u64,
+  mut scratch: &StyleScratch,
+  mut syn_a: &DiffSynCache,
+  mut syn_b: &DiffSynCache
+) -> void {
+  if styles == 0 || line_ptr == 0 || line_len <= 0 {
+    return;
+  }
+  if !ctx.line_is_code {
+    return;
+  }
+
+  // Ensure caches for the current file paths are loaded.
+  diff_syn_cache_ensure(mut syn_a, ctx.path_a_ptr, ctx.path_a_len);
+  diff_syn_cache_ensure(mut syn_b, ctx.path_b_ptr, ctx.path_b_len);
+
+  var use_a: bool = false;
+  if ctx.line_marker == 45 { // '-'
+    use_a = true;
+  } else {
+    use_a = false; // '+' or ' ' -> prefer new side
+  }
+
+  let have_a: bool = syn_a.active;
+  let have_b: bool = syn_b.active;
+  if !have_a && !have_b {
+    return;
+  }
+
+  var prefer_a: bool = use_a;
+  if prefer_a && !have_a { prefer_a = false; }
+  if !prefer_a && !have_b { prefer_a = true; }
+
+  let skip: i64 = if is_line_start { 1 } else { 0 };
+  if skip >= line_len {
+    return;
+  }
+  let content_ptr: u64 = line_ptr + (skip as u64);
+  let content_len: i64 = line_len - skip;
+  if content_len <= 0 {
+    return;
+  }
+
+  if !ensure_style_scratch(mut scratch, content_len) {
+    return;
+  }
+
+  var st: HLState = hl_state_init();
+  var ok: bool = false;
+  if prefer_a {
+    ok = highlight_segment_stateful(&syn_a.syn, mut st, content_ptr, content_len, scratch.ptr);
+  } else {
+    ok = highlight_segment_stateful(&syn_b.syn, mut st, content_ptr, content_len, scratch.ptr);
+  }
+  if !ok {
+    return;
+  }
+
+  var i: i64 = 0;
+  while i < content_len {
+    let tok: u8 = std::runtime::mem::load_u8(scratch.ptr, i);
+    if tok != TOK_NONE {
+      std::runtime::mem::store_u8(styles, skip + i, tok);
+    }
+    i = i + 1;
+  }
+}
+
 fn render_line (mut w: &Writer, theme: &Theme, ptr: u64, len: i64, width: int, unsafe_raw: bool, allow_ansi: bool, hl_start: i64, hl_end: i64, styles: u64) -> i64 {
   if width <= 0 {
     return 0;
@@ -3649,12 +4785,12 @@ fn push_spaces (mut w: &Writer, n: int) -> void {
 }
 
 fn push_gutter (
-mut w: &Writer,
-theme: &Theme,
-line0: i64,     // 0-based, or <0 if unknown
-width: int,     // digits width
-use_color: bool,
-allow_ansi: bool
+  mut w: &Writer,
+  theme: &Theme,
+  line0: i64,     // 0-based, or <0 if unknown
+  width: int,     // digits width
+  use_color: bool,
+  allow_ansi: bool
 ) -> void {
   if width <= 0 {
     return;
@@ -3780,20 +4916,20 @@ fn push_path_pretty (mut w: &Writer, theme: &Theme, path: string, max: int) -> i
 }
 
 fn status_right_len (
-top_line: i64,
-top_off: i64,
-file_len: i64,
-indexed_done: bool,
-scan_off: i64,
-lines: i64,
-alert: int,
-use_regex: bool,
-ignore_case: bool,
-show_off: bool,
-show_lines: bool,
-show_index: bool,
-show_mode: bool,
-show_pct: bool
+  top_line: i64,
+  top_off: i64,
+  file_len: i64,
+  indexed_done: bool,
+  scan_off: i64,
+  lines: i64,
+  alert: int,
+  use_regex: bool,
+  ignore_case: bool,
+  show_off: bool,
+  show_lines: bool,
+  show_index: bool,
+  show_mode: bool,
+  show_pct: bool
 ) -> int {
   let sep: int = 3;
 
@@ -3837,22 +4973,22 @@ show_pct: bool
 }
 
 fn push_status_right (
-mut w: &Writer,
-theme: &Theme,
-top_line: i64,
-top_off: i64,
-file_len: i64,
-indexed_done: bool,
-scan_off: i64,
-lines: i64,
-alert: int,
-use_regex: bool,
-ignore_case: bool,
-show_off: bool,
-show_lines: bool,
-show_index: bool,
-show_mode: bool,
-show_pct: bool
+  mut w: &Writer,
+  theme: &Theme,
+  top_line: i64,
+  top_off: i64,
+  file_len: i64,
+  indexed_done: bool,
+  scan_off: i64,
+  lines: i64,
+  alert: int,
+  use_regex: bool,
+  ignore_case: bool,
+  show_off: bool,
+  show_lines: bool,
+  show_index: bool,
+  show_mode: bool,
+  show_pct: bool
 ) -> void {
   // Ln
   ansi_fg_256(mut w, theme.status_dim);
@@ -3968,14 +5104,14 @@ show_pct: bool
 }
 
 fn draw_help (
-mut w: &Writer,
-theme: &Theme,
-start_row: int,
-content_rows: int,
-cols: int,
-use_regex: bool,
-ignore_case: bool,
-unsafe_raw: bool
+  mut w: &Writer,
+  theme: &Theme,
+  start_row: int,
+  content_rows: int,
+  cols: int,
+  use_regex: bool,
+  ignore_case: bool,
+  unsafe_raw: bool
 ) -> void {
   // `cols` is currently only used for future layout tweaks.
   let _ = cols;
@@ -4200,13 +5336,13 @@ fn tab_label_est_len (path: string, idx: i64, name_max: int) -> int {
 }
 
 fn draw_tabs (
-mut w: &Writer,
-theme: &Theme,
-cols: int,
-tabs_ptr: u64,
-tabs_cap: i64,
-tabs_len: i64,
-active_tab: i64
+  mut w: &Writer,
+  theme: &Theme,
+  cols: int,
+  tabs_ptr: u64,
+  tabs_cap: i64,
+  tabs_len: i64,
+  active_tab: i64
 ) -> void {
   if cols <= 0 {
     return;
@@ -4388,13 +5524,13 @@ active_tab: i64
 }
 
 fn tab_hit_test (
-cols: int,
-tabs_ptr: u64,
-tabs_cap: i64,
-tabs_len: i64,
-active_tab: i64,
-use_color: bool,
-x: int
+  cols: int,
+  tabs_ptr: u64,
+  tabs_cap: i64,
+  tabs_len: i64,
+  active_tab: i64,
+  use_color: bool,
+  x: int
 ) -> i64 {
   if cols <= 0 {
     return -1;
@@ -4575,20 +5711,20 @@ x: int
 }
 
 fn status_line (
-mut w: &Writer,
-theme: &Theme,
-path: string,
-top_line: i64,
-top_off: i64,
-file_len: i64,
-rows: int,
-cols: int,
-indexed_done: bool,
-scan_off: i64,
-lines: i64,
-alert: int,
-use_regex: bool,
-ignore_case: bool
+  mut w: &Writer,
+  theme: &Theme,
+  path: string,
+  top_line: i64,
+  top_off: i64,
+  file_len: i64,
+  rows: int,
+  cols: int,
+  indexed_done: bool,
+  scan_off: i64,
+  lines: i64,
+  alert: int,
+  use_regex: bool,
+  ignore_case: bool
 ) -> void {
   ansi_move(mut w, rows, 1);
 
@@ -4608,9 +5744,9 @@ ignore_case: bool
 
   // If the terminal is narrow, drop less-important fields first so we don't wrap.
   var right_len: int = status_right_len(
-  top_line, top_off, file_len, indexed_done, scan_off, lines, alert,
-  use_regex, ignore_case,
-  show_off, show_lines, show_index, show_mode, show_pct
+    top_line, top_off, file_len, indexed_done, scan_off, lines, alert,
+    use_regex, ignore_case,
+    show_off, show_lines, show_index, show_mode, show_pct
   );
   var path_avail: int = cols - left_fixed - min_space - right_len;
   while path_avail < 0 {
@@ -4628,9 +5764,9 @@ ignore_case: bool
       break;
     }
     right_len = status_right_len(
-    top_line, top_off, file_len, indexed_done, scan_off, lines, alert,
-    use_regex, ignore_case,
-    show_off, show_lines, show_index, show_mode, show_pct
+      top_line, top_off, file_len, indexed_done, scan_off, lines, alert,
+      use_regex, ignore_case,
+      show_off, show_lines, show_index, show_mode, show_pct
     );
     path_avail = cols - left_fixed - min_space - right_len;
   }
@@ -4661,11 +5797,11 @@ ignore_case: bool
 
   // Right.
   push_status_right(
-  mut w,
-  theme,
-  top_line, top_off, file_len, indexed_done, scan_off, lines, alert,
-  use_regex, ignore_case,
-  show_off, show_lines, show_index, show_mode, show_pct
+    mut w,
+    theme,
+    top_line, top_off, file_len, indexed_done, scan_off, lines, alert,
+    use_regex, ignore_case,
+    show_off, show_lines, show_index, show_mode, show_pct
   );
 
   ansi_clear_eol(mut w);
@@ -5123,16 +6259,16 @@ fn search_hist_push (mut data: &BufferU8, mut idx: &VecU64, q_ptr: u64, q_len: i
 }
 
 fn prompt_search (
-mut w: &Writer,
-theme: &Theme,
-mut inp: &Input,
-rows: int,
-cols: int,
-hist_data: &BufferU8,
-hist_idx: &VecU64,
-mut out_query: &BufferU8,
-use_regex: bool,
-ignore_case: bool
+  mut w: &Writer,
+  theme: &Theme,
+  mut inp: &Input,
+  rows: int,
+  cols: int,
+  hist_data: &BufferU8,
+  hist_idx: &VecU64,
+  mut out_query: &BufferU8,
+  use_regex: bool,
+  ignore_case: bool
 ) -> bool {
   out_query.clear();
 
@@ -5296,12 +6432,12 @@ ignore_case: bool
 }
 
 fn prompt_cmd (
-mut w: &Writer,
-theme: &Theme,
-mut inp: &Input,
-rows: int,
-cols: int,
-mut out_cmd: &BufferU8
+  mut w: &Writer,
+  theme: &Theme,
+  mut inp: &Input,
+  rows: int,
+  cols: int,
+  mut out_cmd: &BufferU8
 ) -> bool {
   out_cmd.clear();
 
@@ -5391,12 +6527,12 @@ mut out_cmd: &BufferU8
 }
 
 fn prompt_find (
-mut w: &Writer,
-theme: &Theme,
-mut inp: &Input,
-rows: int,
-cols: int,
-mut out_query: &BufferU8
+  mut w: &Writer,
+  theme: &Theme,
+  mut inp: &Input,
+  rows: int,
+  cols: int,
+  mut out_query: &BufferU8
 ) -> bool {
   out_query.clear();
 
@@ -5641,10 +6777,10 @@ fn find_push_u64_dec (mut s: &std::strings::String, n: i64) -> bool {
   }
 
   let mut digits: u8[32] = [
-  0, 0, 0, 0, 0, 0, 0, 0,
-  0, 0, 0, 0, 0, 0, 0, 0,
-  0, 0, 0, 0, 0, 0, 0, 0,
-  0, 0, 0, 0, 0, 0, 0, 0
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0
   ];
   var dn: i64 = 0;
   while x != 0 && dn < 32 {
@@ -5664,13 +6800,13 @@ fn find_push_u64_dec (mut s: &std::strings::String, n: i64) -> bool {
 }
 
 fn find_push_result_line (
-mut out: &std::strings::String,
-fmt: int,
-path: string,
-line1: i64,
-col1: i64,
-snippet_ptr: u64,
-snippet_len: i64
+  mut out: &std::strings::String,
+  fmt: int,
+  path: string,
+  line1: i64,
+  col1: i64,
+  snippet_ptr: u64,
+  snippet_len: i64
 ) -> bool {
   if out.push_string(path) != None { return false; }
   if out.push_u8(58) != None { return false; } // ':'
@@ -5689,13 +6825,13 @@ snippet_len: i64
 }
 
 fn find_scan_file_lines (
-file: &MappedFile,
-fmt: int,
-path: string,
-q_ptr: u64,
-q_len: i64,
-mut out: &std::strings::String,
-total0: i64
+  file: &MappedFile,
+  fmt: int,
+  path: string,
+  q_ptr: u64,
+  q_len: i64,
+  mut out: &std::strings::String,
+  total0: i64
 ) -> i64? {
   var total: i64 = total0;
   if file.ptr == 0 || file.len <= 0 || q_ptr == 0 || q_len <= 0 {
@@ -6195,25 +7331,25 @@ fn find_syn_slot_match (slot_ptr: u64, slot_len: i64, path_ptr: u64, path_len: i
 }
 
 fn draw_find_modal (
-mut w: &Writer,
-theme: &Theme,
-start_row: int,
-content_rows: int,
-cols: int,
-query: &BufferU8,
-stdout: &std::strings::String,
-stderr: &std::strings::String,
-idx: &VecU64,
-sel: i64,
-scroll: i64,
-fmt: int,
-exit_code: int,
-truncated: bool,
-err_stage: int,
-err_code: int,
-syntax_on: bool,
-mut styles: &BufferU8,
-mut syn_cache: &FindSynCache
+  mut w: &Writer,
+  theme: &Theme,
+  start_row: int,
+  content_rows: int,
+  cols: int,
+  query: &BufferU8,
+  stdout: &std::strings::String,
+  stderr: &std::strings::String,
+  idx: &VecU64,
+  sel: i64,
+  scroll: i64,
+  fmt: int,
+  exit_code: int,
+  truncated: bool,
+  err_stage: int,
+  err_code: int,
+  syntax_on: bool,
+  mut styles: &BufferU8,
+  mut syn_cache: &FindSynCache
 ) -> void {
   var r: int = 0;
   ansi_reset(mut w);
@@ -7224,7 +8360,8 @@ export async fn main (argc: int, argv: u64) -> int {
     }
 
     // Map file contents for the active tab.
-    let mi_opt: MappedInput? = map_input(path, cfg.allow_binary);
+    let t_map: TabState = (tabs.ptr as TabState[](tabs.cap as int))[active_tab];
+    let mi_opt: MappedInput? = map_input_for_tab(&t_map, cfg.allow_binary);
     if mi_opt == None {
       tabs_free(mut tabs);
       let _ = write_str(std::runtime::posix::io::STDERR_FD, "sage: failed to open input\n");
@@ -7257,19 +8394,39 @@ export async fn main (argc: int, argv: u64) -> int {
       let _ = vw.flush();
     }
 
+    // Diff inputs: keep the full diff as tab 0, and open each referenced file
+    // as its own tab (starting at tab 1). This enables Ctrl-K across the
+    // changed files while still keeping the complete patch view available.
+    if tabs.len == 1 && diff_looks_like(file.ptr, file.len) {
+      let mut t0: TabState = (tabs.ptr as TabState[](tabs.cap as int))[0];
+      var can_split: bool = true;
+      if t0.path == "-" {
+        // Stdin is single-use; persist it to a temp path so switching tabs
+        // can return to the full diff view.
+        if !tab_ensure_stdin_spool_path(mut t0, file.ptr, file.len) {
+          can_split = false;
+        } else {
+          (tabs.ptr as TabState[](tabs.cap as int))[0] = t0;
+        }
+      }
+      if can_split {
+        let _ = diff_add_file_tabs(&cfg, mut tabs, file.ptr, file.len);
+      }
+    }
+
     // Plugins (QuickJS JavaScript).
     //
     // Initialized before entering raw mode / alt screen so any plugin startup
     // diagnostics can be safely emitted.
     let plug: plugins::Plugins = plugins::init(
-    cfg.verbose,
-    cfg.plugins,
-    cfg.plugins_dir,
-    cfg.plugin_log_path,
-    cfg.plugin_load_timeout_ms,
-    cfg.plugin_event_timeout_ms,
-    cfg.plugin_mem_limit_mb,
-    cfg.plugin_stack_limit_kb
+      cfg.verbose,
+      cfg.plugins,
+      cfg.plugins_dir,
+      cfg.plugin_log_path,
+      cfg.plugin_load_timeout_ms,
+      cfg.plugin_event_timeout_ms,
+      cfg.plugin_mem_limit_mb,
+      cfg.plugin_stack_limit_kb
     );
     var plug_init_err: bool = plugins::had_init_error(&plug);
 
@@ -7343,7 +8500,7 @@ export async fn main (argc: int, argv: u64) -> int {
     var syn_active: bool = false;
     let mut syn: Highlighter = highlighter_empty();
     let has_override: bool = syntax_override != None;
-    if (cfg.syntax || has_override) && use_color && !cfg.unsafe_raw && (path != "-" || has_override) {
+    if (cfg.syntax || has_override) && use_color && !cfg.unsafe_raw && tab_may_use_syntax(path, allow_ansi, file.ptr, file.len, has_override) {
       let syn_path: string = path_for_syntax(path);
       let fl: ByteSlice = first_line_slice(file.ptr, file.len);
       let mapped_syntax: string = syntax_map_lookup(&cfg.syntax_map, syn_path);
@@ -7373,6 +8530,12 @@ export async fn main (argc: int, argv: u64) -> int {
     var style_cap: i64 = 0;
     var syn_state_top: HLState = hl_state_init();
     var syn_state_off: i64 = 0;
+    var diff_inject: bool = syn_active && diff_looks_like(file.ptr, file.len);
+    var diff_ctx_top: DiffCtx = diff_ctx_empty();
+    var diff_ctx_off: i64 = -1;
+    var diff_syn_a: DiffSynCache = diff_syn_cache_empty();
+    var diff_syn_b: DiffSynCache = diff_syn_cache_empty();
+    var diff_scratch: StyleScratch = style_scratch_empty();
 
     let w_opt: Writer? = Writer.stdout(use_color, 65536);
     if w_opt == None {
@@ -7819,34 +8982,51 @@ export async fn main (argc: int, argv: u64) -> int {
           syn_state_off = top_off;
         }
 
+        // Align diff injection context with `top_off` so Ctrl+K results and
+        // normal scrolling can render mid-hunk segments correctly.
+        if diff_inject && file.ptr != 0 && file.len > 0 {
+          if diff_ctx_off != top_off {
+            if diff_ctx_off >= 0 && top_off > diff_ctx_off && (top_off - diff_ctx_off) <= (DIFF_CTX_LOOKBACK_BYTES * 4) {
+              diff_ctx_advance(file.ptr, file.len, diff_ctx_off, top_off, mut diff_ctx_top);
+            } else {
+              diff_ctx_align(file.ptr, file.len, top_off, mut diff_ctx_top);
+            }
+            diff_ctx_off = top_off;
+          }
+        } else {
+          diff_ctx_top = diff_ctx_empty();
+          diff_ctx_off = top_off;
+        }
+
         if show_help {
           draw_help(mut w, &cfg.theme, start_row, content_rows, cols, cfg.regex, cfg.ignore_case, cfg.unsafe_raw);
         } else if find_active {
           draw_find_modal(
-          mut w,
-          &cfg.theme,
-          start_row,
-          content_rows,
-          cols,
-          &find_query,
-          &find_stdout,
-          &find_stderr,
-          &find_idx,
-          find_sel,
-          find_scroll,
-          find_fmt,
-          find_exit_code,
-          find_truncated,
-          find_err_stage,
-          find_err_code,
-          cfg.syntax && use_color && !cfg.unsafe_raw,
-          mut find_styles,
-          mut find_syn_cache
+            mut w,
+            &cfg.theme,
+            start_row,
+            content_rows,
+            cols,
+            &find_query,
+            &find_stdout,
+            &find_stderr,
+            &find_idx,
+            find_sel,
+            find_scroll,
+            find_fmt,
+            find_exit_code,
+            find_truncated,
+            find_err_stage,
+            find_err_code,
+            cfg.syntax && use_color && !cfg.unsafe_raw,
+            mut find_styles,
+            mut find_syn_cache
           );
         } else {
           var cur: i64 = top_off;
           var cur_line: i64 = top_line;
           var hl_state: HLState = syn_state_top;
+          var diff_ctx: DiffCtx = diff_ctx_top;
           var r: int = 0;
           while r < content_rows {
             ansi_move(mut w, start_row + r, 1);
@@ -7895,6 +9075,12 @@ export async fn main (argc: int, argv: u64) -> int {
             if seg_len > 0 {
               line_len = measure_line_consumed(line_ptr, seg_len, view_cols, cfg.unsafe_raw, allow_ansi);
             }
+
+            let at_line_start: bool = cur == 0 || std::runtime::mem::load_u8(file.ptr, cur - 1) == 10;
+            if diff_inject && at_line_start {
+              diff_ctx_on_physical_line_start(file.ptr, file.len, cur, mut diff_ctx);
+            }
+
             var hl_s: i64 = -1;
             var hl_e: i64 = -1;
             if !cfg.unsafe_raw && sel_on && sel_anchor >= 0 && sel_head >= 0 && sel_anchor != sel_head {
@@ -7947,7 +9133,21 @@ export async fn main (argc: int, argv: u64) -> int {
               }
               if syn_active && style_ptr != 0 {
                 let ok_hl: bool = highlight_segment_stateful(&syn, mut hl_state, line_ptr, line_len, style_ptr);
-                if ok_hl { styles = style_ptr; }
+                if ok_hl {
+                  styles = style_ptr;
+                  if diff_inject {
+                    diff_inject_overlay(
+                      &diff_ctx,
+                      line_ptr,
+                      line_len,
+                      at_line_start,
+                      styles,
+                      mut diff_scratch,
+                      mut diff_syn_a,
+                      mut diff_syn_b
+                    );
+                  }
+                }
               }
             }
 
@@ -8529,7 +9729,7 @@ export async fn main (argc: int, argv: u64) -> int {
         if want_tab >= 0 && want_tab < tabs.len && want_tab != active_tab {
           // Map the new tab first so a failed open doesn't destroy the current view.
           let new_state: TabState = (tabs.ptr as TabState[](tabs.cap as int))[want_tab];
-          let mi2_opt: MappedInput? = map_input(new_state.path, cfg.allow_binary);
+          let mi2_opt: MappedInput? = map_input_for_tab(&new_state, cfg.allow_binary);
           if mi2_opt == None {
             find_queued_line0 = -1;
             find_queued_col1 = -1;
@@ -8635,7 +9835,7 @@ export async fn main (argc: int, argv: u64) -> int {
           syn_active = false;
           syn = highlighter_empty();
           let has_override2: bool = syntax_override != None;
-          if (cfg.syntax || has_override2) && use_color && !cfg.unsafe_raw && (path != "-" || has_override2) {
+          if (cfg.syntax || has_override2) && use_color && !cfg.unsafe_raw && tab_may_use_syntax(path, allow_ansi, file.ptr, file.len, has_override2) {
             let syn_path: string = path_for_syntax(path);
             let fl: ByteSlice = first_line_slice(file.ptr, file.len);
             let mapped_syntax: string = syntax_map_lookup(&cfg.syntax_map, syn_path);
@@ -8674,6 +9874,13 @@ export async fn main (argc: int, argv: u64) -> int {
           } else {
             syn_state_off = top_off;
           }
+
+          // Reset diff injection state/caches for the new file mapping.
+          diff_inject = syn_active && diff_looks_like(file.ptr, file.len);
+          diff_ctx_top = diff_ctx_empty();
+          diff_ctx_off = -1;
+          diff_syn_cache_reset(mut diff_syn_a);
+          diff_syn_cache_reset(mut diff_syn_b);
 
           // If Ctrl-K queued a jump into this tab, apply it after the switch.
           if find_queued_line0 >= 0 {
@@ -8872,7 +10079,7 @@ export async fn main (argc: int, argv: u64) -> int {
               if want_tab_cmd >= 0 && want_tab_cmd < tabs.len && want_tab_cmd != active_tab {
                 // Map the new tab first so a failed open doesn't destroy the current view.
                 let new_state2: TabState = (tabs.ptr as TabState[](tabs.cap as int))[want_tab_cmd];
-                let mi3_opt: MappedInput? = map_input(new_state2.path, cfg.allow_binary);
+                let mi3_opt: MappedInput? = map_input_for_tab(&new_state2, cfg.allow_binary);
                 if mi3_opt == None {
                   find_queued_line0 = -1;
                   find_queued_col1 = -1;
@@ -8978,7 +10185,7 @@ export async fn main (argc: int, argv: u64) -> int {
                 syn_active = false;
                 syn = highlighter_empty();
                 let has_override2: bool = syntax_override != None;
-                if (cfg.syntax || has_override2) && use_color && !cfg.unsafe_raw && (path != "-" || has_override2) {
+                if (cfg.syntax || has_override2) && use_color && !cfg.unsafe_raw && tab_may_use_syntax(path, allow_ansi, file.ptr, file.len, has_override2) {
                   let syn_path: string = path_for_syntax(path);
                   let fl: ByteSlice = first_line_slice(file.ptr, file.len);
                   let mapped_syntax: string = syntax_map_lookup(&cfg.syntax_map, syn_path);
@@ -9134,7 +10341,7 @@ export async fn main (argc: int, argv: u64) -> int {
               syn_active = false;
               syn = highlighter_empty();
               let has_override3: bool = syntax_override != None;
-              if (cfg.syntax || has_override3) && use_color && !cfg.unsafe_raw && (path != "-" || has_override3) {
+              if (cfg.syntax || has_override3) && use_color && !cfg.unsafe_raw && tab_may_use_syntax(path, allow_ansi, file.ptr, file.len, has_override3) {
                 let syn_path: string = path_for_syntax(path);
                 let fl: ByteSlice = first_line_slice(file.ptr, file.len);
                 let mapped_syntax: string = syntax_map_lookup(&cfg.syntax_map, syn_path);
@@ -9173,6 +10380,13 @@ export async fn main (argc: int, argv: u64) -> int {
               } else {
                 syn_state_off = top_off;
               }
+
+              // Reset diff injection state/caches when syntax changes.
+              diff_inject = syn_active && diff_looks_like(file.ptr, file.len);
+              diff_ctx_top = diff_ctx_empty();
+              diff_ctx_off = -1;
+              diff_syn_cache_reset(mut diff_syn_a);
+              diff_syn_cache_reset(mut diff_syn_b);
 
               alert = 0;
               need_redraw = true;

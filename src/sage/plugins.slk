@@ -408,14 +408,14 @@ export struct Plugins {
 }
 
 export fn init (
-verbose: bool,
-enabled: bool,
-plugins_dir_opt: string?,
-plugin_log_path_opt: string?,
-load_timeout_ms: i64,
-event_timeout_ms: i64,
-mem_limit_mb: i64,
-stack_limit_kb: i64
+  verbose: bool,
+  enabled: bool,
+  plugins_dir_opt: string?,
+  plugin_log_path_opt: string?,
+  load_timeout_ms: i64,
+  event_timeout_ms: i64,
+  mem_limit_mb: i64,
+  stack_limit_kb: i64
 ) -> Plugins {
   // Allow explicit disable for debugging.
   if !enabled {
@@ -686,9 +686,9 @@ impl Plugins as std::interfaces::Drop {
 
 fn touch_file (path: string) -> bool {
   let fd: int = std::runtime::posix::fs::open(
-  path,
-  std::runtime::posix::fs::O_WRONLY | std::runtime::posix::fs::O_CREAT | std::runtime::posix::fs::O_TRUNC,
-  420
+    path,
+    std::runtime::posix::fs::O_WRONLY | std::runtime::posix::fs::O_CREAT | std::runtime::posix::fs::O_TRUNC,
+    420
   ) as int;
   if fd < 0 {
     return false;
