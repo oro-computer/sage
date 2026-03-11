@@ -4560,6 +4560,22 @@ test "visual_prev_off inverts visual_next_off (ansi off)" {
   std::runtime::mem::free(p);
 }
 
+test "is_logical_line_start distinguishes wrapped continuations" {
+  let s: string = "abcdefghijXYZ\nok\n";
+  let p: u64 = std::runtime::mem::string_ptr(s);
+  let n: i64 = std::runtime::mem::string_len(s);
+
+  assert(is_logical_line_start(p, n, 0), "file start");
+
+  let wrap2: i64 = visual_next_off(p, n, 0, 10, false, false);
+  assert(wrap2 == 10, "second visual segment offset");
+  assert(!is_logical_line_start(p, n, wrap2), "wrapped segment");
+
+  let line2: i64 = visual_next_off(p, n, wrap2, 10, false, false);
+  assert(line2 == 14, "second logical line offset");
+  assert(is_logical_line_start(p, n, line2), "newline-delimited line start");
+}
+
 test "word_span_at extracts identifiers" {
   let s: string = "hello world\nfoo_bar42 baz\n";
   let p: u64 = std::runtime::mem::string_ptr(s);
@@ -4704,6 +4720,16 @@ fn push_spaces (mut w: &Writer, n: int) -> void {
     let _ = w.push_u8(32);
     i = i + 1;
   }
+}
+
+fn is_logical_line_start (file_ptr: u64, file_len: i64, off: i64) -> bool {
+  if off <= 0 {
+    return true;
+  }
+  if file_ptr == 0 || file_len <= 0 || off > file_len {
+    return false;
+  }
+  return std::runtime::mem::load_u8(file_ptr, off - 1) == 10;
 }
 
 fn push_gutter (
@@ -9013,7 +9039,7 @@ export async fn main (argc: int, argv: u64) -> int {
               line_len = measure_line_consumed(line_ptr, seg_len, view_cols, cfg.unsafe_raw, allow_ansi);
             }
 
-            let at_line_start: bool = cur == 0 || std::runtime::mem::load_u8(file.ptr, cur - 1) == 10;
+            let at_line_start: bool = is_logical_line_start(file.ptr, file.len, cur);
             if diff_inject && at_line_start {
               diff_ctx_on_physical_line_start(file.ptr, file.len, cur, mut diff_ctx);
             }
@@ -9089,7 +9115,11 @@ export async fn main (argc: int, argv: u64) -> int {
             }
 
             if gutter_render {
-              push_gutter(mut w, &cfg.theme, cur_line, gutter_ln_width, use_color, allow_ansi);
+              if at_line_start {
+                push_gutter(mut w, &cfg.theme, cur_line, gutter_ln_width, use_color, allow_ansi);
+              } else {
+                push_spaces(mut w, gutter_cols);
+              }
             }
 
             let consumed: i64 = render_line(mut w, &cfg.theme, line_ptr, line_len, view_cols, cfg.unsafe_raw, allow_ansi, hl_s, hl_e, styles);

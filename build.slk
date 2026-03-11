@@ -801,7 +801,7 @@ export async fn run (package_root: string, action: string) -> int {
 
   // QuickJS + host shim.
   b.target_add_input(t, "src/native/sage_qjs.c");
-  b.target_add_input(t, "quickjs/cutils.c");
+  b.target_add_input(t, "quickjs/cutils.h");
   b.target_add_input(t, "quickjs/dtoa.c");
   b.target_add_input(t, "quickjs/libregexp.c");
   b.target_add_input(t, "quickjs/libunicode.c");
