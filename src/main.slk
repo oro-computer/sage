@@ -103,9 +103,11 @@ struct IndexState {
 struct TabState {
   path: string,
   stdin_spool_path: string?,
+  view_spool_path: string?,
   top_off: i64,
   gutter_on: bool,
   syntax_override: string?,
+  find_disabled: bool,
 }
 
 struct Theme {
@@ -435,7 +437,6 @@ let SYN_STATE_LOOKBACK_BYTES: i64 = 65536;
 let DIFF_CTX_LOOKBACK_BYTES: i64 = 262144;
 let DIFF_CTX_SEARCH_BACK_BYTES: i64 = 4194304;
 let DIFF_MAX_FILE_TABS: i64 = 256;
-let DIFF_PATH_RESOLVE_MAX_UP: i64 = 8;
 let DOUBLE_CLICK_NS: i64 = 350000000; // 350ms
 let WORD_QUERY_MAX: i64 = 256;
 let FIRST_LINE_MAX: i64 = 1024;
@@ -828,6 +829,7 @@ struct Tabs {
   ptr: u64,
   len: i64,
   cap: i64,
+  zero_based_labels: bool,
 }
 
 fn cstr_copy_owned (s: string) -> string? {
@@ -926,7 +928,15 @@ fn tabs_push_owned (mut tabs: &Tabs, path_owned: string) -> bool {
   if !tabs_ensure_cap(mut tabs, 1) {
     return false;
   }
-  (tabs.ptr as TabState[](tabs.cap as int))[tabs.len] = TabState{ path: path_owned, stdin_spool_path: None, top_off: 0, gutter_on: false, syntax_override: None };
+  (tabs.ptr as TabState[](tabs.cap as int))[tabs.len] = TabState{
+    path: path_owned,
+    stdin_spool_path: None,
+    view_spool_path: None,
+    top_off: 0,
+    gutter_on: false,
+    syntax_override: None,
+    find_disabled: false
+  };
   tabs.len = tabs.len + 1;
   return true;
 }
@@ -1070,7 +1080,7 @@ fn tabs_collect (args: Args) -> Tabs? {
     return None;
   }
 
-  let mut tabs: Tabs = Tabs{ ptr: ptr, len: 0, cap: cap };
+  let mut tabs: Tabs = Tabs{ ptr: ptr, len: 0, cap: cap, zero_based_labels: false };
 
   var i: int = 1;
   var after_dd: bool = false;
@@ -1137,6 +1147,11 @@ fn tabs_free (mut tabs: &Tabs) -> void {
         let _ = std::runtime::posix::fs::unlink(sp);
         free_joined(sp);
       }
+      if t.view_spool_path != None {
+        let vp: string = match (t.view_spool_path) { Some(v) => v, None => "" };
+        let _ = std::runtime::posix::fs::unlink(vp);
+        free_joined(vp);
+      }
       if t.syntax_override != None {
         let s: string = match (t.syntax_override) { Some(v) => v, None => "" };
         free_joined(s);
@@ -1148,6 +1163,7 @@ fn tabs_free (mut tabs: &Tabs) -> void {
   tabs.ptr = 0;
   tabs.len = 0;
   tabs.cap = 0;
+  tabs.zero_based_labels = false;
 }
 
 struct RcChoice {
@@ -2633,11 +2649,22 @@ fn tab_prev (cur: i64, tabs_len: i64) -> i64 {
   return cur - 1;
 }
 
-fn tab_index_from_user_num (n: i64, tabs_len: i64) -> i64? {
-  // User-facing tab numbers are 1-indexed.
-  // `0` is a convenience shortcut that always selects the last tab.
+fn tab_user_num (zero_based_labels: bool, idx: i64) -> i64 {
+  if zero_based_labels {
+    return idx;
+  }
+  return idx + 1;
+}
+
+fn tab_index_from_user_num2 (zero_based_labels: bool, tabs_len: i64, n: i64) -> i64? {
   if tabs_len <= 0 {
     return None;
+  }
+  if zero_based_labels {
+    if n < 0 || n >= tabs_len {
+      return None;
+    }
+    return Some(n);
   }
   if n == 0 {
     return Some(tabs_len - 1);
@@ -2729,6 +2756,10 @@ fn tab_may_use_syntax (path: string, allow_ansi: bool, file_ptr: u64, file_len: 
 }
 
 fn map_input_for_tab (t: &TabState, allow_binary: bool) -> MappedInput? {
+  if t.view_spool_path != None {
+    let p0: string = match (t.view_spool_path) { Some(v) => v, None => "" };
+    return map_input(p0, allow_binary);
+  }
   if t.path != "-" {
     return map_input(t.path, allow_binary);
   }
@@ -2752,35 +2783,29 @@ fn gutter_default_for_path (cfg: &Config, path: string) -> bool {
   return false;
 }
 
-fn tab_ensure_stdin_spool_path (mut t: &TabState, data_ptr: u64, data_len: i64) -> bool {
-  if t.path != "-" {
-    return true;
-  }
-  if t.stdin_spool_path != None {
-    return true;
-  }
+fn spool_slice_to_temp_path (data_ptr: u64, data_len: i64) -> string? {
   if data_ptr == 0 || data_len < 0 {
-    return false;
+    return None;
   }
 
-  let tmpl_r = std::strings::String.from_string("/tmp/sage-stdin-XXXXXX");
+  let tmpl_r = std::strings::String.from_string("/tmp/sage-view-XXXXXX");
   if tmpl_r.is_err() {
-    return false;
+    return None;
   }
   let mut tmpl: std::strings::String = match (tmpl_r) { Ok(v) => v, Err(_) => std::strings::String.empty() };
   if tmpl.len <= 0 {
-    return false;
+    return None;
   }
 
   let fd_r: std::runtime::fs::IntResult = std::runtime::fs::mkstemp(tmpl.ptr);
   if fd_r.is_err() {
     tmpl.drop();
-    return false;
+    return None;
   }
   let fd: int = std::runtime::fs::IntResult.ok_value(fd_r) ?? -1;
   if fd < 0 {
     tmpl.drop();
-    return false;
+    return None;
   }
 
   var off: i64 = 0;
@@ -2791,7 +2816,7 @@ fn tab_ensure_stdin_spool_path (mut t: &TabState, data_ptr: u64, data_len: i64) 
       let tmp_path: string = tmpl.as_string();
       let _ = std::runtime::posix::fs::unlink(tmp_path);
       tmpl.drop();
-      return false;
+      return None;
     }
     off = off + (w as i64);
   }
@@ -2802,10 +2827,27 @@ fn tab_ensure_stdin_spool_path (mut t: &TabState, data_ptr: u64, data_len: i64) 
   if own_opt == None {
     let _ = std::runtime::posix::fs::unlink(tmp_path2);
     tmpl.drop();
+    return None;
+  }
+  tmpl.drop();
+  return own_opt;
+}
+
+fn tab_ensure_stdin_spool_path (mut t: &TabState, data_ptr: u64, data_len: i64) -> bool {
+  if t.path != "-" {
+    return true;
+  }
+  if t.stdin_spool_path != None {
+    return true;
+  }
+  if data_ptr == 0 || data_len < 0 {
+    return false;
+  }
+  let own_opt: string? = spool_slice_to_temp_path(data_ptr, data_len);
+  if own_opt == None {
     return false;
   }
   let own: string = match (own_opt) { Some(v) => v, None => "" };
-  tmpl.drop();
   t.stdin_spool_path = Some(own);
   return true;
 }
@@ -2824,6 +2866,12 @@ struct DiffCtx {
   // Current physical line context (for wrapped segments):
   line_marker: u8,   // '+', '-', ' ' (hunk lines) or other
   line_is_code: bool // true when inside a hunk and marker is +|-|space
+}
+
+struct DiffLineBounds {
+  ok: bool,
+  pos: i64,
+  len: i64,
 }
 
 fn diff_ctx_empty () -> DiffCtx {
@@ -3000,12 +3048,105 @@ fn diff_path_strip (ptr: u64, len: i64) -> ByteSlice {
   return ByteSlice{ ptr: ptr, len: len };
 }
 
+fn diff_header_token_looks_like_path (line_ptr: u64, line_len: i64, start: i64) -> bool {
+  let t: DiffToken = diff_parse_token(line_ptr, line_len, start);
+  if t.ptr == 0 || t.len <= 0 {
+    return false;
+  }
+  if bytes_eq(t.ptr, t.len, "/dev/null") || bytes_eq(t.ptr, t.len, "-") {
+    return true;
+  }
+
+  let b0: u8 = std::runtime::mem::load_u8(t.ptr, 0);
+  if b0 == 47 { // '/'
+    return true;
+  }
+  if t.len >= 2 {
+    let b1: u8 = std::runtime::mem::load_u8(t.ptr, 1);
+    if (b0 == 97 || b0 == 98) && b1 == 47 { // a/ or b/
+      return true;
+    }
+    if b0 == 46 && b1 == 47 { // ./
+      return true;
+    }
+    if t.len >= 3 && b0 == 46 && b1 == 46 && std::runtime::mem::load_u8(t.ptr, 2) == 47 { // ../
+      return true;
+    }
+  }
+
+  return memchr(t.ptr, 47, t.len) != 0;
+}
+
+fn diff_is_old_header_line (line_ptr: u64, line_len: i64) -> bool {
+  if !bytes_has_prefix(line_ptr, line_len, "--- ") {
+    return false;
+  }
+  return diff_header_token_looks_like_path(line_ptr, line_len, 4);
+}
+
+fn diff_is_new_header_line (line_ptr: u64, line_len: i64) -> bool {
+  if !bytes_has_prefix(line_ptr, line_len, "+++ ") {
+    return false;
+  }
+  return diff_header_token_looks_like_path(line_ptr, line_len, 4);
+}
+
+fn diff_next_line_bounds (diff_ptr: u64, diff_len: i64, pos: i64) -> DiffLineBounds {
+  if diff_ptr == 0 || diff_len <= 0 || pos < 0 || pos >= diff_len {
+    return DiffLineBounds{ ok: false, pos: -1, len: 0 };
+  }
+
+  let rem: i64 = diff_len - pos;
+  let nl_ptr: u64 = if rem > 0 { memchr(diff_ptr + (pos as u64), 10, rem) } else { 0 };
+  if nl_ptr == 0 {
+    return DiffLineBounds{ ok: false, pos: -1, len: 0 };
+  }
+
+  let next_pos: i64 = ((nl_ptr - diff_ptr) as i64) + 1;
+  if next_pos >= diff_len {
+    return DiffLineBounds{ ok: false, pos: -1, len: 0 };
+  }
+
+  let next_rem: i64 = diff_len - next_pos;
+  let next_nl_ptr: u64 = if next_rem > 0 { memchr(diff_ptr + (next_pos as u64), 10, next_rem) } else { 0 };
+  var next_len: i64 = if next_nl_ptr != 0 { (next_nl_ptr - (diff_ptr + (next_pos as u64))) as i64 } else { next_rem };
+  if next_len > 0 && std::runtime::mem::load_u8(diff_ptr + (next_pos as u64), next_len - 1) == 13 {
+    next_len = next_len - 1;
+  }
+  return DiffLineBounds{ ok: true, pos: next_pos, len: next_len };
+}
+
 fn diff_ctx_process_line_start (line_ptr: u64, line_len: i64, mut ctx: &DiffCtx) -> void {
   if line_ptr == 0 || line_len <= 0 {
     return;
   }
 
-  if bytes_has_prefix(line_ptr, line_len, "diff --git ") {
+  if line_len >= 2 {
+    let b0: u8 = std::runtime::mem::load_u8(line_ptr, 0);
+    let b1: u8 = std::runtime::mem::load_u8(line_ptr, 1);
+    if b0 == 64 && b1 == 64 { // "@@"
+      ctx.in_hunk = true;
+      return;
+    }
+  }
+
+  let is_git_hdr: bool = bytes_has_prefix(line_ptr, line_len, "diff --git ");
+  let is_old_header: bool = diff_is_old_header_line(line_ptr, line_len);
+  let is_new_header: bool = diff_is_new_header_line(line_ptr, line_len);
+
+  if ctx.in_hunk {
+    if is_git_hdr {
+      ctx.in_hunk = false;
+    } else {
+      let lead: u8 = std::runtime::mem::load_u8(line_ptr, 0);
+      if lead == 32 || lead == 43 || lead == 45 || lead == 92 { // space, +, -, '\'
+        return;
+      }
+      ctx.in_hunk = false;
+    }
+  }
+
+  if is_git_hdr {
     ctx.in_hunk = false;
     let t1: DiffToken = diff_parse_token(line_ptr, line_len, 11);
     let t2: DiffToken = diff_parse_token(line_ptr, line_len, t1.next);
@@ -3018,9 +3159,7 @@ fn diff_ctx_process_line_start (line_ptr: u64, line_len: i64, mut ctx: &DiffCtx)
     return;
   }
 
-  if bytes_has_prefix(line_ptr, line_len, "--- ") {
-    // File header lines only occur outside hunks; avoid misinterpreting
-    // real code lines like "++ i" / "-- foo" inside hunks as diff headers.
+  if is_old_header {
     if !ctx.in_hunk {
       ctx.in_hunk = false;
       let t: DiffToken = diff_parse_token(line_ptr, line_len, 4);
@@ -3031,22 +3170,13 @@ fn diff_ctx_process_line_start (line_ptr: u64, line_len: i64, mut ctx: &DiffCtx)
     }
   }
 
-  if bytes_has_prefix(line_ptr, line_len, "+++ ") {
+  if is_new_header {
     if !ctx.in_hunk {
       ctx.in_hunk = false;
       let t3: DiffToken = diff_parse_token(line_ptr, line_len, 4);
       let b2: ByteSlice = diff_path_strip(t3.ptr, t3.len);
       ctx.path_b_ptr = b2.ptr;
       ctx.path_b_len = b2.len;
-      return;
-    }
-  }
-
-  if line_len >= 2 {
-    let b0: u8 = std::runtime::mem::load_u8(line_ptr, 0);
-    let b1: u8 = std::runtime::mem::load_u8(line_ptr, 1);
-    if b0 == 64 && b1 == 64 { // "@@"
-      ctx.in_hunk = true;
       return;
     }
   }
@@ -3063,228 +3193,78 @@ fn diff_ctx_set_line_meta (line_ptr: u64, line_len: i64, mut ctx: &DiffCtx) -> v
   ctx.line_is_code = ctx.in_hunk && (m == 43 || m == 45 || m == 32); // +, -, space
 }
 
-fn diff_prefix_score (prefix: string, paths: &VecU64, slash_only: bool) -> i64? {
-  if paths.ptr == 0 || paths.len <= 0 {
-    return Some(0);
+fn diff_ctx_path_owned (ctx: &DiffCtx) -> string? {
+  var p_ptr: u64 = ctx.path_b_ptr;
+  var p_len: i64 = ctx.path_b_len;
+  if p_ptr == 0 || p_len <= 0 {
+    p_ptr = ctx.path_a_ptr;
+    p_len = ctx.path_a_len;
   }
-
-  let count: i64 = paths.len / 2;
-  var score: i64 = 0;
-  var i: i64 = 0;
-  while i < count {
-    let p_ptr: u64 = paths.get(i * 2);
-    let p_len: i64 = paths.get((i * 2) + 1) as i64;
-    if p_ptr == 0 || p_len <= 0 {
-      i = i + 1;
-      continue;
-    }
-    if slash_only {
-      let slash_ptr: u64 = memchr(p_ptr, 47, p_len); // '/'
-      if slash_ptr == 0 {
-        i = i + 1;
-        continue;
-      }
-    }
-
-    let rel: string = std::runtime::mem::string_from_ptr_len(p_ptr, p_len as int);
-    let cand_opt: string? = join2(prefix, rel);
-    if cand_opt == None {
-      return None;
-    }
-    let cand: string = match (cand_opt) { Some(v) => v, None => "" };
-    let fd: int = std::runtime::posix::fs::open(cand, std::runtime::posix::fs::O_RDONLY, 0) as int;
-    if fd >= 0 {
-      let _ = std::runtime::posix::fs::close(fd);
-      score = score + 1;
-    }
-    free_joined(cand);
-    i = i + 1;
+  if p_ptr == 0 || p_len <= 0 {
+    return None;
   }
-
-  return Some(score);
+  let view: string = std::runtime::mem::string_from_ptr_len(p_ptr, p_len as int);
+  if view == "-" {
+    return None;
+  }
+  return cstr_copy_owned(view);
 }
 
-fn diff_choose_base_prefix (diff_ptr: u64, diff_len: i64) -> string? {
-  if diff_ptr == 0 || diff_len <= 0 {
-    return None;
+fn diff_push_section_tab (cfg: &Config, mut tabs: &Tabs, path_owned: string, diff_ptr: u64, start_off: i64, end_off: i64) -> int {
+  if tabs_has_path(tabs, path_owned) {
+    free_joined(path_owned);
+    return 0;
+  }
+  if diff_ptr == 0 || start_off < 0 || end_off <= start_off {
+    free_joined(path_owned);
+    return 0;
   }
 
-  // Collect file paths from the diff headers as (ptr,len) pairs. Prefer paths
-  // with a '/' when scoring so monorepos resolve to the correct subdir.
-  let paths_opt: VecU64? = VecU64.init(128);
-  if paths_opt == None {
-    return None;
+  let slice_ptr: u64 = diff_ptr + (start_off as u64);
+  let slice_len: i64 = end_off - start_off;
+  let spool_opt: string? = spool_slice_to_temp_path(slice_ptr, slice_len);
+  if spool_opt == None {
+    free_joined(path_owned);
+    return -1;
   }
-  let mut paths: VecU64 = match (paths_opt) { Some(v) => v, None => VecU64.empty() };
-  var saw_slash: bool = false;
+  let spool: string = match (spool_opt) { Some(v) => v, None => "" };
 
-  let mut ctx: DiffCtx = diff_ctx_empty();
-  var pos: i64 = 0;
-  var pushed: i64 = 0;
-  while pos < diff_len && pushed < 64 {
-    let rem: i64 = diff_len - pos;
-    let nl_ptr: u64 = if rem > 0 { memchr(diff_ptr + (pos as u64), 10, rem) } else { 0 };
-    var line_len: i64 = if nl_ptr != 0 { (nl_ptr - (diff_ptr + (pos as u64))) as i64 } else { rem };
-    if line_len > 0 && std::runtime::mem::load_u8(diff_ptr + (pos as u64), line_len - 1) == 13 {
-      line_len = line_len - 1;
-    }
+  let diff_key_opt: string? = cstr_copy_owned("diff");
+  if diff_key_opt == None {
+    let _ = std::runtime::posix::fs::unlink(spool);
+    free_joined(spool);
+    free_joined(path_owned);
+    return -1;
+  }
+  let diff_key: string = match (diff_key_opt) { Some(v) => v, None => "" };
 
-    let line_ptr: u64 = diff_ptr + (pos as u64);
-    let is_git_hdr: bool = bytes_has_prefix(line_ptr, line_len, "diff --git ");
-    let is_unified_new: bool = bytes_has_prefix(line_ptr, line_len, "+++ ");
-
-    diff_ctx_process_line_start(line_ptr, line_len, mut ctx);
-    if is_git_hdr || is_unified_new {
-      var p_ptr: u64 = ctx.path_b_ptr;
-      var p_len: i64 = ctx.path_b_len;
-      if p_ptr == 0 || p_len <= 0 {
-        p_ptr = ctx.path_a_ptr;
-        p_len = ctx.path_a_len;
-      }
-      if p_ptr != 0 && p_len > 0 {
-        let view: string = std::runtime::mem::string_from_ptr_len(p_ptr, p_len as int);
-        if view != "-" && !is_network_path(view) {
-          let e1 = paths.push(p_ptr);
-          if e1 != None { paths.drop(); return None; }
-          let e2 = paths.push(p_len as u64);
-          if e2 != None { paths.drop(); return None; }
-          pushed = pushed + 1;
-          if !saw_slash && memchr(p_ptr, 47, p_len) != 0 {
-            saw_slash = true;
-          }
-        }
-      }
-    }
-
-    if nl_ptr == 0 {
-      break;
-    }
-    pos = ((nl_ptr - diff_ptr) as i64) + 1;
+  if !tabs_ensure_cap(mut tabs, 1) {
+    let _ = std::runtime::posix::fs::unlink(spool);
+    free_joined(spool);
+    free_joined(diff_key);
+    free_joined(path_owned);
+    return -1;
   }
 
-  if paths.len <= 0 {
-    paths.drop();
-    return None;
-  }
+  let gutter_on: bool = if cfg.gutter == GUTTER_ALWAYS {
+    true
+  } else if cfg.gutter == GUTTER_NEVER {
+    false
+  } else {
+    true
+  };
 
-  var best: string? = None;
-  var best_score: i64 = 0;
-
-  var pfx: string = "./";
-  var pfx_owned: bool = false;
-  var up: i64 = 0;
-  while up <= DIFF_PATH_RESOLVE_MAX_UP {
-    let sc0_opt: i64? = diff_prefix_score(pfx, &paths, saw_slash);
-    if sc0_opt == None {
-      if best != None { let b0: string = match (best) { Some(v) => v, None => "" }; free_joined(b0); }
-      if pfx_owned { free_joined(pfx); }
-      paths.drop();
-      return None;
-    }
-    let sc0: i64 = match (sc0_opt) { Some(v) => v, None => 0 };
-    if sc0 > best_score {
-      let cp0_opt: string? = cstr_copy_owned(pfx);
-      if cp0_opt != None {
-        if best != None {
-          let b1: string = match (best) { Some(v) => v, None => "" };
-          free_joined(b1);
-        }
-        best = cp0_opt;
-        best_score = sc0;
-      }
-    }
-
-    let dir: u64 = std::runtime::posix::fs::opendir(pfx);
-    if dir != 0 {
-      var scanned: i64 = 0;
-      while scanned < 256 {
-        let name_cstr: u64 = std::runtime::posix::fs::readdir_name_owned(dir);
-        if name_cstr == 0 {
-          break;
-        }
-        let name_len: i64 = cstr_len_max(name_cstr, 4096);
-        let name: string = std::runtime::mem::string_from_ptr_len(name_cstr, name_len as int);
-        if name == "." || name == ".." {
-          std::runtime::mem::free(name_cstr);
-          continue;
-        }
-
-        let base_opt: string? = join2(pfx, name);
-        std::runtime::mem::free(name_cstr);
-        if base_opt == None {
-          let _ = std::runtime::posix::fs::closedir(dir);
-          if best != None { let b2: string = match (best) { Some(v) => v, None => "" }; free_joined(b2); }
-          if pfx_owned { free_joined(pfx); }
-          paths.drop();
-          return None;
-        }
-        let base: string = match (base_opt) { Some(v) => v, None => "" };
-        let dirp_opt: string? = join2(base, "/");
-        free_joined(base);
-        if dirp_opt == None {
-          let _ = std::runtime::posix::fs::closedir(dir);
-          if best != None { let b3: string = match (best) { Some(v) => v, None => "" }; free_joined(b3); }
-          if pfx_owned { free_joined(pfx); }
-          paths.drop();
-          return None;
-        }
-        let dirp: string = match (dirp_opt) { Some(v) => v, None => "" };
-
-        let sc1_opt: i64? = diff_prefix_score(dirp, &paths, saw_slash);
-        if sc1_opt == None {
-          free_joined(dirp);
-          let _ = std::runtime::posix::fs::closedir(dir);
-          if best != None { let b4: string = match (best) { Some(v) => v, None => "" }; free_joined(b4); }
-          if pfx_owned { free_joined(pfx); }
-          paths.drop();
-          return None;
-        }
-        let sc1: i64 = match (sc1_opt) { Some(v) => v, None => 0 };
-        if sc1 > best_score {
-          let cp1_opt: string? = cstr_copy_owned(dirp);
-          if cp1_opt != None {
-            if best != None {
-              let b5: string = match (best) { Some(v) => v, None => "" };
-              free_joined(b5);
-            }
-            best = cp1_opt;
-            best_score = sc1;
-          }
-        }
-        free_joined(dirp);
-        scanned = scanned + 1;
-      }
-      let _ = std::runtime::posix::fs::closedir(dir);
-    }
-
-    if up == DIFF_PATH_RESOLVE_MAX_UP {
-      break;
-    }
-    let next_opt: string? = join2(pfx, "../");
-    if next_opt == None {
-      if best != None { let b6: string = match (best) { Some(v) => v, None => "" }; free_joined(b6); }
-      if pfx_owned { free_joined(pfx); }
-      paths.drop();
-      return None;
-    }
-    let next: string = match (next_opt) { Some(v) => v, None => "" };
-    if pfx_owned { free_joined(pfx); }
-    pfx = next;
-    pfx_owned = true;
-    up = up + 1;
-  }
-
-  if pfx_owned { free_joined(pfx); }
-  paths.drop();
-
-  if best_score <= 0 {
-    if best != None {
-      let b7: string = match (best) { Some(v) => v, None => "" };
-      free_joined(b7);
-    }
-    return None;
-  }
-  return best;
+  (tabs.ptr as TabState[](tabs.cap as int))[tabs.len] = TabState{
+    path: path_owned,
+    stdin_spool_path: None,
+    view_spool_path: Some(spool),
+    top_off: 0,
+    gutter_on: gutter_on,
+    syntax_override: Some(diff_key),
+    find_disabled: false
+  };
+  tabs.len = tabs.len + 1;
+  return 1;
 }
 
 fn diff_add_file_tabs (cfg: &Config, mut tabs: &Tabs, diff_ptr: u64, diff_len: i64) -> bool {
@@ -3298,7 +3278,11 @@ fn diff_add_file_tabs (cfg: &Config, mut tabs: &Tabs, diff_ptr: u64, diff_len: i
   let mut ctx: DiffCtx = diff_ctx_empty();
   var pos: i64 = 0;
   var added: i64 = 0;
-  var base_prefix: string? = diff_choose_base_prefix(diff_ptr, diff_len);
+  var current_start: i64 = -1;
+  var pending_old_start: i64 = -1;
+  var current_has_git: bool = false;
+  var current_header_complete: bool = false;
+  var current_path: string? = None;
 
   while pos < diff_len && added < DIFF_MAX_FILE_TABS {
     let rem: i64 = diff_len - pos;
@@ -3312,249 +3296,112 @@ fn diff_add_file_tabs (cfg: &Config, mut tabs: &Tabs, diff_ptr: u64, diff_len: i
 
     let line_ptr: u64 = diff_ptr + (pos as u64);
     let is_git_hdr: bool = bytes_has_prefix(line_ptr, line_len, "diff --git ");
-    let is_unified_new: bool = bytes_has_prefix(line_ptr, line_len, "+++ ");
-
-    diff_ctx_process_line_start(line_ptr, line_len, mut ctx);
-
-    if is_git_hdr || is_unified_new {
-      var p_ptr: u64 = ctx.path_b_ptr;
-      var p_len: i64 = ctx.path_b_len;
-      if p_ptr == 0 || p_len <= 0 {
-        p_ptr = ctx.path_a_ptr;
-        p_len = ctx.path_a_len;
+    let line_is_old_header: bool = diff_is_old_header_line(line_ptr, line_len);
+    let was_in_hunk: bool = ctx.in_hunk;
+    if was_in_hunk && line_is_old_header {
+      let next_line: DiffLineBounds = diff_next_line_bounds(diff_ptr, diff_len, pos);
+      if next_line.ok && next_line.pos >= 0 && next_line.len > 0 {
+        let next_ptr: u64 = diff_ptr + (next_line.pos as u64);
+        if diff_is_new_header_line(next_ptr, next_line.len) {
+          ctx.in_hunk = false;
+        }
       }
+    }
+    diff_ctx_process_line_start(line_ptr, line_len, mut ctx);
+    let is_unified_old: bool = !ctx.in_hunk && line_is_old_header;
+    let is_unified_new: bool = !ctx.in_hunk && diff_is_new_header_line(line_ptr, line_len);
 
-      if p_ptr != 0 && p_len > 0 {
-        let view: string = std::runtime::mem::string_from_ptr_len(p_ptr, p_len as int);
-        let own_opt: string? = cstr_copy_owned(view);
-        if own_opt == None {
-          if base_prefix != None {
-            let bp0: string = match (base_prefix) { Some(v) => v, None => "" };
-            free_joined(bp0);
-            base_prefix = None;
-          }
+    if is_git_hdr {
+      if current_start >= 0 && current_path != None {
+        let path_owned: string = match (current_path) { Some(v) => v, None => "" };
+        current_path = None;
+        let rc: int = diff_push_section_tab(cfg, mut tabs, path_owned, diff_ptr, current_start, pos);
+        if rc < 0 {
           return false;
         }
-        var own: string = match (own_opt) { Some(v) => v, None => "" };
-
-        // Skip missing local paths (deleted files, patches applied elsewhere).
-        var ok_path: bool = true;
-        if own != "-" && !is_network_path(own) {
-          ok_path = false;
-
-          // First try a cached repo/subdir prefix discovered from earlier files.
-          if base_prefix != None {
-            let bp: string = match (base_prefix) { Some(v) => v, None => "" };
-            let cand_opt: string? = join2(bp, own);
-            if cand_opt == None {
-              free_joined(own);
-              free_joined(bp);
-              base_prefix = None;
-              return false;
-            }
-            let cand: string = match (cand_opt) { Some(v) => v, None => "" };
-            let fd0: int = std::runtime::posix::fs::open(cand, std::runtime::posix::fs::O_RDONLY, 0) as int;
-            if fd0 >= 0 {
-              let _ = std::runtime::posix::fs::close(fd0);
-              ok_path = true;
-              free_joined(own);
-              own = cand;
-            } else {
-              free_joined(cand);
-            }
-          }
-
-          // Try as-is (relative to cwd).
-          if !ok_path {
-            let fd1: int = std::runtime::posix::fs::open(own, std::runtime::posix::fs::O_RDONLY, 0) as int;
-            if fd1 >= 0 {
-              let _ = std::runtime::posix::fs::close(fd1);
-              ok_path = true;
-            }
-          }
-
-          // For relative paths, try resolving by walking up parent directories.
-          let op: u64 = std::runtime::mem::string_ptr(own);
-          let on: i64 = std::runtime::mem::string_len(own);
-          let is_abs: bool = op != 0 && on > 0 && std::runtime::mem::load_u8(op, 0) == 47; // '/'
-          if !ok_path && !is_abs {
-            var prefix: string = "../";
-            var prefix_owned: bool = false;
-            var up: i64 = 0;
-            while up < DIFF_PATH_RESOLVE_MAX_UP {
-              let cand_opt2: string? = join2(prefix, own);
-              if cand_opt2 == None {
-                if prefix_owned { free_joined(prefix); }
-                free_joined(own);
-                if base_prefix != None {
-                  let bp2: string = match (base_prefix) { Some(v) => v, None => "" };
-                  free_joined(bp2);
-                  base_prefix = None;
-                }
-                return false;
-              }
-              let cand2: string = match (cand_opt2) { Some(v) => v, None => "" };
-              let fd2: int = std::runtime::posix::fs::open(cand2, std::runtime::posix::fs::O_RDONLY, 0) as int;
-              if fd2 >= 0 {
-                let _ = std::runtime::posix::fs::close(fd2);
-                ok_path = true;
-                free_joined(own);
-                own = cand2;
-                break;
-              }
-              free_joined(cand2);
-
-              let next_opt: string? = join2(prefix, "../");
-              if next_opt == None {
-                if prefix_owned { free_joined(prefix); }
-                free_joined(own);
-                if base_prefix != None {
-                  let bp3: string = match (base_prefix) { Some(v) => v, None => "" };
-                  free_joined(bp3);
-                  base_prefix = None;
-                }
-                return false;
-              }
-              let next: string = match (next_opt) { Some(v) => v, None => "" };
-              if prefix_owned { free_joined(prefix); }
-              prefix = next;
-              prefix_owned = true;
-              up = up + 1;
-            }
-            if prefix_owned { free_joined(prefix); }
-          }
-
-          // Final fallback: search for the file within immediate child directories
-          // of this directory and its parents (useful for monorepos).
-          if !ok_path && !is_abs {
-            var pfx2: string = "./";
-            var pfx2_owned: bool = false;
-            var up2: i64 = 0;
-            while up2 <= DIFF_PATH_RESOLVE_MAX_UP {
-              let dir: u64 = std::runtime::posix::fs::opendir(pfx2);
-              if dir != 0 {
-                var scanned: i64 = 0;
-                while scanned < 512 {
-                  let name_cstr: u64 = std::runtime::posix::fs::readdir_name_owned(dir);
-                  if name_cstr == 0 {
-                    break;
-                  }
-                  let name_len: i64 = cstr_len_max(name_cstr, 4096);
-                  let name: string = std::runtime::mem::string_from_ptr_len(name_cstr, name_len as int);
-                  if name == "." || name == ".." {
-                    std::runtime::mem::free(name_cstr);
-                    continue;
-                  }
-
-                  let base_opt: string? = join2(pfx2, name);
-                  std::runtime::mem::free(name_cstr);
-                  if base_opt == None {
-                    let _ = std::runtime::posix::fs::closedir(dir);
-                    if pfx2_owned { free_joined(pfx2); }
-                    free_joined(own);
-                    if base_prefix != None {
-                      let bp4: string = match (base_prefix) { Some(v) => v, None => "" };
-                      free_joined(bp4);
-                      base_prefix = None;
-                    }
-                    return false;
-                  }
-                  let base: string = match (base_opt) { Some(v) => v, None => "" };
-
-                  let dirp_opt: string? = join2(base, "/");
-                  free_joined(base);
-                  if dirp_opt == None {
-                    let _ = std::runtime::posix::fs::closedir(dir);
-                    if pfx2_owned { free_joined(pfx2); }
-                    free_joined(own);
-                    if base_prefix != None {
-                      let bp5: string = match (base_prefix) { Some(v) => v, None => "" };
-                      free_joined(bp5);
-                      base_prefix = None;
-                    }
-                    return false;
-                  }
-                  let dirp: string = match (dirp_opt) { Some(v) => v, None => "" };
-
-                  let cand_opt3: string? = join2(dirp, own);
-                  if cand_opt3 == None {
-                    free_joined(dirp);
-                    let _ = std::runtime::posix::fs::closedir(dir);
-                    if pfx2_owned { free_joined(pfx2); }
-                    free_joined(own);
-                    if base_prefix != None {
-                      let bp6: string = match (base_prefix) { Some(v) => v, None => "" };
-                      free_joined(bp6);
-                      base_prefix = None;
-                    }
-                    return false;
-                  }
-                  let cand3: string = match (cand_opt3) { Some(v) => v, None => "" };
-
-                  let fd3: int = std::runtime::posix::fs::open(cand3, std::runtime::posix::fs::O_RDONLY, 0) as int;
-                  if fd3 >= 0 {
-                    let _ = std::runtime::posix::fs::close(fd3);
-                    ok_path = true;
-                    free_joined(own);
-                    own = cand3;
-                    free_joined(dirp);
-                    break;
-                  }
-                  free_joined(cand3);
-                  free_joined(dirp);
-                  scanned = scanned + 1;
-                }
-                let _ = std::runtime::posix::fs::closedir(dir);
-              }
-
-              if ok_path {
-                break;
-              }
-              if up2 == DIFF_PATH_RESOLVE_MAX_UP {
-                break;
-              }
-              let next2_opt: string? = join2(pfx2, "../");
-              if next2_opt == None {
-                if pfx2_owned { free_joined(pfx2); }
-                free_joined(own);
-                if base_prefix != None {
-                  let bp7: string = match (base_prefix) { Some(v) => v, None => "" };
-                  free_joined(bp7);
-                  base_prefix = None;
-                }
-                return false;
-              }
-              let next2: string = match (next2_opt) { Some(v) => v, None => "" };
-              if pfx2_owned { free_joined(pfx2); }
-              pfx2 = next2;
-              pfx2_owned = true;
-              up2 = up2 + 1;
-            }
-            if pfx2_owned { free_joined(pfx2); }
-          }
+        if rc > 0 {
+          added = added + 1;
         }
+      }
 
-        if ok_path {
-          let idx: i64 = tabs.len;
-          let rc: int = tabs_push_owned_unique(mut tabs, own);
-          if rc < 0 {
-            free_joined(own);
-            if base_prefix != None {
-              let bp8: string = match (base_prefix) { Some(v) => v, None => "" };
-              free_joined(bp8);
-              base_prefix = None;
-            }
+      current_start = pos;
+      pending_old_start = -1;
+      current_has_git = true;
+      current_header_complete = false;
+
+      if current_path != None {
+        let stale: string = match (current_path) { Some(v) => v, None => "" };
+        current_path = None;
+        free_joined(stale);
+      }
+
+      let own_opt: string? = diff_ctx_path_owned(&ctx);
+      if own_opt != None {
+        let own: string = match (own_opt) { Some(v) => v, None => "" };
+        current_path = Some(own);
+      }
+    } else if is_unified_old {
+      if current_has_git && current_header_complete {
+        if current_start >= 0 && current_path != None {
+          let path_owned2a: string = match (current_path) { Some(v) => v, None => "" };
+          current_path = None;
+          let rc2a: int = diff_push_section_tab(cfg, mut tabs, path_owned2a, diff_ptr, current_start, pos);
+          if rc2a < 0 {
             return false;
           }
-          if rc == 1 {
-            let mut tnew: TabState = (tabs.ptr as TabState[](tabs.cap as int))[idx];
-            tnew.gutter_on = gutter_default_for_path(cfg, tnew.path);
-            (tabs.ptr as TabState[](tabs.cap as int))[idx] = tnew;
+          if rc2a > 0 {
             added = added + 1;
           }
-        } else {
-          free_joined(own);
         }
+
+        current_start = pos;
+        current_has_git = false;
+        current_header_complete = false;
+      } else if !current_has_git {
+        if current_start >= 0 && current_path != None {
+          let path_owned2: string = match (current_path) { Some(v) => v, None => "" };
+          current_path = None;
+          let rc2: int = diff_push_section_tab(cfg, mut tabs, path_owned2, diff_ptr, current_start, pos);
+          if rc2 < 0 {
+            return false;
+          }
+          if rc2 > 0 {
+            added = added + 1;
+          }
+        }
+
+        current_start = pos;
+      }
+      pending_old_start = pos;
+    } else if is_unified_new {
+      if current_has_git {
+        current_header_complete = true;
+      } else {
+        if current_start < 0 {
+          if pending_old_start >= 0 {
+            current_start = pending_old_start;
+          } else {
+            current_start = pos;
+          }
+        }
+
+        if current_path != None {
+          let stale2: string = match (current_path) { Some(v) => v, None => "" };
+          current_path = None;
+          free_joined(stale2);
+        }
+
+        let own_opt2: string? = diff_ctx_path_owned(&ctx);
+        if own_opt2 != None {
+          let own2: string = match (own_opt2) { Some(v) => v, None => "" };
+          current_path = Some(own2);
+        }
+      }
+    } else if current_has_git && line_len >= 2 {
+      let b0: u8 = std::runtime::mem::load_u8(line_ptr, 0);
+      let b1: u8 = std::runtime::mem::load_u8(line_ptr, 1);
+      if b0 == 64 && b1 == 64 { // "@@"
+        current_header_complete = true;
       }
     }
 
@@ -3564,10 +3411,17 @@ fn diff_add_file_tabs (cfg: &Config, mut tabs: &Tabs, diff_ptr: u64, diff_len: i
     pos = ((nl_ptr - diff_ptr) as i64) + 1;
   }
 
-  if base_prefix != None {
-    let bp9: string = match (base_prefix) { Some(v) => v, None => "" };
-    free_joined(bp9);
-    base_prefix = None;
+  if added < DIFF_MAX_FILE_TABS && current_start >= 0 && current_path != None {
+    let path_owned3: string = match (current_path) { Some(v) => v, None => "" };
+    current_path = None;
+    let rc3: int = diff_push_section_tab(cfg, mut tabs, path_owned3, diff_ptr, current_start, diff_len);
+    if rc3 < 0 {
+      return false;
+    }
+  } else if current_path != None {
+    let stale3: string = match (current_path) { Some(v) => v, None => "" };
+    current_path = None;
+    free_joined(stale3);
   }
   return true;
 }
@@ -4746,6 +4600,74 @@ test "word_span_at extracts identifiers" {
   assert(sp5_opt == None, "dash none");
 }
 
+fn diff_test_tabs_alloc (cap: i64) -> Tabs {
+  let tab_bytes: i64 = (sizeof (TabState)) as i64;
+  let bytes: i64 = cap * tab_bytes;
+  let ptr: u64 = if bytes > 0 { std::runtime::mem::alloc(bytes) } else { 0 };
+  assert(cap <= 0 || ptr != 0, "tabs alloc");
+  return Tabs{ ptr: ptr, len: 0, cap: cap, zero_based_labels: false };
+}
+
+test "diff_add_file_tabs handles concatenated unified sections" {
+  let cfg: Config = cfg_default();
+  let diff: string = "--- a/one.txt\n+++ b/one.txt\n@@ -1 +1 @@\n-old\n+one\n--- a/two.txt\n+++ b/two.txt\n@@ -1 +1 @@\n-old\n+two\n";
+
+  let p: u64 = std::runtime::mem::string_ptr(diff);
+  let n: i64 = std::runtime::mem::string_len(diff);
+  let mut tabs: Tabs = diff_test_tabs_alloc(4);
+
+  let ok: bool = diff_add_file_tabs(&cfg, mut tabs, p, n);
+  assert(ok, "diff add");
+  assert(tabs.len == 2, "two tabs");
+
+  let t0: TabState = (tabs.ptr as TabState[](tabs.cap as int))[0];
+  let t1: TabState = (tabs.ptr as TabState[](tabs.cap as int))[1];
+  assert(t0.path == "one.txt", "first path");
+  assert(t1.path == "two.txt", "second path");
+  assert(t0.view_spool_path != None, "first spool");
+  assert(t1.view_spool_path != None, "second spool");
+
+  tabs_free(mut tabs);
+}
+
+test "diff_add_file_tabs handles git then non-git sections" {
+  let cfg: Config = cfg_default();
+  let diff: string = "diff --git a/one.txt b/one.txt\n--- a/one.txt\n+++ b/one.txt\n@@ -1 +1 @@\n-old\n+one\n--- a/two.txt\n+++ b/two.txt\n@@ -1 +1 @@\n-old\n+two\n";
+
+  let p: u64 = std::runtime::mem::string_ptr(diff);
+  let n: i64 = std::runtime::mem::string_len(diff);
+  let mut tabs: Tabs = diff_test_tabs_alloc(4);
+
+  let ok: bool = diff_add_file_tabs(&cfg, mut tabs, p, n);
+  assert(ok, "diff add");
+  assert(tabs.len == 2, "two tabs");
+
+  let t0: TabState = (tabs.ptr as TabState[](tabs.cap as int))[0];
+  let t1: TabState = (tabs.ptr as TabState[](tabs.cap as int))[1];
+  assert(t0.path == "one.txt", "first path");
+  assert(t1.path == "two.txt", "second path");
+
+  tabs_free(mut tabs);
+}
+
+test "diff_add_file_tabs ignores hunk lines that look like headers" {
+  let cfg: Config = cfg_default();
+  let diff: string = "--- a/one.txt\n+++ b/one.txt\n@@ -1 +1,2 @@\n old\n+++ ./not-a-header\n";
+
+  let p: u64 = std::runtime::mem::string_ptr(diff);
+  let n: i64 = std::runtime::mem::string_len(diff);
+  let mut tabs: Tabs = diff_test_tabs_alloc(4);
+
+  let ok: bool = diff_add_file_tabs(&cfg, mut tabs, p, n);
+  assert(ok, "diff add");
+  assert(tabs.len == 1, "one tab");
+
+  let t0: TabState = (tabs.ptr as TabState[](tabs.cap as int))[0];
+  assert(t0.path == "one.txt", "path");
+
+  tabs_free(mut tabs);
+}
+
 // ---------------------------------------------------------------------------
 // Theme (256-color palette).
 
@@ -5184,7 +5106,7 @@ fn draw_help (
   if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.accent, "Right / Left", help_desc_col, "forward/back a page"); r = r + 1; }
   if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.accent, "Tab / Shift-Tab", help_desc_col, "next/prev file tab"); r = r + 1; }
   if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.accent, "MouseClickTab", help_desc_col, "switch to clicked tab"); r = r + 1; }
-  if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.accent, "1-9", help_desc_col, "jump to tab N (0 = last tab)"); r = r + 1; }
+  if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.accent, "0-9", help_desc_col, "jump to tab number (0 = tab 0 in diff view, else last tab)"); r = r + 1; }
   if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.accent, "gg / Home", help_desc_col, "top"); r = r + 1; }
   if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.accent, "G / End", help_desc_col, "bottom"); r = r + 1; }
 
@@ -5228,7 +5150,7 @@ fn draw_help (
     ansi_clear_eol(mut w);
     r = r + 1;
   }
-  if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.accent, ":", help_desc_col, "goto line (:<n>, :0=top, :<neg>=from end), :tab <n>/:t<n> (0 = last), :bn/:bp, :q quit"); r = r + 1; }
+  if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.accent, ":", help_desc_col, "goto line (:<n>, :0=top, :<neg>=from end), :tab <n>/:t<n> (0 = tab 0 in diff view, else last), :bn/:bp, :q quit"); r = r + 1; }
   if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.accent, "L", help_desc_col, "toggle line-number gutter"); r = r + 1; }
   if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.accent, "MouseDrag", help_desc_col, "select text (gutter excluded)"); r = r + 1; }
   if r < content_rows { draw_help_row(mut w, theme, start_row + r, theme.accent, "Ctrl-C", help_desc_col, "copy selection (OSC 52)"); r = r + 1; }
@@ -5316,8 +5238,8 @@ fn draw_help_row (mut w: &Writer, _theme: &Theme, row: int, key_color: int, key:
   ansi_clear_eol(mut w);
 }
 
-fn tab_label_est_len (path: string, idx: i64, name_max: int) -> int {
-  let disp: i64 = idx + 1;
+fn tab_label_est_len (path: string, zero_based_labels: bool, idx: i64, name_max: int) -> int {
+  let disp: i64 = tab_user_num(zero_based_labels, idx);
   let name_ptr: u64 = std::runtime::mem::string_ptr(path);
   let name_len: i64 = std::runtime::mem::string_len(path);
   if name_ptr == 0 || name_len <= 0 {
@@ -5339,6 +5261,7 @@ fn draw_tabs (
   mut w: &Writer,
   theme: &Theme,
   cols: int,
+  zero_based_labels: bool,
   tabs_ptr: u64,
   tabs_cap: i64,
   tabs_len: i64,
@@ -5373,14 +5296,14 @@ fn draw_tabs (
   let sep_len: int = 1; // "│" (spaces come from segments)
   var start: i64 = a;
   var end: i64 = a + 1;
-  var total: int = tab_label_est_len((tabs_ptr as TabState[](tabs_cap as int))[a].path, a, TAB_NAME_MAX);
+  var total: int = tab_label_est_len((tabs_ptr as TabState[](tabs_cap as int))[a].path, zero_based_labels, a, TAB_NAME_MAX);
 
   while true {
     var did: bool = false;
 
     if start > 0 {
       let i0: i64 = start - 1;
-      let add: int = sep_len + tab_label_est_len((tabs_ptr as TabState[](tabs_cap as int))[i0].path, i0, TAB_NAME_MAX);
+      let add: int = sep_len + tab_label_est_len((tabs_ptr as TabState[](tabs_cap as int))[i0].path, zero_based_labels, i0, TAB_NAME_MAX);
       if (used + total + add) <= cols {
         start = i0;
         total = total + add;
@@ -5390,7 +5313,7 @@ fn draw_tabs (
 
     if end < tabs_len {
       let i1: i64 = end;
-      let add2: int = sep_len + tab_label_est_len((tabs_ptr as TabState[](tabs_cap as int))[i1].path, i1, TAB_NAME_MAX);
+      let add2: int = sep_len + tab_label_est_len((tabs_ptr as TabState[](tabs_cap as int))[i1].path, zero_based_labels, i1, TAB_NAME_MAX);
       if (used + total + add2) <= cols {
         end = i1 + 1;
         total = total + add2;
@@ -5451,7 +5374,7 @@ fn draw_tabs (
 
     // Remaining space; ensure the segment never wraps.
     let remaining: int = cols - used;
-    let disp_i: i64 = i + 1;
+    let disp_i: i64 = tab_user_num(zero_based_labels, i);
     let idx_digits: int = digits_i64(disp_i);
     let fixed: int = 2 + idx_digits + 1; // " " + <idx> + ":" + (name...) + " "
     var name_max: int = remaining - fixed;
@@ -5525,6 +5448,7 @@ fn draw_tabs (
 
 fn tab_hit_test (
   cols: int,
+  zero_based_labels: bool,
   tabs_ptr: u64,
   tabs_cap: i64,
   tabs_len: i64,
@@ -5555,14 +5479,14 @@ fn tab_hit_test (
   var used0: int = 1; // leading space in the bar
   var start: i64 = a;
   var end: i64 = a + 1;
-  var total: int = tab_label_est_len((tabs_ptr as TabState[](tabs_cap as int))[a].path, a, TAB_NAME_MAX);
+  var total: int = tab_label_est_len((tabs_ptr as TabState[](tabs_cap as int))[a].path, zero_based_labels, a, TAB_NAME_MAX);
 
   while true {
     var did: bool = false;
 
     if start > 0 {
       let i0: i64 = start - 1;
-      let add: int = sep_len + tab_label_est_len((tabs_ptr as TabState[](tabs_cap as int))[i0].path, i0, TAB_NAME_MAX);
+      let add: int = sep_len + tab_label_est_len((tabs_ptr as TabState[](tabs_cap as int))[i0].path, zero_based_labels, i0, TAB_NAME_MAX);
       if (used0 + total + add) <= cols {
         start = i0;
         total = total + add;
@@ -5572,7 +5496,7 @@ fn tab_hit_test (
 
     if end < tabs_len {
       let i1: i64 = end;
-      let add2: int = sep_len + tab_label_est_len((tabs_ptr as TabState[](tabs_cap as int))[i1].path, i1, TAB_NAME_MAX);
+      let add2: int = sep_len + tab_label_est_len((tabs_ptr as TabState[](tabs_cap as int))[i1].path, zero_based_labels, i1, TAB_NAME_MAX);
       if (used0 + total + add2) <= cols {
         end = i1 + 1;
         total = total + add2;
@@ -5633,7 +5557,7 @@ fn tab_hit_test (
     }
 
     let remaining: int = cols - used;
-    let disp_i: i64 = i + 1;
+    let disp_i: i64 = tab_user_num(zero_based_labels, i);
     let idx_digits: int = digits_i64(disp_i);
     let fixed: int = 2 + idx_digits + 1; // " " + <idx> + ":" + (name...) + " "
     var name_max: int = remaining - fixed;
@@ -6949,24 +6873,29 @@ fn find_run_open_files (cfg: &Config, tabs_ptr: u64, tabs_cap: i64, tabs_len: i6
     return out;
   }
 
-  // Count local + network file tabs (skip stdin).
+  // External tools can search real local paths only. Virtual views (diff tabs)
+  // and fetched URLs are searched internally.
   var local_count: i64 = 0;
-  var net_count: i64 = 0;
+  var internal_count: i64 = 0;
   if tabs_ptr != 0 && tabs_len > 0 {
     var i: i64 = 0;
     while i < tabs_len {
       let t: TabState = (tabs_ptr as TabState[](tabs_cap as int))[i];
-      if t.path != "-" {
-        if is_network_path(t.path) {
-          net_count = net_count + 1;
-        } else {
-          local_count = local_count + 1;
+      if !t.find_disabled {
+        if t.view_spool_path != None {
+          internal_count = internal_count + 1;
+        } else if t.path != "-" {
+          if is_network_path(t.path) {
+            internal_count = internal_count + 1;
+          } else {
+            local_count = local_count + 1;
+          }
         }
       }
       i = i + 1;
     }
   }
-  if local_count <= 0 && net_count <= 0 {
+  if local_count <= 0 && internal_count <= 0 {
     out.exit_code = 2;
     out.err_stage = -11;
     return out;
@@ -6982,8 +6911,8 @@ fn find_run_open_files (cfg: &Config, tabs_ptr: u64, tabs_cap: i64, tabs_len: i6
   var q_owned: string = "";
   var has_q_owned: bool = false;
 
-  // If we have no local paths, we can't run an external tool; just decide the
-  // output format so parsing/jumps work for internal URL results.
+  // If we have no external local paths, just decide the output format so
+  // parsing/jumps work for internal results too.
   if local_count <= 0 {
     if cfg.find_cmd != None {
       let cmd_raw0: string = match (cfg.find_cmd) { Some(v) => v, None => "" };
@@ -7076,7 +7005,7 @@ fn find_run_open_files (cfg: &Config, tabs_ptr: u64, tabs_cap: i64, tabs_len: i6
               var ti: i64 = 0;
               while ti < tabs_len {
                 let t: TabState = (tabs_ptr as TabState[](tabs_cap as int))[ti];
-                if t.path != "-" && !is_network_path(t.path) {
+                if !t.find_disabled && t.view_spool_path == None && t.path != "-" && !is_network_path(t.path) {
                   let _ = cmd.arg(t.path);
                 }
                 ti = ti + 1;
@@ -7150,7 +7079,7 @@ fn find_run_open_files (cfg: &Config, tabs_ptr: u64, tabs_cap: i64, tabs_len: i6
       var ti2: i64 = 0;
       while ti2 < tabs_len {
         let t: TabState = (tabs_ptr as TabState[](tabs_cap as int))[ti2];
-        if t.path != "-" && !is_network_path(t.path) {
+        if !t.find_disabled && t.view_spool_path == None && t.path != "-" && !is_network_path(t.path) {
           let _ = cmd.arg(t.path);
         }
         ti2 = ti2 + 1;
@@ -7179,9 +7108,9 @@ fn find_run_open_files (cfg: &Config, tabs_ptr: u64, tabs_cap: i64, tabs_len: i6
     }
   }
 
-  // Internal scan for URL tabs (external tools can't read in-memory fetches).
+  // Internal scan for virtual diff tabs and URL tabs.
   var internal_results: i64 = 0;
-  if net_count > 0 {
+  if internal_count > 0 {
     // Ensure a trailing newline before appending results.
     if out.stdout.len > 0 && out.stdout.ptr != 0 {
       let last: u8 = std::runtime::mem::load_u8(out.stdout.ptr, out.stdout.len - 1);
@@ -7193,8 +7122,9 @@ fn find_run_open_files (cfg: &Config, tabs_ptr: u64, tabs_cap: i64, tabs_len: i6
     var ti3: i64 = 0;
     while ti3 < tabs_len && internal_results < FIND_MAX_RESULTS {
       let t: TabState = (tabs_ptr as TabState[](tabs_cap as int))[ti3];
-      if t.path != "-" && is_network_path(t.path) {
-        let mi_opt: MappedInput? = map_input(t.path, cfg.allow_binary);
+      let internal_tab: bool = !t.find_disabled && (t.view_spool_path != None || (t.path != "-" && is_network_path(t.path)));
+      if internal_tab {
+        let mi_opt: MappedInput? = map_input_for_tab(&t, cfg.allow_binary);
         if mi_opt != None {
           let mut mi: MappedInput = match (mi_opt) { Some(v) => v, None => mapped_input_empty() };
           let mut mf: MappedFile = mi.file;
@@ -7211,7 +7141,7 @@ fn find_run_open_files (cfg: &Config, tabs_ptr: u64, tabs_cap: i64, tabs_len: i6
 
           mf.drop();
         } else if local_count <= 0 {
-          // Only URL tabs were searchable and at least one failed to map.
+          // Only internal tabs were searchable and at least one failed to map.
           out.exit_code = 2;
           out.err_stage = -14;
         }
@@ -7220,8 +7150,8 @@ fn find_run_open_files (cfg: &Config, tabs_ptr: u64, tabs_cap: i64, tabs_len: i6
     }
   }
 
-  // Combine exit code with internal results so "[no matches]" doesn't show when
-  // URL tabs matched.
+  // Combine exit code with internal results so "[no matches]" doesn't show
+  // when virtual views or URL tabs matched.
   if local_count <= 0 {
     if out.exit_code == 0 || out.exit_code == 1 {
       out.exit_code = if internal_results > 0 { 0 } else { 1 };
@@ -8273,7 +8203,7 @@ export async fn main (argc: int, argv: u64) -> int {
       let _ = write_str(std::runtime::posix::io::STDERR_FD, "sage: out of memory\n");
       return 2;
     }
-    let mut tabs: Tabs = match (tabs_opt) { Some(v) => v, None => Tabs{ ptr: 0, len: 0, cap: 0 } };
+    let mut tabs: Tabs = match (tabs_opt) { Some(v) => v, None => Tabs{ ptr: 0, len: 0, cap: 0, zero_based_labels: false } };
 
     if v_on {
       let _ = vw.push_str("sage[v] tabs=");
@@ -8400,6 +8330,7 @@ export async fn main (argc: int, argv: u64) -> int {
     if tabs.len == 1 && diff_looks_like(file.ptr, file.len) {
       let mut t0: TabState = (tabs.ptr as TabState[](tabs.cap as int))[0];
       var can_split: bool = true;
+      let tabs_before: i64 = tabs.len;
       if t0.path == "-" {
         // Stdin is single-use; persist it to a temp path so switching tabs
         // can return to the full diff view.
@@ -8411,6 +8342,12 @@ export async fn main (argc: int, argv: u64) -> int {
       }
       if can_split {
         let _ = diff_add_file_tabs(&cfg, mut tabs, file.ptr, file.len);
+        if tabs.len > tabs_before {
+          tabs.zero_based_labels = true;
+          let mut t0b: TabState = (tabs.ptr as TabState[](tabs.cap as int))[0];
+          t0b.find_disabled = true;
+          (tabs.ptr as TabState[](tabs.cap as int))[0] = t0b;
+        }
       }
     }
 
@@ -8954,7 +8891,7 @@ export async fn main (argc: int, argv: u64) -> int {
         ansi_home(mut w);
 
         if tab_rows > 0 {
-          draw_tabs(mut w, &cfg.theme, cols, tabs.ptr, tabs.cap, tabs.len, active_tab);
+          draw_tabs(mut w, &cfg.theme, cols, tabs.zero_based_labels, tabs.ptr, tabs.cap, tabs.len, active_tab);
         }
 
         // Keep stateful comment/string highlighting aligned with `top_off` so
@@ -9586,7 +9523,7 @@ export async fn main (argc: int, argv: u64) -> int {
         // Tab switching by mouse click on the tab bar (row 1).
         if tab_rows > 0 && my == 1 {
           if is_press_or_motion && btn == 0 && !motion {
-            let hit: i64 = tab_hit_test(cols, tabs.ptr, tabs.cap, tabs.len, active_tab, use_color, mx);
+            let hit: i64 = tab_hit_test(cols, tabs.zero_based_labels, tabs.ptr, tabs.cap, tabs.len, active_tab, use_color, mx);
             if hit >= 0 && hit < tabs.len && hit != active_tab {
               want_tab = hit;
             }
@@ -9711,7 +9648,7 @@ export async fn main (argc: int, argv: u64) -> int {
         if want_tab < 0 {
           if is_byte && b >= 48 && b <= 57 { // '0'..'9'
             let n: i64 = (((b - 48) as int) as i64);
-            let idx_opt: i64? = tab_index_from_user_num(n, tabs.len);
+            let idx_opt: i64? = tab_index_from_user_num2(tabs.zero_based_labels, tabs.len, n);
             if idx_opt == None {
               alert = ALERT_TAB_RANGE;
               need_redraw = true;
@@ -10015,7 +9952,7 @@ export async fn main (argc: int, argv: u64) -> int {
                 alert = ALERT_TAB_RANGE;
               }
             } else if eq_nocase(c_ptr, head_len, "t") {
-              // Vim-ish shortcut: `:t 6` (tabs are 1-indexed; 0 selects the last tab)
+              // Vim-ish shortcut: `:t 6`
               is_tab_cmd = true;
               if arg_ptr == 0 || arg_len <= 0 || tabs.len <= 0 {
                 alert = ALERT_TAB_RANGE;
@@ -10025,13 +9962,13 @@ export async fn main (argc: int, argv: u64) -> int {
                   alert = ALERT_TAB_RANGE;
                 } else {
                   let t0: i64 = match (t_opt) { Some(v) => v, None => 0 };
-                  let idx_opt: i64? = tab_index_from_user_num(t0, tabs.len);
+                  let idx_opt: i64? = tab_index_from_user_num2(tabs.zero_based_labels, tabs.len, t0);
                   if idx_opt == None { alert = ALERT_TAB_RANGE; }
                   else { want_tab_cmd = match (idx_opt) { Some(v) => v, None => -1 }; }
                 }
               }
             } else if head_len >= 2 && (std::runtime::mem::load_u8(c_ptr, 0) == 116 || std::runtime::mem::load_u8(c_ptr, 0) == 84) {
-              // Vim-ish shortcut: `:t6` (tabs are 1-indexed; 0 selects the last tab)
+              // Vim-ish shortcut: `:t6`
               var ok_digits: bool = true;
               var di: i64 = 1;
               while di < head_len {
@@ -10052,7 +9989,7 @@ export async fn main (argc: int, argv: u64) -> int {
                     alert = ALERT_TAB_RANGE;
                   } else {
                     let t1: i64 = match (t_opt2) { Some(v) => v, None => 0 };
-                    let idx_opt2: i64? = tab_index_from_user_num(t1, tabs.len);
+                    let idx_opt2: i64? = tab_index_from_user_num2(tabs.zero_based_labels, tabs.len, t1);
                     if idx_opt2 == None { alert = ALERT_TAB_RANGE; }
                     else { want_tab_cmd = match (idx_opt2) { Some(v) => v, None => -1 }; }
                   }
@@ -10068,7 +10005,7 @@ export async fn main (argc: int, argv: u64) -> int {
                   alert = ALERT_TAB_RANGE;
                 } else {
                   let t0: i64 = match (t_opt) { Some(v) => v, None => 0 };
-                  let idx_opt3: i64? = tab_index_from_user_num(t0, tabs.len);
+                  let idx_opt3: i64? = tab_index_from_user_num2(tabs.zero_based_labels, tabs.len, t0);
                   if idx_opt3 == None { alert = ALERT_TAB_RANGE; }
                   else { want_tab_cmd = match (idx_opt3) { Some(v) => v, None => -1 }; }
                 }
