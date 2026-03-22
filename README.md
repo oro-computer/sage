@@ -24,6 +24,7 @@ man -l man/sage.1
 ```sh
 sage <path> [path ...]  # files or directories (dirs expand to child files)
 sage src/               # open all files in a directory (non-recursive)
+sage --print <path> [path ...]
 sage https://...        # open a URL
 sage ssh://...          # open a path through ssh
 cat <path> | bin/sage
@@ -37,6 +38,7 @@ sage --color never <path>
 sage --theme ocean <path>
 sage --no-alt-screen <path>
 sage --no-rc <path>
+sage --print --color always src/main.slk src/sage/out.slk
 ```
 
 ## Keys
@@ -72,6 +74,8 @@ sage --no-rc <path>
   passes through ANSI SGR (`ESC [ ... m`) so colored output (like `man`) renders
   (use `--no-ansi` to fully sanitize).
 - When stdout is not a TTY, `sage` falls back to streaming bytes to stdout.
+  Use `--print` to force safe rendered output instead; in that mode, `--color auto`
+  only emits colors when stdout is a TTY.
 - Line numbers are computed using a background indexer; on very large inputs they
   may briefly show `?` until the indexer scans past the current viewport.
 - The status bar, prompts, and match highlighting use ANSI colors (256-color SGR).
@@ -80,6 +84,10 @@ sage --no-rc <path>
 ## Syntax highlighting
 
 `sage` can apply syntax highlighting when viewing a file path (not stdin).
+
+`sage --print` reuses the same syntax highlighter, but prints content directly to
+stdout without the pager UI or line-number gutter. Multiple inputs are printed in
+the order they were passed.
 
 - Syntax definitions live in `XDG_CONFIG_HOME/sage/syntax/` (`~/.config/sage/syntax/`).
 - `sage --compile-cache` compiles them into `XDG_CACHE_HOME/sage/syntax/` (`~/.cache/sage/syntax/`).

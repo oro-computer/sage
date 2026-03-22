@@ -1,4 +1,4 @@
-.TH SAGE 7 "2026-03-05" "sage 0.1.0" "Miscellaneous Information Manual"
+.TH SAGE 7 "2026-03-20" "sage 0.1.0" "Miscellaneous Information Manual"
 .SH NAME
 sage \- concepts, configuration, and security notes
 .SH DESCRIPTION
@@ -16,6 +16,8 @@ stdin (use \fB\-\fR, or pipe into \fBsage\fR),
 network paths: \fBhttp://\fR, \fBhttps://\fR, and \fBssh://\fR.
 .PP
 When stdin is a pipe, \fBsage\fR reads keys from \fI/dev/tty\fR so it remains interactive.
+.PP
+\fB\-\-print\fR switches \fBsage\fR into a non\-interactive rendering mode: inputs are printed directly to \fBstdout\fR in argument order, with safe escaping and optional syntax highlighting, and without tabs or a line\-number gutter.
 .PP
 Network paths are treated as read\-only content.
 For syntax selection, \fBsage\fR ignores URL query strings and fragments.

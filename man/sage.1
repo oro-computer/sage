@@ -1,8 +1,13 @@
-.TH SAGE 1 "2026-03-05" "sage 0.1.0" "User Commands"
+.TH SAGE 1 "2026-03-20" "sage 0.1.0" "User Commands"
 .SH NAME
 sage \- a fast, ergonomic terminal pager
 .SH SYNOPSIS
 .B sage
+[\fIOPTIONS\fR]
+[\fIPATH\fR\ ...]
+.PP
+.B sage
+\-\-print
 [\fIOPTIONS\fR]
 [\fIPATH\fR\ ...]
 .PP
@@ -30,7 +35,7 @@ mouse scrolling and selection (optional),
 optional syntax highlighting via a compiled cache.
 .PP
 When \fBstdin\fR is a pipe (for example, \fBman\fR output), \fBsage\fR reads keys from \fI/dev/tty\fR so it remains interactive.
-If \fBstdout\fR is not a TTY, \fBsage\fR behaves like a safe pass\-through filter.
+If \fBstdout\fR is not a TTY, \fBsage\fR behaves like a safe pass\-through filter unless \fB\-\-print\fR is used.
 .PP
 If a \fIPATH\fR is a directory, \fBsage\fR opens each direct child file as a tab (non\-recursive).
 .SH OPTIONS
@@ -40,6 +45,10 @@ Show help and exit.
 .TP
 .B \-V\fR,\fB \-\-version
 Show version and exit.
+.TP
+.B \-p\fR,\fB \-\-print
+Print inputs directly to \fBstdout\fR with Sage's safe renderer and syntax highlighting, without entering the pager UI or rendering the line number gutter.
+Multiple inputs are printed in the order they were provided.
 .TP
 .B \-v\fR,\fB \-\-verbose
 Enable verbose logging to \fBstderr\fR.
@@ -51,7 +60,7 @@ Disable JavaScript plugins (QuickJS).
 Load plugins from \fIPATH\fR (unless \fBSAGE_PLUGINS_DIR\fR is set).
 .TP
 .B \-\-color\fR \fIMODE\fR
-UI color mode: \fBauto\fR, \fBalways\fR, or \fBnever\fR. In \fBauto\fR mode, \fBNO_COLOR\fR disables UI colors.
+UI color mode: \fBauto\fR, \fBalways\fR, or \fBnever\fR. In \fBauto\fR mode, \fBNO_COLOR\fR disables UI colors. In \fB\-\-print\fR mode, \fBauto\fR emits colors only when \fBstdout\fR is a TTY.
 .TP
 .B \-\-no\-color
 Disable UI colors (same as \fB\-\-color never\fR).
@@ -218,6 +227,8 @@ Left\-drag selects text in the content area (the gutter is excluded from selecti
 Many terminals and muxers use \fBShift\fR to bypass application mouse reporting for terminal\-native selection; use that if you prefer your terminal's selection behavior.
 .SH SYNTAX HIGHLIGHTING
 Syntax highlighting is optional and applies when \fBsage\fR is given a file path. Stdin (\fIPATH\fR \fB\-\fR) can be highlighted by setting a per\-tab override with \fB:set syntax=\fR.
+.PP
+In \fB\-\-print\fR mode, the same highlighter is used for direct output, but no pager chrome or gutter is rendered.
 .PP
 Sources live under:
 .IP

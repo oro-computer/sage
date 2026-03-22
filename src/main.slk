@@ -389,6 +389,7 @@ fn syntax_map_lookup (m: &SyntaxMap, path: string) -> string {
 struct Config {
   help: bool,
   version: bool,
+  print_mode: bool,
   compile_cache: bool,
   list_syntax: bool,
   verbose: bool,
@@ -440,6 +441,7 @@ let DIFF_MAX_FILE_TABS: i64 = 256;
 let DOUBLE_CLICK_NS: i64 = 350000000; // 350ms
 let WORD_QUERY_MAX: i64 = 256;
 let FIRST_LINE_MAX: i64 = 1024;
+let PRINT_FLUSH_BYTES: i64 = 65536;
 
 let FIND_FMT_GREP: int = 0;
 let FIND_FMT_VIMGREP: int = 1;
@@ -568,6 +570,7 @@ fn cfg_default () -> Config {
   return Config{
     help: false,
     version: false,
+    print_mode: false,
     compile_cache: false,
     list_syntax: false,
     verbose: false,
@@ -635,6 +638,11 @@ fn parse_cli (args: Args, base: Config) -> Config? {
     }
     if streq(a, "--version") || streq(a, "-V") {
       cfg.version = true;
+      i = i + 1;
+      continue;
+    }
+    if streq(a, "--print") || streq(a, "-p") {
+      cfg.print_mode = true;
       i = i + 1;
       continue;
     }
@@ -832,6 +840,16 @@ struct Tabs {
   zero_based_labels: bool,
 }
 
+fn tabs_init (cap: i64) -> Tabs? {
+  let tab_bytes: i64 = (sizeof (TabState)) as i64;
+  let bytes: i64 = cap * tab_bytes;
+  let ptr: u64 = if bytes > 0 { std::runtime::mem::alloc(bytes) } else { 0 };
+  if cap > 0 && ptr == 0 {
+    return None;
+  }
+  return Some(Tabs{ ptr: ptr, len: 0, cap: cap, zero_based_labels: false });
+}
+
 fn cstr_copy_owned (s: string) -> string? {
   // Allocate an owned, NUL-terminated copy so it can be passed to POSIX APIs.
   let p: u64 = std::runtime::mem::string_ptr(s);
@@ -971,7 +989,17 @@ fn tabs_push_owned_unique (mut tabs: &Tabs, path_owned: string) -> int {
   return 1;
 }
 
-fn tabs_expand_dir (mut tabs: &Tabs, dir_path: string) -> int {
+fn tabs_push_owned_policy (mut tabs: &Tabs, path_owned: string, unique: bool) -> int {
+  if unique {
+    return tabs_push_owned_unique(mut tabs, path_owned);
+  }
+  if !tabs_push_owned(mut tabs, path_owned) {
+    return -1;
+  }
+  return 1;
+}
+
+fn tabs_expand_dir (mut tabs: &Tabs, dir_path: string, unique: bool) -> int {
   // Expand a directory into its direct child files (non-recursive).
   //
   // NOTE: In this runtime snapshot, `opendir` is more reliable when paths end
@@ -1036,7 +1064,7 @@ fn tabs_expand_dir (mut tabs: &Tabs, dir_path: string) -> int {
     free_joined(child_dir);
 
     any_file = true;
-    let rc: int = tabs_push_owned_unique(mut tabs, full);
+    let rc: int = tabs_push_owned_policy(mut tabs, full, unique);
     if rc < 0 {
       free_joined(full);
       let _ = std::runtime::posix::fs::closedir(dir);
@@ -1059,7 +1087,7 @@ fn tabs_expand_dir (mut tabs: &Tabs, dir_path: string) -> int {
       return -1;
     }
     let own: string = match (own_opt) { Some(v) => v, None => "" };
-    let rc2: int = tabs_push_owned_unique(mut tabs, own);
+    let rc2: int = tabs_push_owned_policy(mut tabs, own, unique);
     if rc2 < 0 {
       free_joined(own);
       return -1;
@@ -1070,17 +1098,36 @@ fn tabs_expand_dir (mut tabs: &Tabs, dir_path: string) -> int {
   return 1;
 }
 
-fn tabs_collect (args: Args) -> Tabs? {
-  let n: int = args.count();
-  let cap: i64 = if n > 0 { n as i64 } else { 0 };
-  let tab_bytes: i64 = (sizeof (TabState)) as i64;
-  let bytes: i64 = cap * tab_bytes;
-  let ptr: u64 = if bytes > 0 { std::runtime::mem::alloc(bytes) } else { 0 };
-  if cap > 0 && ptr == 0 {
-    return None;
+fn tabs_add_input (mut tabs: &Tabs, a: string, unique: bool) -> int {
+  // Directory? Expand to child files. Otherwise, push the path as-is.
+  //
+  // Network paths should be treated as opaque.
+  let exp: int = if a != "-" && !is_network_path(a) { tabs_expand_dir(mut tabs, a, unique) } else { 0 };
+  if exp != 0 {
+    return exp;
   }
 
-  let mut tabs: Tabs = Tabs{ ptr: ptr, len: 0, cap: cap, zero_based_labels: false };
+  let own_opt: string? = cstr_copy_owned(a);
+  if own_opt == None {
+    return -1;
+  }
+  let own: string = match (own_opt) { Some(v) => v, None => "" };
+  let rc: int = tabs_push_owned_policy(mut tabs, own, unique);
+  if rc < 0 {
+    free_joined(own);
+    return -1;
+  }
+  return rc;
+}
+
+fn tabs_collect (args: Args, unique: bool) -> Tabs? {
+  let n: int = args.count();
+  let cap: i64 = if n > 0 { n as i64 } else { 0 };
+  let tabs_opt: Tabs? = tabs_init(cap);
+  if tabs_opt == None {
+    return None;
+  }
+  let mut tabs: Tabs = match (tabs_opt) { Some(v) => v, None => Tabs{ ptr: 0, len: 0, cap: 0, zero_based_labels: false } };
 
   var i: int = 1;
   var after_dd: bool = false;
@@ -1102,26 +1149,8 @@ fn tabs_collect (args: Args) -> Tabs? {
       continue;
     }
 
-    // Directory? Expand to child files. Otherwise, push the path as-is.
-    //
-    // Network paths should be treated as opaque.
-    let exp: int = if a != "-" && !is_network_path(a) { tabs_expand_dir(mut tabs, a) } else { 0 };
-    if exp == 1 {
-      // expanded
-    } else if exp == 0 {
-      let own_opt: string? = cstr_copy_owned(a);
-      if own_opt == None {
-        tabs_free(mut tabs);
-        return None;
-      }
-      let own: string = match (own_opt) { Some(v) => v, None => "" };
-      let rc: int = tabs_push_owned_unique(mut tabs, own);
-      if rc < 0 {
-        free_joined(own);
-        tabs_free(mut tabs);
-        return None;
-      }
-    } else {
+    let rc: int = tabs_add_input(mut tabs, a, unique);
+    if rc < 0 {
       // Fatal error while expanding directory (likely OOM).
       tabs_free(mut tabs);
       return None;
@@ -2227,6 +2256,19 @@ fn first_line_slice (ptr: u64, len: i64) -> ByteSlice {
   return ByteSlice{ ptr: ptr, len: take };
 }
 
+fn print_color_enabled (cfg: &Config, stdout_is_tty: bool) -> bool {
+  if cfg.color == COLOR_NEVER {
+    return false;
+  }
+  if cfg.color == COLOR_ALWAYS {
+    return true;
+  }
+  if !stdout_is_tty {
+    return false;
+  }
+  return std::runtime::env::getenv("NO_COLOR") == 0;
+}
+
 fn print_help () -> void {
   let w_opt: Writer? = Writer.stderr(false, 8192);
   if w_opt == None { return; }
@@ -2236,11 +2278,13 @@ fn print_help () -> void {
   let _ = w.push_str("\n");
   let _ = w.push_str("Usage:\n");
   let _ = w.push_str("  sage <path> [path ...]  (directories expand to child files)\n");
+  let _ = w.push_str("  sage --print <path> [path ...]\n");
   let _ = w.push_str("  cat <path> | sage\n");
   let _ = w.push_str("\n");
   let _ = w.push_str("Options:\n");
   print_help_opt(mut w, "  -h, --help", "Show help");
   print_help_opt(mut w, "  -V, --version", "Show version");
+  print_help_opt(mut w, "  -p, --print", "Print inputs directly with highlighting (no pager UI)");
   print_help_opt(mut w, "      --compile-cache", "Compile syntax files in XDG_CONFIG_HOME/sage/syntax");
   print_help_opt(mut w, "      --list-syntax", "List compiled syntax keys");
   print_help_opt(mut w, "  -v, --verbose", "Verbose logging to stderr");
@@ -2322,6 +2366,301 @@ fn stream_path_to_stdout (path: string) -> int {
 
 fn stream_stdin_to_stdout () -> int {
   return stream_fd_to_stdout(std::runtime::posix::io::STDIN_FD);
+}
+
+fn print_open_error (path: string) -> void {
+  let _ = write_str(std::runtime::posix::io::STDERR_FD, "sage: failed to open input: ");
+  let _ = write_str(std::runtime::posix::io::STDERR_FD, path);
+  let _ = write_str(std::runtime::posix::io::STDERR_FD, "\n");
+}
+
+fn flush_writer_if_needed (mut w: &Writer) -> bool {
+  if w.buf.len >= PRINT_FLUSH_BYTES {
+    return w.flush();
+  }
+  return true;
+}
+
+fn render_stream_line (mut w: &Writer, theme: &Theme, ptr: u64, len: i64, unsafe_raw: bool, allow_ansi: bool, styles: u64) -> bool {
+  if ptr == 0 || len <= 0 {
+    return true;
+  }
+
+  if unsafe_raw {
+    var off: i64 = 0;
+    while off < len {
+      var take: i64 = len - off;
+      if take > PRINT_FLUSH_BYTES {
+        take = PRINT_FLUSH_BYTES;
+      }
+      let _ = w.push_ptr_len(ptr + (off as u64), take);
+      if !flush_writer_if_needed(mut w) {
+        return false;
+      }
+      off = off + take;
+    }
+    return true;
+  }
+
+  let use_syntax: bool = styles != 0;
+  var cur_tok: u8 = TOK_NONE;
+  var col: int = 0;
+
+  if use_syntax {
+    ansi_reset(mut w);
+    ansi_tok_apply(mut w, theme, TOK_NONE);
+  }
+
+  var i: i64 = 0;
+  while i < len {
+    if use_syntax {
+      let tok: u8 = std::runtime::mem::load_u8(styles, i);
+      if tok != cur_tok {
+        ansi_tok_apply(mut w, theme, tok);
+        cur_tok = tok;
+      }
+    }
+
+    let b: u8 = std::runtime::mem::load_u8(ptr, i);
+
+    if b == 9 { // tab
+      let _ = w.push_u8(9);
+      col = col + (8 - (col & 7));
+      if !flush_writer_if_needed(mut w) {
+        return false;
+      }
+      i = i + 1;
+      continue;
+    }
+
+    if b == 27 { // ESC
+      if allow_ansi {
+        let rem: i64 = len - i;
+        let seq_len: i64 = csi_sgr_len(ptr + (i as u64), rem);
+        if seq_len > 0 {
+          let _ = w.push_ptr_len(ptr + (i as u64), seq_len);
+          if !flush_writer_if_needed(mut w) {
+            return false;
+          }
+          i = i + seq_len;
+          continue;
+        }
+      }
+      let _ = w.push_u8(94); // '^'
+      let _ = w.push_u8(91); // '['
+      col = col + 2;
+      if !flush_writer_if_needed(mut w) {
+        return false;
+      }
+      i = i + 1;
+      continue;
+    }
+
+    if b < 32 {
+      let _ = w.push_u8(94); // '^'
+      let _ = w.push_u8(b + 64);
+      col = col + 2;
+      if !flush_writer_if_needed(mut w) {
+        return false;
+      }
+      i = i + 1;
+      continue;
+    }
+
+    if b == 127 {
+      let _ = w.push_u8(94); // '^'
+      let _ = w.push_u8(63); // '?'
+      col = col + 2;
+      if !flush_writer_if_needed(mut w) {
+        return false;
+      }
+      i = i + 1;
+      continue;
+    }
+
+    let _ = w.push_u8(b);
+    col = col + 1;
+    if !flush_writer_if_needed(mut w) {
+      return false;
+    }
+    i = i + 1;
+  }
+
+  if use_syntax && cur_tok != TOK_NONE {
+    ansi_tok_apply(mut w, theme, TOK_NONE);
+    if !flush_writer_if_needed(mut w) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+fn print_inputs (cfg: &Config, tabs: &Tabs, use_color: bool, mut vw: &Writer, v_on: bool) -> int {
+  let w_opt: Writer? = Writer.stdout(use_color, PRINT_FLUSH_BYTES);
+  if w_opt == None {
+    return 2;
+  }
+  let mut w: Writer = match (w_opt) { Some(v) => v, None => Writer{ fd: -1, color: use_color, buf: BufferU8.empty() } };
+
+  var had_error: bool = false;
+  var i: i64 = 0;
+  while i < tabs.len {
+    let t: TabState = (tabs.ptr as TabState[](tabs.cap as int))[i];
+    if v_on {
+      let _ = vw.push_str("sage[v] print path=");
+      let _ = vw.push_str(t.path);
+      let _ = vw.push_u8(10);
+      let _ = vw.flush();
+    }
+
+    let mi_opt: MappedInput? = map_input_for_tab(&t, cfg.allow_binary);
+    if mi_opt == None {
+      print_open_error(t.path);
+      had_error = true;
+      i = i + 1;
+      continue;
+    }
+
+    let mut mi: MappedInput = match (mi_opt) { Some(v) => v, None => mapped_input_empty() };
+    let syntax_hint: string = mi.syntax_hint;
+    let mut file: MappedFile = mi.file;
+    mi.file = MappedFile{ ptr: 0, len: 0 };
+
+    var allow_ansi: bool = cfg.ansi;
+    var syn_active: bool = false;
+    let mut syn: Highlighter = highlighter_empty();
+    let has_override: bool = t.syntax_override != None;
+    if (cfg.syntax || has_override) && use_color && !cfg.unsafe_raw && tab_may_use_syntax(t.path, allow_ansi, file.ptr, file.len, has_override) {
+      let syn_path: string = path_for_syntax(t.path);
+      let fl: ByteSlice = first_line_slice(file.ptr, file.len);
+      let mapped_syntax: string = syntax_map_lookup(&cfg.syntax_map, syn_path);
+
+      let mut syn_opt: Highlighter? = None;
+      if has_override {
+        let key: string = match (t.syntax_override) { Some(v) => v, None => "" };
+        syn_opt = load_for_key(key);
+      }
+      if syn_opt == None && mapped_syntax != "" {
+        syn_opt = load_for_key(mapped_syntax);
+      }
+      if syn_opt == None {
+        syn_opt = load_for_path_or_first_line(syn_path, fl.ptr, fl.len);
+      }
+      if syn_opt == None && syntax_hint != "" {
+        syn_opt = load_for_key(syntax_hint);
+      }
+      if syn_opt != None {
+        syn = match (syn_opt) { Some(v) => v, None => syn };
+        syn_active = true;
+        allow_ansi = false;
+      }
+    }
+
+    var style_ptr: u64 = 0;
+    var style_cap: i64 = 0;
+    var hl_state: HLState = hl_state_init();
+    var diff_inject: bool = syn_active && diff_looks_like(file.ptr, file.len);
+    var diff_ctx: DiffCtx = diff_ctx_empty();
+    var diff_syn_a: DiffSynCache = diff_syn_cache_empty();
+    var diff_syn_b: DiffSynCache = diff_syn_cache_empty();
+    var diff_scratch: StyleScratch = style_scratch_empty();
+
+    var cur: i64 = 0;
+    while cur < file.len {
+      let tail_len: i64 = file.len - cur;
+      let nl_ptr: u64 = if tail_len > 0 { memchr(file.ptr + (cur as u64), 10, tail_len) } else { 0 };
+
+      var has_nl: bool = false;
+      var nl_next: i64 = file.len;
+      var line_len: i64 = tail_len;
+      if nl_ptr != 0 {
+        has_nl = true;
+        let nl_pos: i64 = (nl_ptr - file.ptr) as i64;
+        nl_next = nl_pos + 1;
+        line_len = nl_pos - cur;
+        if line_len > 0 {
+          let last_b: u8 = std::runtime::mem::load_u8(file.ptr, (cur + line_len) - 1);
+          if last_b == 13 {
+            line_len = line_len - 1;
+          }
+        }
+      }
+
+      let line_ptr: u64 = file.ptr + (cur as u64);
+      let at_line_start: bool = is_logical_line_start(file.ptr, file.len, cur);
+      if diff_inject && at_line_start {
+        diff_ctx_on_physical_line_start(file.ptr, file.len, cur, mut diff_ctx);
+      }
+
+      var styles: u64 = 0;
+      if syn_active && line_len > 0 {
+        if line_len > style_cap {
+          if style_ptr != 0 { std::runtime::mem::free(style_ptr); }
+          style_ptr = 0;
+          style_cap = 0;
+          var new_cap: i64 = line_len;
+          if new_cap < 8192 { new_cap = 8192; }
+          let p2: u64 = std::runtime::mem::alloc(new_cap);
+          if p2 == 0 {
+            syn_active = false;
+            diff_inject = false;
+          } else {
+            style_ptr = p2;
+            style_cap = new_cap;
+          }
+        }
+        if syn_active && style_ptr != 0 {
+          let ok_hl: bool = highlight_segment_stateful(&syn, mut hl_state, line_ptr, line_len, style_ptr);
+          if ok_hl {
+            styles = style_ptr;
+            if diff_inject {
+              diff_inject_overlay(
+                &diff_ctx,
+                line_ptr,
+                line_len,
+                at_line_start,
+                styles,
+                mut diff_scratch,
+                mut diff_syn_a,
+                mut diff_syn_b
+              );
+            }
+          }
+        }
+      }
+
+      if !render_stream_line(mut w, &cfg.theme, line_ptr, line_len, cfg.unsafe_raw, allow_ansi, styles) {
+        if style_ptr != 0 { std::runtime::mem::free(style_ptr); }
+        return 2;
+      }
+
+      if has_nl {
+        let _ = w.push_u8(10);
+        if !flush_writer_if_needed(mut w) {
+          if style_ptr != 0 { std::runtime::mem::free(style_ptr); }
+          return 2;
+        }
+        if syn_active {
+          hl_state_on_newline(mut hl_state);
+        }
+        cur = nl_next;
+      } else {
+        cur = file.len;
+      }
+    }
+
+    if style_ptr != 0 {
+      std::runtime::mem::free(style_ptr);
+    }
+
+    i = i + 1;
+  }
+
+  if !w.flush() {
+    return 2;
+  }
+  return if had_error { 2 } else { 0 };
 }
 
 fn stream_bytes_to_stdout (ptr: u64, len: i64) -> int {
@@ -4682,6 +5021,73 @@ test "diff_add_file_tabs ignores hunk lines that look like headers" {
   assert(t0.path == "one.txt", "path");
 
   tabs_free(mut tabs);
+}
+
+test "tabs_add_input preserves duplicates for print mode" {
+  let mut tabs: Tabs = diff_test_tabs_alloc(4);
+
+  let rc0: int = tabs_add_input(mut tabs, "dup.txt", false);
+  let rc1: int = tabs_add_input(mut tabs, "dup.txt", false);
+  assert(rc0 >= 0, "first add");
+  assert(rc1 >= 0, "second add");
+  assert(tabs.len == 2, "duplicates preserved");
+
+  let t0: TabState = (tabs.ptr as TabState[](tabs.cap as int))[0];
+  let t1: TabState = (tabs.ptr as TabState[](tabs.cap as int))[1];
+  assert(t0.path == "dup.txt", "first path");
+  assert(t1.path == "dup.txt", "second path");
+
+  tabs_free(mut tabs);
+}
+
+test "tabs_add_input deduplicates for tab mode" {
+  let mut tabs: Tabs = diff_test_tabs_alloc(4);
+
+  let rc0: int = tabs_add_input(mut tabs, "dup.txt", true);
+  let rc1: int = tabs_add_input(mut tabs, "dup.txt", true);
+  assert(rc0 >= 0, "first add");
+  assert(rc1 >= 0, "second add");
+  assert(tabs.len == 1, "duplicate skipped");
+
+  let t0: TabState = (tabs.ptr as TabState[](tabs.cap as int))[0];
+  assert(t0.path == "dup.txt", "path");
+
+  tabs_free(mut tabs);
+}
+
+test "render_stream_line preserves tabs and escapes controls" {
+  let in_opt: BufferU8? = BufferU8.init(16);
+  assert(in_opt != None, "input alloc");
+  let mut input: BufferU8 = match (in_opt) { Some(v) => v, None => BufferU8.empty() };
+
+  let _ = input.push_u8(97); // 'a'
+  let _ = input.push_u8(9);  // '\t'
+  let _ = input.push_u8(98); // 'b'
+  let _ = input.push_u8(27); // ESC
+  let _ = input.push_u8(91); // '['
+  let _ = input.push_u8(51); // '3'
+  let _ = input.push_u8(49); // '1'
+  let _ = input.push_u8(109); // 'm'
+  let _ = input.push_u8(1); // ^A
+
+  let out_opt: BufferU8? = BufferU8.init(32);
+  assert(out_opt != None, "output alloc");
+  let mut w: Writer = Writer{ fd: -1, color: false, buf: match (out_opt) { Some(v) => v, None => BufferU8.empty() } };
+  let theme: Theme = theme_default();
+
+  let ok: bool = render_stream_line(mut w, &theme, input.ptr, input.len, false, true, 0);
+  assert(ok, "render ok");
+  assert(w.buf.len == 10, "render len");
+  assert(std::runtime::mem::load_u8(w.buf.ptr, 0) == 97, "a");
+  assert(std::runtime::mem::load_u8(w.buf.ptr, 1) == 9, "tab");
+  assert(std::runtime::mem::load_u8(w.buf.ptr, 2) == 98, "b");
+  assert(std::runtime::mem::load_u8(w.buf.ptr, 3) == 27, "esc");
+  assert(std::runtime::mem::load_u8(w.buf.ptr, 4) == 91, "[");
+  assert(std::runtime::mem::load_u8(w.buf.ptr, 5) == 51, "3");
+  assert(std::runtime::mem::load_u8(w.buf.ptr, 6) == 49, "1");
+  assert(std::runtime::mem::load_u8(w.buf.ptr, 7) == 109, "m");
+  assert(std::runtime::mem::load_u8(w.buf.ptr, 8) == 94, "^");
+  assert(std::runtime::mem::load_u8(w.buf.ptr, 9) == 65, "A");
 }
 
 // ---------------------------------------------------------------------------
@@ -8206,6 +8612,47 @@ export async fn main (argc: int, argv: u64) -> int {
       return 0;
     }
 
+    if cfg.print_mode {
+      let stdin_is_tty: bool = std::runtime::io::isatty(std::runtime::posix::io::STDIN_FD);
+      if v_on {
+        if stdout_is_tty { vlog_line(mut vw, "stdout_tty=true (print mode)"); }
+        else { vlog_line(mut vw, "stdout_tty=false (print mode)"); }
+      }
+
+      let tabs_opt: Tabs? = tabs_collect(args, false);
+      if tabs_opt == None {
+        let _ = write_str(std::runtime::posix::io::STDERR_FD, "sage: out of memory\n");
+        return 2;
+      }
+      let mut tabs: Tabs = match (tabs_opt) { Some(v) => v, None => Tabs{ ptr: 0, len: 0, cap: 0, zero_based_labels: false } };
+
+      if tabs.len <= 0 {
+        if stdin_is_tty {
+          tabs_free(mut tabs);
+          print_help();
+          return 0;
+        }
+        let own_opt: string? = cstr_copy_owned("-");
+        if own_opt == None {
+          tabs_free(mut tabs);
+          let _ = write_str(std::runtime::posix::io::STDERR_FD, "sage: out of memory\n");
+          return 2;
+        }
+        let own: string = match (own_opt) { Some(v) => v, None => "" };
+        if !tabs_push_owned(mut tabs, own) {
+          free_joined(own);
+          tabs_free(mut tabs);
+          let _ = write_str(std::runtime::posix::io::STDERR_FD, "sage: out of memory\n");
+          return 2;
+        }
+      }
+
+      let use_color: bool = print_color_enabled(&cfg, stdout_is_tty);
+      let rc_print: int = print_inputs(&cfg, &tabs, use_color, mut vw, v_on);
+      tabs_free(mut tabs);
+      return rc_print;
+    }
+
     // If stdout isn't a TTY, behave like a pass-through filter.
     if !stdout_is_tty {
       if v_on {
@@ -8224,7 +8671,7 @@ export async fn main (argc: int, argv: u64) -> int {
       if stdin_is_tty { vlog_line(mut vw, "stdin_tty=true"); }
       else { vlog_line(mut vw, "stdin_tty=false (pager mode: keys via /dev/tty)"); }
     }
-    let tabs_opt: Tabs? = tabs_collect(args);
+    let tabs_opt: Tabs? = tabs_collect(args, true);
     if tabs_opt == None {
       let _ = write_str(std::runtime::posix::io::STDERR_FD, "sage: out of memory\n");
       return 2;
