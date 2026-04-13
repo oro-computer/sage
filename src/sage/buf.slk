@@ -1,8 +1,8 @@
 module sage::buf;
 
+import { OutOfMemory } from "std/memory";
 import std::interfaces;
 import std::runtime::mem;
-import { OutOfMemory } from "std/memory";
 
 /**
  * A non-owning byte slice view (`ptr`, `len`).
@@ -34,10 +34,12 @@ impl BufferU8 {
     if cap <= 0 {
       return Some(BufferU8.empty());
     }
+
     let ptr: u64 = std::runtime::mem::alloc(cap);
     if ptr == 0 {
       return None;
     }
+
     return Some(BufferU8{ ptr: ptr, len: 0, cap: cap });
   }
 
@@ -53,21 +55,28 @@ impl BufferU8 {
     if additional <= 0 {
       return None;
     }
+
     if self.len < 0 || self.cap < 0 {
       return Some(oom(additional));
     }
+
     let needed: i64 = self.len + additional;
     if needed <= self.cap {
       return None;
     }
 
     let max_i64: i64 = 9223372036854775807 as i64;
-    var new_cap: i64 = if self.cap > 0 { self.cap } else { 64 };
+    var new_cap: i64 = if self.cap > 0 {
+      self.cap
+    } else {
+      64
+    };
     while new_cap < needed {
       if new_cap > max_i64 / 2 {
         new_cap = needed;
         break;
       }
+
       new_cap = new_cap * 2;
     }
 
@@ -75,6 +84,7 @@ impl BufferU8 {
     if new_ptr == 0 {
       return Some(oom(new_cap));
     }
+
     self.ptr = new_ptr;
     self.cap = new_cap;
     return None;
@@ -85,6 +95,7 @@ impl BufferU8 {
     if err != None {
       return err;
     }
+
     std::runtime::mem::store_u8(self.ptr, self.len, value);
     self.len = self.len + 1;
     return None;
@@ -94,9 +105,11 @@ impl BufferU8 {
     if len <= 0 {
       return None;
     }
+
     if ptr == 0 {
       return Some(oom(len));
     }
+
     let err: OutOfMemory? = self.reserve_additional(len);
     if err != None {
       return err;
@@ -107,6 +120,7 @@ impl BufferU8 {
       std::runtime::mem::store_u8(self.ptr, self.len + i, std::runtime::mem::load_u8(ptr, i));
       i = i + 1;
     }
+
     self.len = self.len + len;
     return None;
   }
@@ -121,6 +135,7 @@ impl BufferU8 {
     if self.len <= 0 {
       return None;
     }
+
     let idx: i64 = self.len - 1;
     self.len = idx;
     return Some(std::runtime::mem::load_u8(self.ptr, idx));
@@ -156,11 +171,13 @@ impl VecU64 {
     if cap <= 0 {
       return Some(VecU64.empty());
     }
+
     let bytes: i64 = cap * 8;
     let ptr: u64 = std::runtime::mem::alloc(bytes);
     if ptr == 0 {
       return None;
     }
+
     return Some(VecU64{ ptr: ptr, len: 0, cap: cap });
   }
 
@@ -168,21 +185,28 @@ impl VecU64 {
     if additional <= 0 {
       return None;
     }
+
     if self.len < 0 || self.cap < 0 {
       return Some(oom(additional));
     }
+
     let needed: i64 = self.len + additional;
     if needed <= self.cap {
       return None;
     }
 
     let max_i64: i64 = 9223372036854775807 as i64;
-    var new_cap: i64 = if self.cap > 0 { self.cap } else { 64 };
+    var new_cap: i64 = if self.cap > 0 {
+      self.cap
+    } else {
+      64
+    };
     while new_cap < needed {
       if new_cap > max_i64 / 2 {
         new_cap = needed;
         break;
       }
+
       new_cap = new_cap * 2;
     }
 
@@ -190,6 +214,7 @@ impl VecU64 {
     if new_ptr == 0 {
       return Some(oom(new_cap));
     }
+
     self.ptr = new_ptr;
     self.cap = new_cap;
     return None;
@@ -200,6 +225,7 @@ impl VecU64 {
     if err != None {
       return err;
     }
+
     std::runtime::mem::store_u64(self.ptr, (self.len * 8), value);
     self.len = self.len + 1;
     return None;

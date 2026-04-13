@@ -1,6 +1,7 @@
 module sage::os;
 
 import std::runtime::posix::fs;
+import std::runtime::mem;
 
 // ---------------------------------------------------------------------------
 // POSIX/libc bindings used by `sage`.
@@ -19,9 +20,29 @@ export ext memchr = fn (u64, int, i64) -> u64;
 export ext memmem = fn (u64, i64, u64, i64) -> u64;
 
 /**
- * `memrchr(3)` — find the last byte in a memory region (glibc).
+ * Find the last matching byte in a memory region.
  */
-export ext memrchr = fn (u64, int, i64) -> u64;
+export fn memrchr (ptr: u64, needle: int, len: i64) -> u64 {
+  if ptr == 0 || len <= 0 {
+    return 0;
+  }
+
+  let want: u8 = needle as u8;
+  var i: i64 = len - 1;
+  while i >= 0 {
+    if std::runtime::mem::load_u8(ptr, i) == want {
+      return ptr + (i as u64);
+    }
+
+    if i == 0 {
+      break;
+    }
+
+    i = i - 1;
+  }
+
+  return 0;
+}
 
 /**
  * Read `errno` via the hosted POSIX backend.

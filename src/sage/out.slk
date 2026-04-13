@@ -1,9 +1,9 @@
 module sage::out;
 
+import { OutOfMemory } from "std/memory";
 import std::interfaces;
 import std::runtime::mem;
 import std::runtime::posix::io;
-import { OutOfMemory } from "std/memory";
 
 import { BufferU8, ByteSlice } from "./buf.slk";
 
@@ -11,18 +11,21 @@ export fn write_all (fd: int, ptr: u64, len: i64) -> bool {
   if len <= 0 {
     return true;
   }
+
   if ptr == 0 {
     return false;
   }
 
   var off: i64 = 0;
   while off < len {
-    let n: int = std::runtime::posix::io::write(fd, ptr + (off as u64), len - off);
+    let n: int = std::runtime::posix::io::write(fd as i32, ptr + (off as u64), len - off) as int;
     if n <= 0 {
       return false;
     }
+
     off = off + (n as i64);
   }
+
   return true;
 }
 
@@ -43,6 +46,7 @@ fn writer_init (fd: int, color: bool, cap: i64) -> Writer? {
   if b_opt == None {
     return None;
   }
+
   let b: BufferU8 = match (b_opt) {
     Some(v) => v,
     None => BufferU8.empty(),
@@ -134,6 +138,7 @@ impl Writer {
         put_buf(mut self, b);
         return err;
       }
+
       i = i - 1;
     }
 
@@ -156,6 +161,7 @@ impl Writer {
         put_buf(mut self, b);
         return err0;
       }
+
       v = (0 - value) as u64;
     } else {
       v = value as u64;

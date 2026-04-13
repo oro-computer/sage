@@ -5,6 +5,7 @@ import std::runtime::mem;
 import std::runtime::posix::io;
 
 // Poll bits.
+
 let POLLIN: int = 1;
 
 // After reading an `ESC` byte, wait briefly for the rest of a CSI/SS3 sequence.
@@ -41,11 +42,12 @@ fn poll_readable (pollfd_ptr: u64, fd: int, timeout_ms: int) -> bool {
   if pollfd_ptr == 0 {
     return false;
   }
+
   store_u32_le(pollfd_ptr, OFF_POLLFD_FD, fd);
   store_u16_le(pollfd_ptr, OFF_POLLFD_EVENTS, POLLIN);
   store_u16_le(pollfd_ptr, OFF_POLLFD_REVENTS, 0);
 
-  let rc: int = std::runtime::posix::io::poll(pollfd_ptr, 1, timeout_ms) as int;
+  let rc: int = std::runtime::posix::io::poll(pollfd_ptr, 1, timeout_ms as i32) as int;
   if rc <= 0 {
     return false;
   }
@@ -94,11 +96,13 @@ export fn input_init (fd: int) -> Input? {
   if buf_ptr == 0 {
     return None;
   }
+
   let pollfd_ptr: u64 = std::runtime::mem::alloc(POLLFD_BYTES);
   if pollfd_ptr == 0 {
     std::runtime::mem::free(buf_ptr);
     return None;
   }
+
   return Some(Input{ fd: fd, buf_ptr: buf_ptr, buf_len: 0, buf_off: 0, pollfd_ptr: pollfd_ptr });
 }
 
@@ -110,11 +114,12 @@ fn take_next_byte (mut inp: &Input) -> u8? {
   }
 
   inp.buf_off = 0;
-  let n: int = std::runtime::posix::io::read(inp.fd, inp.buf_ptr, 64);
+  let n: int = std::runtime::posix::io::read(inp.fd as i32, inp.buf_ptr, 64) as int;
   if n <= 0 {
     inp.buf_len = 0;
     return None;
   }
+
   inp.buf_len = n as i64;
   let b0: u8 = std::runtime::mem::load_u8(inp.buf_ptr, 0);
   inp.buf_off = 1;
@@ -125,9 +130,11 @@ fn maybe_next_byte_after_esc (mut inp: &Input, timeout_ms: int) -> u8? {
   if inp.buf_off < inp.buf_len {
     return take_next_byte(mut inp);
   }
+
   if !poll_readable(inp.pollfd_ptr, inp.fd, timeout_ms) {
     return None;
   }
+
   return take_next_byte(mut inp);
 }
 
@@ -136,29 +143,58 @@ export fn read_key (mut inp: &Input) -> Key {
   if b0_opt == None {
     return Key{ kind: KEY_EOF, byte: 0, x: 0, y: 0, aux: 0 };
   }
-  let b0: u8 = match (b0_opt) { Some(v) => v, None => 0 };
+
+  let b0: u8 = match (b0_opt) {
+    Some(v) => v, None => 0
+  };
 
   if b0 == 27 { // ESC
     let b1_opt: u8? = maybe_next_byte_after_esc(mut inp, ESC_SEQ_TIMEOUT_MS);
     if b1_opt == None {
       return Key{ kind: KEY_ESC, byte: 0, x: 0, y: 0, aux: 0 };
     }
-    let b1: u8 = match (b1_opt) { Some(v) => v, None => 0 };
+
+    let b1: u8 = match (b1_opt) {
+      Some(v) => v, None => 0
+    };
 
     if b1 == 91 { // '['
       let b2_opt: u8? = maybe_next_byte_after_esc(mut inp, ESC_SEQ_TIMEOUT_MS);
       if b2_opt == None {
         return Key{ kind: KEY_ESC, byte: 0, x: 0, y: 0, aux: 0 };
       }
-      let b2: u8 = match (b2_opt) { Some(v) => v, None => 0 };
 
-      if b2 == 65 { return Key{ kind: KEY_UP, byte: 0, x: 0, y: 0, aux: 0 }; }
-      if b2 == 66 { return Key{ kind: KEY_DOWN, byte: 0, x: 0, y: 0, aux: 0 }; }
-      if b2 == 67 { return Key{ kind: KEY_RIGHT, byte: 0, x: 0, y: 0, aux: 0 }; }
-      if b2 == 68 { return Key{ kind: KEY_LEFT, byte: 0, x: 0, y: 0, aux: 0 }; }
-      if b2 == 72 { return Key{ kind: KEY_HOME, byte: 0, x: 0, y: 0, aux: 0 }; }
-      if b2 == 70 { return Key{ kind: KEY_END, byte: 0, x: 0, y: 0, aux: 0 }; }
-      if b2 == 90 { return Key{ kind: KEY_SHIFT_TAB, byte: 0, x: 0, y: 0, aux: 0 }; } // 'Z' (backtab)
+      let b2: u8 = match (b2_opt) {
+        Some(v) => v, None => 0
+      };
+
+      if b2 == 65 {
+        return Key{ kind: KEY_UP, byte: 0, x: 0, y: 0, aux: 0 };
+      }
+
+      if b2 == 66 {
+        return Key{ kind: KEY_DOWN, byte: 0, x: 0, y: 0, aux: 0 };
+      }
+
+      if b2 == 67 {
+        return Key{ kind: KEY_RIGHT, byte: 0, x: 0, y: 0, aux: 0 };
+      }
+
+      if b2 == 68 {
+        return Key{ kind: KEY_LEFT, byte: 0, x: 0, y: 0, aux: 0 };
+      }
+
+      if b2 == 72 {
+        return Key{ kind: KEY_HOME, byte: 0, x: 0, y: 0, aux: 0 };
+      }
+
+      if b2 == 70 {
+        return Key{ kind: KEY_END, byte: 0, x: 0, y: 0, aux: 0 };
+      }
+
+      if b2 == 90 {
+        return Key{ kind: KEY_SHIFT_TAB, byte: 0, x: 0, y: 0, aux: 0 };
+      } // 'Z' (backtab)
 
       // Mouse reporting (xterm):
       // - SGR 1006: ESC [ < Cb ; Cx ; Cy M/m
@@ -178,7 +214,10 @@ export fn read_key (mut inp: &Input) -> Key {
           if c_opt == None {
             return Key{ kind: KEY_ESC, byte: 0, x: 0, y: 0, aux: 0 };
           }
-          let c: u8 = match (c_opt) { Some(v) => v, None => 0 };
+
+          let c: u8 = match (c_opt) {
+            Some(v) => v, None => 0
+          };
 
           if c >= 48 && c <= 57 {
             have = true;
@@ -186,27 +225,41 @@ export fn read_key (mut inp: &Input) -> Key {
             steps_sgr = steps_sgr + 1;
             continue;
           }
+
           if c == 59 { // ';'
             if !have {
               return Key{ kind: KEY_ESC, byte: 0, x: 0, y: 0, aux: 0 };
             }
-            if idx == 0 { cb = cur; }
-            else if idx == 1 { cx = cur; }
-            else { return Key{ kind: KEY_ESC, byte: 0, x: 0, y: 0, aux: 0 }; }
+
+            if idx == 0 {
+              cb = cur;
+            } else if idx == 1 {
+              cx = cur;
+            } else {
+              return Key{ kind: KEY_ESC, byte: 0, x: 0, y: 0, aux: 0 };
+            }
+
             idx = idx + 1;
             cur = 0;
             have = false;
             steps_sgr = steps_sgr + 1;
             continue;
           }
+
           if c == 77 || c == 109 { // 'M' or 'm'
             if !have {
               return Key{ kind: KEY_ESC, byte: 0, x: 0, y: 0, aux: 0 };
             }
-            if idx == 0 { cb = cur; }
-            else if idx == 1 { cx = cur; }
-            else if idx == 2 { cy = cur; }
-            else { return Key{ kind: KEY_ESC, byte: 0, x: 0, y: 0, aux: 0 }; }
+
+            if idx == 0 {
+              cb = cur;
+            } else if idx == 1 {
+              cx = cur;
+            } else if idx == 2 {
+              cy = cur;
+            } else {
+              return Key{ kind: KEY_ESC, byte: 0, x: 0, y: 0, aux: 0 };
+            }
 
             if cb >= 0 {
               // Wheel: Cb has bit 6 set (64), low bits indicate direction.
@@ -214,6 +267,7 @@ export fn read_key (mut inp: &Input) -> Key {
                 if (cb & 1) == 0 {
                   return Key{ kind: KEY_MOUSE_WHEEL_UP, byte: 0, x: cx, y: cy, aux: cb };
                 }
+
                 return Key{ kind: KEY_MOUSE_WHEEL_DOWN, byte: 0, x: cx, y: cy, aux: cb };
               }
             }
@@ -221,8 +275,10 @@ export fn read_key (mut inp: &Input) -> Key {
             // implement selection or ignore them explicitly.
             return Key{ kind: KEY_MOUSE, byte: c, x: cx, y: cy, aux: cb };
           }
+
           return Key{ kind: KEY_ESC, byte: 0, x: 0, y: 0, aux: 0 };
         }
+
         return Key{ kind: KEY_ESC, byte: 0, x: 0, y: 0, aux: 0 };
       }
 
@@ -233,10 +289,21 @@ export fn read_key (mut inp: &Input) -> Key {
         if cb_opt == None || cx_opt == None || cy_opt == None {
           return Key{ kind: KEY_ESC, byte: 0, x: 0, y: 0, aux: 0 };
         }
-        let cb_b: u8 = match (cb_opt) { Some(v) => v, None => 0 };
-        let cx_b: u8 = match (cx_opt) { Some(v) => v, None => 0 };
-        let cy_b: u8 = match (cy_opt) { Some(v) => v, None => 0 };
-        let cbv: int = if cb_b >= 32 { (cb_b - 32) as int } else { 0 };
+
+        let cb_b: u8 = match (cb_opt) {
+          Some(v) => v, None => 0
+        };
+        let cx_b: u8 = match (cx_opt) {
+          Some(v) => v, None => 0
+        };
+        let cy_b: u8 = match (cy_opt) {
+          Some(v) => v, None => 0
+        };
+        let cbv: int = if cb_b >= 32 {
+          (cb_b - 32) as int
+        } else {
+          0
+        };
 
         if (cbv & 64) != 0 {
           let _ = cx_b;
@@ -244,6 +311,7 @@ export fn read_key (mut inp: &Input) -> Key {
           if (cbv & 1) == 0 {
             return Key{ kind: KEY_MOUSE_WHEEL_UP, byte: 0, x: 0, y: 0, aux: cbv };
           }
+
           return Key{ kind: KEY_MOUSE_WHEEL_DOWN, byte: 0, x: 0, y: 0, aux: cbv };
         }
 
@@ -270,20 +338,40 @@ export fn read_key (mut inp: &Input) -> Key {
             }
           } else if c == 59 { // ';'
             parsing_first = false;
-          } else if c == 65 { return Key{ kind: KEY_UP, byte: 0, x: 0, y: 0, aux: 0 }; }
-          else if c == 66 { return Key{ kind: KEY_DOWN, byte: 0, x: 0, y: 0, aux: 0 }; }
-          else if c == 67 { return Key{ kind: KEY_RIGHT, byte: 0, x: 0, y: 0, aux: 0 }; }
-          else if c == 68 { return Key{ kind: KEY_LEFT, byte: 0, x: 0, y: 0, aux: 0 }; }
-          else if c == 72 { return Key{ kind: KEY_HOME, byte: 0, x: 0, y: 0, aux: 0 }; }
-          else if c == 70 { return Key{ kind: KEY_END, byte: 0, x: 0, y: 0, aux: 0 }; }
-          else if c == 90 { return Key{ kind: KEY_SHIFT_TAB, byte: 0, x: 0, y: 0, aux: 0 }; } // 'Z'
+          } else if c == 65 {
+            return Key{ kind: KEY_UP, byte: 0, x: 0, y: 0, aux: 0 };
+          } else if c == 66 {
+            return Key{ kind: KEY_DOWN, byte: 0, x: 0, y: 0, aux: 0 };
+          } else if c == 67 {
+            return Key{ kind: KEY_RIGHT, byte: 0, x: 0, y: 0, aux: 0 };
+          } else if c == 68 {
+            return Key{ kind: KEY_LEFT, byte: 0, x: 0, y: 0, aux: 0 };
+          } else if c == 72 {
+            return Key{ kind: KEY_HOME, byte: 0, x: 0, y: 0, aux: 0 };
+          } else if c == 70 {
+            return Key{ kind: KEY_END, byte: 0, x: 0, y: 0, aux: 0 };
+          } else if c == 90 {
+            return Key{ kind: KEY_SHIFT_TAB, byte: 0, x: 0, y: 0, aux: 0 };
+          } // 'Z'
           else if c == 126 { // '~'
             if have_n {
-              if n == 5 { return Key{ kind: KEY_PAGE_UP, byte: 0, x: 0, y: 0, aux: 0 }; }
-              if n == 6 { return Key{ kind: KEY_PAGE_DOWN, byte: 0, x: 0, y: 0, aux: 0 }; }
-              if n == 1 || n == 7 { return Key{ kind: KEY_HOME, byte: 0, x: 0, y: 0, aux: 0 }; }
-              if n == 4 || n == 8 { return Key{ kind: KEY_END, byte: 0, x: 0, y: 0, aux: 0 }; }
+              if n == 5 {
+                return Key{ kind: KEY_PAGE_UP, byte: 0, x: 0, y: 0, aux: 0 };
+              }
+
+              if n == 6 {
+                return Key{ kind: KEY_PAGE_DOWN, byte: 0, x: 0, y: 0, aux: 0 };
+              }
+
+              if n == 1 || n == 7 {
+                return Key{ kind: KEY_HOME, byte: 0, x: 0, y: 0, aux: 0 };
+              }
+
+              if n == 4 || n == 8 {
+                return Key{ kind: KEY_END, byte: 0, x: 0, y: 0, aux: 0 };
+              }
             }
+
             return Key{ kind: KEY_ESC, byte: 0, x: 0, y: 0, aux: 0 };
           } else {
             return Key{ kind: KEY_ESC, byte: 0, x: 0, y: 0, aux: 0 };
@@ -293,9 +381,13 @@ export fn read_key (mut inp: &Input) -> Key {
           if next_opt == None {
             return Key{ kind: KEY_ESC, byte: 0, x: 0, y: 0, aux: 0 };
           }
-          c = match (next_opt) { Some(v) => v, None => 0 };
+
+          c = match (next_opt) {
+            Some(v) => v, None => 0
+          };
           steps = steps + 1;
         }
+
         return Key{ kind: KEY_ESC, byte: 0, x: 0, y: 0, aux: 0 };
       }
 
@@ -307,13 +399,34 @@ export fn read_key (mut inp: &Input) -> Key {
       if b2_opt == None {
         return Key{ kind: KEY_ESC, byte: 0, x: 0, y: 0, aux: 0 };
       }
-      let b2: u8 = match (b2_opt) { Some(v) => v, None => 0 };
-      if b2 == 65 { return Key{ kind: KEY_UP, byte: 0, x: 0, y: 0, aux: 0 }; }
-      if b2 == 66 { return Key{ kind: KEY_DOWN, byte: 0, x: 0, y: 0, aux: 0 }; }
-      if b2 == 67 { return Key{ kind: KEY_RIGHT, byte: 0, x: 0, y: 0, aux: 0 }; }
-      if b2 == 68 { return Key{ kind: KEY_LEFT, byte: 0, x: 0, y: 0, aux: 0 }; }
-      if b2 == 72 { return Key{ kind: KEY_HOME, byte: 0, x: 0, y: 0, aux: 0 }; }
-      if b2 == 70 { return Key{ kind: KEY_END, byte: 0, x: 0, y: 0, aux: 0 }; }
+
+      let b2: u8 = match (b2_opt) {
+        Some(v) => v, None => 0
+      };
+      if b2 == 65 {
+        return Key{ kind: KEY_UP, byte: 0, x: 0, y: 0, aux: 0 };
+      }
+
+      if b2 == 66 {
+        return Key{ kind: KEY_DOWN, byte: 0, x: 0, y: 0, aux: 0 };
+      }
+
+      if b2 == 67 {
+        return Key{ kind: KEY_RIGHT, byte: 0, x: 0, y: 0, aux: 0 };
+      }
+
+      if b2 == 68 {
+        return Key{ kind: KEY_LEFT, byte: 0, x: 0, y: 0, aux: 0 };
+      }
+
+      if b2 == 72 {
+        return Key{ kind: KEY_HOME, byte: 0, x: 0, y: 0, aux: 0 };
+      }
+
+      if b2 == 70 {
+        return Key{ kind: KEY_END, byte: 0, x: 0, y: 0, aux: 0 };
+      }
+
       return Key{ kind: KEY_ESC, byte: 0, x: 0, y: 0, aux: 0 };
     }
 
@@ -323,6 +436,7 @@ export fn read_key (mut inp: &Input) -> Key {
   if b0 == 127 {
     return Key{ kind: KEY_BACKSPACE, byte: 0, x: 0, y: 0, aux: 0 };
   }
+
   if b0 == 13 || b0 == 10 {
     return Key{ kind: KEY_ENTER, byte: 0, x: 0, y: 0, aux: 0 };
   }
@@ -340,12 +454,15 @@ export fn read_key_timeout (mut inp: &Input, timeout_ms: int) -> Key {
   if inp.buf_off < inp.buf_len {
     return read_key(mut inp);
   }
+
   if timeout_ms < 0 {
     return read_key(mut inp);
   }
+
   if !poll_readable(inp.pollfd_ptr, inp.fd, timeout_ms) {
     return Key{ kind: KEY_NONE, byte: 0, x: 0, y: 0, aux: 0 };
   }
+
   return read_key(mut inp);
 }
 

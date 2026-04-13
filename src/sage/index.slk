@@ -1,11 +1,11 @@
 module sage::index;
 
+import { OutOfMemory } from "std/memory";
 import std::runtime::mem;
 import std::sync;
-import { OutOfMemory } from "std/memory";
 
-import { memchr } from "./os.slk";
 import { VecU64 } from "./buf.slk";
+import { memchr } from "./os.slk";
 
 let NL: int = 10;
 let CHUNK_MAX: i64 = 8192;
@@ -15,7 +15,11 @@ let PROGRESS_BYTES: i64 = 67108864; // 64 MiB
 export let INDEX_STRIDE: i64 = 256;
 
 fn flush_chunk (ch: std::sync::ChannelBorrow(u64), buf: u64, n: i64, scan_off: i64, lines: i64) -> bool {
-  let count: i64 = if n > 0 { n } else { 0 };
+  let count: i64 = if n > 0 {
+    n
+  } else {
+    0
+  };
 
   // Layout: [count:u64][scan_off:u64][lines:u64][off0:u64]...[offN:u64]
   let bytes: i64 = (count + 3) * 8;
@@ -38,6 +42,7 @@ fn flush_chunk (ch: std::sync::ChannelBorrow(u64), buf: u64, n: i64, scan_off: i
     std::runtime::mem::free(p);
     return false;
   }
+
   return true;
 }
 
@@ -90,7 +95,11 @@ task fn build_line_index_task (
     }
 
     let rem: i64 = len - scan_off;
-    let chunk_len: i64 = if rem < SCAN_CHUNK_BYTES { rem } else { SCAN_CHUNK_BYTES };
+    let chunk_len: i64 = if rem < SCAN_CHUNK_BYTES {
+      rem
+    } else {
+      SCAN_CHUNK_BYTES
+    };
     let chunk_end: i64 = scan_off + chunk_len;
 
     var cur: i64 = scan_off;
@@ -101,11 +110,16 @@ task fn build_line_index_task (
           break;
         }
       }
+
       tick = tick + 1;
 
       let tail_ptr: u64 = ptr + (cur as u64);
       let tail_len: i64 = chunk_end - cur;
-      let nl_ptr: u64 = if tail_len > 0 { memchr(tail_ptr, NL, tail_len) } else { 0 };
+      let nl_ptr: u64 = if tail_len > 0 {
+        memchr(tail_ptr, NL, tail_len)
+      } else {
+        0
+      };
       if nl_ptr == 0 {
         cur = chunk_end;
         break;
@@ -120,6 +134,7 @@ task fn build_line_index_task (
         n = n + 1;
         next_checkpoint = next_checkpoint + INDEX_STRIDE;
       }
+
       cur = next;
 
       if n >= CHUNK_MAX {
@@ -150,6 +165,7 @@ task fn build_line_index_task (
         let _ = ch.send(0 as u64);
         return 2;
       }
+
       n = 0;
     }
   }
@@ -219,6 +235,7 @@ export fn consume_msg (msg: u64, mut offsets: &VecU64) -> ConsumeOutcome {
       std::runtime::mem::free(msg);
       return ConsumeOutcome{ kind: CONSUME_OUT_OF_MEMORY, scan_off: scan_off, lines: lines };
     }
+
     i = i + 1;
   }
 
@@ -229,7 +246,9 @@ export fn consume_msg (msg: u64, mut offsets: &VecU64) -> ConsumeOutcome {
 test "sage::index consume_msg - done sentinel" {
   let v_opt: VecU64? = VecU64.init(4);
   assert(v_opt != None, "VecU64.init should succeed");
-  let mut v: VecU64 = match (v_opt) { Some(x) => x, None => VecU64.empty() };
+  let mut v: VecU64 = match (v_opt) {
+    Some(x) => x, None => VecU64.empty()
+  };
 
   let out: ConsumeOutcome = consume_msg(0 as u64, mut v);
   assert(out.kind == CONSUME_DONE, "expected done");
@@ -240,7 +259,9 @@ test "sage::index consume_msg - done sentinel" {
 test "sage::index consume_msg - appends offsets" {
   let v_opt: VecU64? = VecU64.init(4);
   assert(v_opt != None, "VecU64.init should succeed");
-  let mut v: VecU64 = match (v_opt) { Some(x) => x, None => VecU64.empty() };
+  let mut v: VecU64 = match (v_opt) {
+    Some(x) => x, None => VecU64.empty()
+  };
   let _ = v.push(0);
 
   // Build a chunk message: count=3, scan_off=123, lines=999, offsets=[5, 10, 20].
@@ -266,7 +287,9 @@ test "sage::index consume_msg - appends offsets" {
 test "sage::index consume_msg - progress only (count=0)" {
   let v_opt: VecU64? = VecU64.init(4);
   assert(v_opt != None, "VecU64.init should succeed");
-  let mut v: VecU64 = match (v_opt) { Some(x) => x, None => VecU64.empty() };
+  let mut v: VecU64 = match (v_opt) {
+    Some(x) => x, None => VecU64.empty()
+  };
   let _ = v.push(0);
 
   let msg: u64 = std::runtime::mem::alloc(3 * 8);

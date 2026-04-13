@@ -66,6 +66,7 @@ fn lower_ascii (b: u8) -> u8 {
   if b >= 65 && b <= 90 {
     return b + 32;
   }
+
   return b;
 }
 
@@ -75,6 +76,7 @@ fn eq_nocase (a_ptr: u64, a_len: i64, b: string) -> bool {
   if a_len != b_len {
     return false;
   }
+
   var i: i64 = 0;
   while i < a_len {
     let x: u8 = std::runtime::mem::load_u8(a_ptr, i);
@@ -82,8 +84,10 @@ fn eq_nocase (a_ptr: u64, a_len: i64, b: string) -> bool {
     if lower_ascii(x) != lower_ascii(y) {
       return false;
     }
+
     i = i + 1;
   }
+
   return true;
 }
 
@@ -93,13 +97,16 @@ fn has_prefix_nocase (ptr: u64, len: i64, prefix: string) -> bool {
   if p_len <= 0 || len < p_len {
     return false;
   }
+
   var i: i64 = 0;
   while i < p_len {
     if lower_ascii(std::runtime::mem::load_u8(ptr, i)) != lower_ascii(std::runtime::mem::load_u8(p_ptr, i)) {
       return false;
     }
+
     i = i + 1;
   }
+
   return true;
 }
 
@@ -109,9 +116,11 @@ fn ends_with (s: string, suffix: string) -> bool {
   if suf_len <= 0 {
     return true;
   }
+
   if s_len < suf_len {
     return false;
   }
+
   let s_ptr: u64 = std::runtime::mem::string_ptr(s);
   let suf_ptr: u64 = std::runtime::mem::string_ptr(suffix);
   let off: i64 = s_len - suf_len;
@@ -120,16 +129,30 @@ fn ends_with (s: string, suffix: string) -> bool {
     if std::runtime::mem::load_u8(s_ptr + (off as u64), i) != std::runtime::mem::load_u8(suf_ptr, i) {
       return false;
     }
+
     i = i + 1;
   }
+
   return true;
 }
 
 fn is_ascii_ws (b: u8) -> bool {
-  if b == 32 { return true; }
-  if b == 9 { return true; }
-  if b == 10 { return true; }
-  if b == 13 { return true; }
+  if b == 32 {
+    return true;
+  }
+
+  if b == 9 {
+    return true;
+  }
+
+  if b == 10 {
+    return true;
+  }
+
+  if b == 13 {
+    return true;
+  }
+
   return false;
 }
 
@@ -137,13 +160,16 @@ fn cstr_len_max (cstr: u64, max: i64) -> i64 {
   if cstr == 0 || max <= 0 {
     return 0;
   }
+
   var i: i64 = 0;
   while i < max {
     if std::runtime::mem::load_u8(cstr, i) == 0 {
       return i;
     }
+
     i = i + 1;
   }
+
   return max;
 }
 
@@ -152,6 +178,7 @@ fn env_get_string (key: string) -> string? {
   if p == 0 {
     return None;
   }
+
   let n: i64 = cstr_len_max(p, 8192);
   if n < 0 {
     return None;
@@ -165,11 +192,13 @@ fn env_get_string (key: string) -> string? {
   if out == 0 {
     return None;
   }
+
   var i: i64 = 0;
   while i < n {
     std::runtime::mem::store_u8(out, i, std::runtime::mem::load_u8(p, i));
     i = i + 1;
   }
+
   std::runtime::mem::store_u8(out, n, 0);
   return Some(std::runtime::mem::string_from_ptr_len(out, n as int));
 }
@@ -180,6 +209,7 @@ fn join2 (a: string, b: string) -> string? {
   if a_len < 0 || b_len < 0 {
     return None;
   }
+
   let total: i64 = a_len + b_len;
   if total < 0 {
     return None;
@@ -191,6 +221,7 @@ fn join2 (a: string, b: string) -> string? {
   if p == 0 {
     return None;
   }
+
   let a_ptr: u64 = std::runtime::mem::string_ptr(a);
   let b_ptr: u64 = std::runtime::mem::string_ptr(b);
   var i: i64 = 0;
@@ -198,11 +229,13 @@ fn join2 (a: string, b: string) -> string? {
     std::runtime::mem::store_u8(p, i, std::runtime::mem::load_u8(a_ptr, i));
     i = i + 1;
   }
+
   var j: i64 = 0;
   while j < b_len {
     std::runtime::mem::store_u8(p, a_len + j, std::runtime::mem::load_u8(b_ptr, j));
     j = j + 1;
   }
+
   std::runtime::mem::store_u8(p, total, 0);
   // NOTE: This string view points at a heap allocation; the caller must free.
   return Some(std::runtime::mem::string_from_ptr_len(p, total as int));
@@ -221,12 +254,19 @@ fn join_dir_file (dir: string, file: string) -> string? {
   if d_ptr == 0 || d_len <= 0 {
     return None;
   }
+
   if std::runtime::mem::load_u8(d_ptr, d_len - 1) == 47 { // '/'
     return join2(dir, file);
   }
+
   let tmp_opt: string? = join2(dir, "/");
-  if tmp_opt == None { return None; }
-  let tmp: string = match (tmp_opt) { Some(v) => v, None => "" };
+  if tmp_opt == None {
+    return None;
+  }
+
+  let tmp: string = match (tmp_opt) {
+    Some(v) => v, None => ""
+  };
   let out_opt: string? = join2(tmp, file);
   free_joined(tmp);
   return out_opt;
@@ -238,9 +278,11 @@ fn dir_slash_owned (dir: string) -> string? {
   if d_ptr == 0 || d_len <= 0 {
     return None;
   }
+
   if std::runtime::mem::load_u8(d_ptr, d_len - 1) == 47 { // '/'
     return join2("", dir);
   }
+
   return join2(dir, "/");
 }
 
@@ -252,6 +294,7 @@ fn mkdir_p (path: string, mode: int) -> bool {
   if len <= 0 {
     return true;
   }
+
   let ptr: u64 = std::runtime::mem::string_ptr(path);
 
   // Build prefixes incrementally.
@@ -259,7 +302,10 @@ fn mkdir_p (path: string, mode: int) -> bool {
   if buf_opt == None {
     return false;
   }
-  let mut buf: BufferU8 = match (buf_opt) { Some(v) => v, None => BufferU8.empty() };
+
+  let mut buf: BufferU8 = match (buf_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
 
   var i: i64 = 0;
   while i < len {
@@ -283,6 +329,7 @@ fn mkdir_p (path: string, mode: int) -> bool {
         }
       }
     }
+
     i = i + 1;
   }
 
@@ -294,11 +341,15 @@ fn xdg_config_home () -> string? {
   if v != None {
     return v;
   }
+
   let home_opt: string? = env_get_string("HOME");
   if home_opt == None {
     return None;
   }
-  let home: string = match (home_opt) { Some(x) => x, None => "" };
+
+  let home: string = match (home_opt) {
+    Some(x) => x, None => ""
+  };
   let out_opt: string? = join2(home, "/.config");
   free_joined(home);
   return out_opt;
@@ -309,11 +360,15 @@ fn xdg_cache_home () -> string? {
   if v != None {
     return v;
   }
+
   let home_opt: string? = env_get_string("HOME");
   if home_opt == None {
     return None;
   }
-  let home: string = match (home_opt) { Some(x) => x, None => "" };
+
+  let home: string = match (home_opt) {
+    Some(x) => x, None => ""
+  };
   let out_opt: string? = join2(home, "/.cache");
   free_joined(home);
   return out_opt;
@@ -331,43 +386,56 @@ fn tok_from_single_scope (ptr: u64, len: i64) -> u8 {
   if has_prefix_nocase(ptr, len, "comment") {
     return TOK_COMMENT;
   }
+
   if has_prefix_nocase(ptr, len, "string") {
     return TOK_STRING;
   }
+
   if has_prefix_nocase(ptr, len, "constant.numeric") {
     return TOK_NUMBER;
   }
+
   if has_prefix_nocase(ptr, len, "constant") {
     return TOK_CONSTANT;
   }
+
   if has_prefix_nocase(ptr, len, "keyword.operator") || has_prefix_nocase(ptr, len, "punctuation") {
     return TOK_OPERATOR;
   }
+
   if has_prefix_nocase(ptr, len, "keyword") {
     // Distinguish preprocessor-ish keywords when possible.
     if has_prefix_nocase(ptr, len, "keyword.control.directive") {
       return TOK_PREPROC;
     }
+
     return TOK_KEYWORD;
   }
+
   if has_prefix_nocase(ptr, len, "storage.modifier") {
     return TOK_KEYWORD;
   }
+
   if has_prefix_nocase(ptr, len, "storage.type") || has_prefix_nocase(ptr, len, "entity.name.type") || has_prefix_nocase(ptr, len, "support.type") {
     return TOK_TYPE;
   }
+
   if has_prefix_nocase(ptr, len, "entity.name.function") || has_prefix_nocase(ptr, len, "support.function") {
     return TOK_FUNCTION;
   }
+
   if has_prefix_nocase(ptr, len, "variable.language") {
     return TOK_CONSTANT;
   }
+
   if has_prefix_nocase(ptr, len, "markup.heading") {
     return TOK_HEADING;
   }
+
   if has_prefix_nocase(ptr, len, "markup.bold") || has_prefix_nocase(ptr, len, "markup.italic") {
     return TOK_EMPHASIS;
   }
+
   if has_prefix_nocase(ptr, len, "meta.preprocessor") {
     return TOK_PREPROC;
   }
@@ -386,9 +454,15 @@ fn tok_from_scope (ptr: u64, len: i64) -> u8 {
   var best_pri: int = 999;
   var i: i64 = 0;
   while i < len {
-    while i < len && is_ascii_ws(std::runtime::mem::load_u8(ptr, i)) { i = i + 1; }
+    while i < len && is_ascii_ws(std::runtime::mem::load_u8(ptr, i)) {
+      i = i + 1;
+    }
+
     let start: i64 = i;
-    while i < len && !is_ascii_ws(std::runtime::mem::load_u8(ptr, i)) { i = i + 1; }
+    while i < len && !is_ascii_ws(std::runtime::mem::load_u8(ptr, i)) {
+      i = i + 1;
+    }
+
     let seg_len: i64 = i - start;
     if seg_len > 0 {
       let tok: u8 = tok_from_single_scope(ptr + (start as u64), seg_len);
@@ -405,17 +479,50 @@ fn tok_from_scope (ptr: u64, len: i64) -> u8 {
 
 fn rule_priority (tok: u8) -> int {
   // Lower is higher priority.
-  if tok == TOK_COMMENT { return 0; }
-  if tok == TOK_STRING { return 1; }
-  if tok == TOK_PREPROC { return 2; }
-  if tok == TOK_NUMBER { return 3; }
-  if tok == TOK_KEYWORD { return 4; }
-  if tok == TOK_TYPE { return 5; }
-  if tok == TOK_FUNCTION { return 6; }
-  if tok == TOK_CONSTANT { return 7; }
-  if tok == TOK_HEADING { return 8; }
-  if tok == TOK_EMPHASIS { return 9; }
-  if tok == TOK_OPERATOR { return 10; }
+  if tok == TOK_COMMENT {
+    return 0;
+  }
+
+  if tok == TOK_STRING {
+    return 1;
+  }
+
+  if tok == TOK_PREPROC {
+    return 2;
+  }
+
+  if tok == TOK_NUMBER {
+    return 3;
+  }
+
+  if tok == TOK_KEYWORD {
+    return 4;
+  }
+
+  if tok == TOK_TYPE {
+    return 5;
+  }
+
+  if tok == TOK_FUNCTION {
+    return 6;
+  }
+
+  if tok == TOK_CONSTANT {
+    return 7;
+  }
+
+  if tok == TOK_HEADING {
+    return 8;
+  }
+
+  if tok == TOK_EMPHASIS {
+    return 9;
+  }
+
+  if tok == TOK_OPERATOR {
+    return 10;
+  }
+
   return 100;
 }
 
@@ -456,14 +563,40 @@ fn buf_push_u64_le (mut b: &BufferU8, v: u64) -> bool {
 }
 
 fn write_file_bytes (path: string, ptr: u64, len: i64) -> bool {
-  let fd: int = std::runtime::posix::fs::open(path, std::runtime::posix::fs::O_WRONLY | std::runtime::posix::fs::O_CREAT | std::runtime::posix::fs::O_TRUNC, 420) as int;
-  if fd < 0 {
+  // Write through a temporary file so generated cache entries land with
+  // predictable readable permissions on macOS and update atomically.
+  let tmp_opt: string? = join2(path, ".tmp.XXXXXX");
+  if tmp_opt == None {
     return false;
   }
+
+  let tmp: string = match (tmp_opt) {
+    Some(v) => v, None => ""
+  };
+
+  let fd: int = std::runtime::posix::fs::mkstemp(std::runtime::mem::string_ptr(tmp)) as int;
+  if fd < 0 {
+    free_joined(tmp);
+    return false;
+  }
+
   let ok: bool = write_all(fd, ptr, len);
-  let _ = std::runtime::posix::fs::fsync(fd);
-  let _ = std::runtime::posix::fs::close(fd);
-  return ok;
+  let _ = std::runtime::posix::fs::fsync(fd as i32);
+  let _ = std::runtime::posix::fs::close(fd as i32);
+  if !ok {
+    let _ = std::runtime::posix::fs::unlink(tmp);
+    free_joined(tmp);
+    return false;
+  }
+
+  let _ = std::runtime::posix::fs::unlink(path);
+  let renamed: bool = std::runtime::posix::fs::rename(tmp, path) == 0;
+  if !renamed {
+    let _ = std::runtime::posix::fs::unlink(tmp);
+  }
+
+  free_joined(tmp);
+  return renamed;
 }
 
 fn read_file_all (path: string, mut out: &BufferU8) -> bool {
@@ -475,30 +608,32 @@ fn read_file_all (path: string, mut out: &BufferU8) -> bool {
 
   let tmp: u64 = std::runtime::mem::alloc(8192);
   if tmp == 0 {
-    let _ = std::runtime::posix::fs::close(fd);
+    let _ = std::runtime::posix::fs::close(fd as i32);
     return false;
   }
 
   while true {
-    let n: int = std::runtime::posix::fs::read(fd, tmp, 8192);
+    let n: int = std::runtime::posix::fs::read(fd as i32, tmp, 8192) as int;
     if n < 0 {
       std::runtime::mem::free(tmp);
-      let _ = std::runtime::posix::fs::close(fd);
+      let _ = std::runtime::posix::fs::close(fd as i32);
       return false;
     }
+
     if n == 0 {
       break;
     }
+
     let err = out.push_ptr_len(tmp, n as i64);
     if err != None {
       std::runtime::mem::free(tmp);
-      let _ = std::runtime::posix::fs::close(fd);
+      let _ = std::runtime::posix::fs::close(fd as i32);
       return false;
     }
   }
 
   std::runtime::mem::free(tmp);
-  let _ = std::runtime::posix::fs::close(fd);
+  let _ = std::runtime::posix::fs::close(fd as i32);
   return true;
 }
 
@@ -513,6 +648,7 @@ fn write_i64_dec (fd: int, n: i64) -> void {
   if out == 0 {
     return;
   }
+
   var out_len: i64 = 0;
   if x < 0 {
     std::runtime::mem::store_u8(out, 0, 45);
@@ -541,6 +677,7 @@ fn write_i64_dec (fd: int, n: i64) -> void {
     out_len = out_len + 1;
     k = k - 1;
   }
+
   let _ = write_all(fd, out, out_len);
   std::runtime::mem::free(out);
 }
@@ -549,6 +686,7 @@ fn to_lower_ascii_inplace (ptr: u64, len: i64) -> void {
   if ptr == 0 || len <= 0 {
     return;
   }
+
   var i: i64 = 0;
   while i < len {
     let b: u8 = std::runtime::mem::load_u8(ptr, i);
@@ -566,10 +704,17 @@ fn trim_ascii_ws (ptr: u64, len: i64) -> Span {
   if ptr == 0 || len <= 0 {
     return Span{ ptr: 0, len: 0 };
   }
+
   var s: i64 = 0;
   var e: i64 = len;
-  while s < e && is_ascii_ws(std::runtime::mem::load_u8(ptr, s)) { s = s + 1; }
-  while e > s && is_ascii_ws(std::runtime::mem::load_u8(ptr, e - 1)) { e = e - 1; }
+  while s < e && is_ascii_ws(std::runtime::mem::load_u8(ptr, s)) {
+    s = s + 1;
+  }
+
+  while e > s && is_ascii_ws(std::runtime::mem::load_u8(ptr, e - 1)) {
+    e = e - 1;
+  }
+
   return Span{ ptr: ptr + (s as u64), len: e - s };
 }
 
@@ -583,13 +728,16 @@ fn lit_eq (ptr: u64, len: i64, s: string) -> bool {
   if ptr == 0 || len != s_len {
     return false;
   }
+
   var i: i64 = 0;
   while i < len {
     if std::runtime::mem::load_u8(ptr, i) != std::runtime::mem::load_u8(s_ptr, i) {
       return false;
     }
+
     i = i + 1;
   }
+
   return true;
 }
 
@@ -606,16 +754,30 @@ fn re_unescape_simple (ptr: u64, len: i64, mut out: &BufferU8) -> Span {
     let b: u8 = std::runtime::mem::load_u8(ptr, i);
     if b == 92 && (i + 1) < len { // '\\'
       let c: u8 = std::runtime::mem::load_u8(ptr, i + 1);
-      if c == 110 { let _ = out.push_u8(10); i = i + 2; continue; } // n
-      if c == 116 { let _ = out.push_u8(9); i = i + 2; continue; } // t
-      if c == 114 { let _ = out.push_u8(13); i = i + 2; continue; } // r
+      if c == 110 {
+        let _ = out.push_u8(10);
+        i = i + 2;
+        continue;
+      } // n
+      if c == 116 {
+        let _ = out.push_u8(9);
+        i = i + 2;
+        continue;
+      } // t
+      if c == 114 {
+        let _ = out.push_u8(13);
+        i = i + 2;
+        continue;
+      } // r
       let _ = out.push_u8(c);
       i = i + 2;
       continue;
     }
+
     let _ = out.push_u8(b);
     i = i + 1;
   }
+
   return Span{ ptr: out.ptr, len: out.len };
 }
 
@@ -641,6 +803,7 @@ fn syn_flags_from_range (tok: u8, begin_ptr: u64, begin_len: i64, end_ptr: u64, 
             meta.flags = meta.flags | SYN_F_BLOCK_COMMENT_C;
             break;
           }
+
           j = j + 1;
         }
       }
@@ -655,6 +818,7 @@ fn syn_flags_from_range (tok: u8, begin_ptr: u64, begin_len: i64, end_ptr: u64, 
             meta.flags = meta.flags | SYN_F_LINE_COMMENT_SLASH;
             break;
           }
+
           k = k + 1;
         }
       }
@@ -668,22 +832,31 @@ fn syn_flags_from_range (tok: u8, begin_ptr: u64, begin_len: i64, end_ptr: u64, 
   if b1.ptr == 0 || b1.len <= 0 {
     return;
   }
+
   let bc: u8 = std::runtime::mem::load_u8(b1.ptr, b1.len - 1);
   if bc != 39 && bc != 34 && bc != 96 {
     return;
   }
+
   let e2: Span = re_unescape_simple(end_ptr, end_len, mut scratch);
   if e2.ptr == 0 || e2.len <= 0 {
     return;
   }
+
   let ec: u8 = std::runtime::mem::load_u8(e2.ptr, e2.len - 1);
   if bc != ec {
     return;
   }
 
-  if bc == 39 { meta.flags = meta.flags | SYN_F_STRING_SQ; }       // '\''
-  else if bc == 34 { meta.flags = meta.flags | SYN_F_STRING_DQ; }  // '"'
-  else if bc == 96 { meta.flags = meta.flags | SYN_F_STRING_BT; }  // '`'
+  if bc == 39 {
+    meta.flags = meta.flags | SYN_F_STRING_SQ;
+  }       // '\''
+  else if bc == 34 {
+    meta.flags = meta.flags | SYN_F_STRING_DQ;
+  }  // '"'
+  else if bc == 96 {
+    meta.flags = meta.flags | SYN_F_STRING_BT;
+  }  // '`'
 }
 
 // ---------------------------------------------------------------------------
@@ -707,17 +880,20 @@ fn parse_yaml_quoted (ptr: u64, len: i64) -> Span {
   if ptr == 0 || len <= 0 {
     return Span{ ptr: 0, len: 0 };
   }
+
   let first: u8 = std::runtime::mem::load_u8(ptr, 0);
   if first == 39 { // '\''
     if len >= 2 && std::runtime::mem::load_u8(ptr, len - 1) == 39 {
       return Span{ ptr: ptr + 1, len: len - 2 };
     }
   }
+
   if first == 34 { // '"'
     if len >= 2 && std::runtime::mem::load_u8(ptr, len - 1) == 34 {
       return Span{ ptr: ptr + 1, len: len - 2 };
     }
   }
+
   return Span{ ptr: ptr, len: len };
 }
 
@@ -731,9 +907,11 @@ fn yaml_unescape_single_quotes (src_ptr: u64, src_len: i64, mut out: &BufferU8) 
       i = i + 2;
       continue;
     }
+
     let _ = out.push_u8(b);
     i = i + 1;
   }
+
   return true;
 }
 
@@ -744,19 +922,41 @@ fn yaml_unescape_double_quotes (src_ptr: u64, src_len: i64, mut out: &BufferU8) 
     let b: u8 = std::runtime::mem::load_u8(src_ptr, i);
     if b == 92 && (i + 1) < src_len { // '\\'
       let c: u8 = std::runtime::mem::load_u8(src_ptr, i + 1);
-      if c == 110 { let _ = out.push_u8(10); i = i + 2; continue; } // n
-      if c == 116 { let _ = out.push_u8(9); i = i + 2; continue; } // t
-      if c == 114 { let _ = out.push_u8(13); i = i + 2; continue; } // r
-      if c == 34 { let _ = out.push_u8(34); i = i + 2; continue; } // "
-      if c == 92 { let _ = out.push_u8(92); i = i + 2; continue; } // \
+      if c == 110 {
+        let _ = out.push_u8(10);
+        i = i + 2;
+        continue;
+      } // n
+      if c == 116 {
+        let _ = out.push_u8(9);
+        i = i + 2;
+        continue;
+      } // t
+      if c == 114 {
+        let _ = out.push_u8(13);
+        i = i + 2;
+        continue;
+      } // r
+      if c == 34 {
+        let _ = out.push_u8(34);
+        i = i + 2;
+        continue;
+      } // "
+      if c == 92 {
+        let _ = out.push_u8(92);
+        i = i + 2;
+        continue;
+      } // \
       // Unknown escape: keep the escaped char.
       let _ = out.push_u8(c);
       i = i + 2;
       continue;
     }
+
     let _ = out.push_u8(b);
     i = i + 1;
   }
+
   return true;
 }
 
@@ -770,6 +970,7 @@ fn yaml_decode_string (ptr: u64, len: i64, mut scratch: &BufferU8) -> Span {
   if v_ptr0 == 0 || v_len0 <= 0 {
     return Span{ ptr: 0, len: 0 };
   }
+
   let first: u8 = std::runtime::mem::load_u8(v_ptr0, 0);
   let last: u8 = std::runtime::mem::load_u8(v_ptr0, v_len0 - 1);
   if first == 39 && last == 39 { // single
@@ -777,6 +978,7 @@ fn yaml_decode_string (ptr: u64, len: i64, mut scratch: &BufferU8) -> Span {
     let _ = yaml_unescape_single_quotes(inner.ptr, inner.len, mut scratch);
     return Span{ ptr: scratch.ptr, len: scratch.len };
   }
+
   if first == 34 && last == 34 { // double
     let inner2: Span = parse_yaml_quoted(v_ptr0, v_len0);
     let _ = yaml_unescape_double_quotes(inner2.ptr, inner2.len, mut scratch);
@@ -790,8 +992,10 @@ fn yaml_decode_string (ptr: u64, len: i64, mut scratch: &BufferU8) -> Span {
       end = i;
       break;
     }
+
     i = i + 1;
   }
+
   let v2: Span = trim_ascii_ws(v_ptr0, end);
   return v2;
 }
@@ -812,8 +1016,10 @@ fn yaml_subst_vars (pat_ptr: u64, pat_len: i64, vars_ptr: u64, vars_len: i64, mu
         if std::runtime::mem::load_u8(pat_ptr, j) == 125 && (j + 1) < pat_len && std::runtime::mem::load_u8(pat_ptr, j + 1) == 125 {
           break;
         }
+
         j = j + 1;
       }
+
       if j < pat_len && (j + 1) < pat_len {
         let name_ptr: u64 = pat_ptr + ((i + 2) as u64);
         let name_len: i64 = j - (i + 2);
@@ -824,10 +1030,15 @@ fn yaml_subst_vars (pat_ptr: u64, pat_len: i64, vars_ptr: u64, vars_len: i64, mu
           // name\0value\0
           let n_ptr: u64 = vars_ptr + (k as u64);
           var n_len: i64 = 0;
-          while (k + n_len) < vars_len && std::runtime::mem::load_u8(vars_ptr, k + n_len) != 0 { n_len = n_len + 1; }
+          while (k + n_len) < vars_len && std::runtime::mem::load_u8(vars_ptr, k + n_len) != 0 {
+            n_len = n_len + 1;
+          }
+
           let v_off: i64 = k + n_len + 1;
           var v_len: i64 = 0;
-          while (v_off + v_len) < vars_len && std::runtime::mem::load_u8(vars_ptr, v_off + v_len) != 0 { v_len = v_len + 1; }
+          while (v_off + v_len) < vars_len && std::runtime::mem::load_u8(vars_ptr, v_off + v_len) != 0 {
+            v_len = v_len + 1;
+          }
 
           if n_len == name_len {
             var m: i64 = 0;
@@ -837,8 +1048,10 @@ fn yaml_subst_vars (pat_ptr: u64, pat_len: i64, vars_ptr: u64, vars_len: i64, mu
                 ok = false;
                 break;
               }
+
               m = m + 1;
             }
+
             if ok {
               let _ = out.push_ptr_len(vars_ptr + (v_off as u64), v_len);
               found = true;
@@ -855,6 +1068,7 @@ fn yaml_subst_vars (pat_ptr: u64, pat_len: i64, vars_ptr: u64, vars_len: i64, mu
             // Prevent runaway expansion.
             return false;
           }
+
           continue;
         }
       }
@@ -874,6 +1088,7 @@ fn yaml_flush_rule (mut out_rules: &BufferU8, mut out_rule_toks: &BufferU8, var_
   if match_ptr == 0 || match_len <= 0 || scope_ptr == 0 || scope_len <= 0 {
     return;
   }
+
   let tok: u8 = tok_from_scope(scope_ptr, scope_len);
   if tok == TOK_NONE {
     return;
@@ -888,6 +1103,7 @@ fn yaml_flush_rule (mut out_rules: &BufferU8, mut out_rule_toks: &BufferU8, var_
     let _ = out_rules.push_ptr_len(match_ptr, match_len);
     let _ = out_rules.push_u8(0);
   }
+
   let _ = out_rule_toks.push_u8(tok);
 }
 
@@ -895,9 +1111,16 @@ fn pack_push_checked (mut pack: &BufferU8, ptr: u64, len: i64) -> i64? {
   if ptr == 0 || len <= 0 {
     return None;
   }
+
   let off: i64 = pack.len;
-  if pack.push_ptr_len(ptr, len) != None { return None; }
-  if pack.push_u8(0) != None { return None; }
+  if pack.push_ptr_len(ptr, len) != None {
+    return None;
+  }
+
+  if pack.push_u8(0) != None {
+    return None;
+  }
+
   return Some(off);
 }
 
@@ -928,23 +1151,53 @@ fn parse_sublime_syntax (
 
   // Scratch buffers.
   let scratch_opt: BufferU8? = BufferU8.init(256);
-  if scratch_opt == None { return false; }
-  let mut scratch: BufferU8 = match (scratch_opt) { Some(v) => v, None => BufferU8.empty() };
+  if scratch_opt == None {
+    return false;
+  }
+
+  let mut scratch: BufferU8 = match (scratch_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
   let scratch2_opt: BufferU8? = BufferU8.init(1024);
-  if scratch2_opt == None { return false; }
-  let mut scratch2: BufferU8 = match (scratch2_opt) { Some(v) => v, None => BufferU8.empty() };
+  if scratch2_opt == None {
+    return false;
+  }
+
+  let mut scratch2: BufferU8 = match (scratch2_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
   let var_pack_opt: BufferU8? = BufferU8.init(2048);
-  if var_pack_opt == None { return false; }
-  let mut var_pack: BufferU8 = match (var_pack_opt) { Some(v) => v, None => BufferU8.empty() };
+  if var_pack_opt == None {
+    return false;
+  }
+
+  let mut var_pack: BufferU8 = match (var_pack_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
   let pack_opt: BufferU8? = BufferU8.init(4096);
-  if pack_opt == None { return false; }
-  let mut pack: BufferU8 = match (pack_opt) { Some(v) => v, None => BufferU8.empty() };
+  if pack_opt == None {
+    return false;
+  }
+
+  let mut pack: BufferU8 = match (pack_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
   let fl_block_opt: BufferU8? = BufferU8.init(1024);
-  if fl_block_opt == None { return false; }
-  let mut fl_block: BufferU8 = match (fl_block_opt) { Some(v) => v, None => BufferU8.empty() };
+  if fl_block_opt == None {
+    return false;
+  }
+
+  let mut fl_block: BufferU8 = match (fl_block_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
   let rs_opt: VecU64? = VecU64.init(96);
-  if rs_opt == None { return false; }
-  let mut range_stack: VecU64 = match (rs_opt) { Some(v) => v, None => VecU64.empty() }; // triples: [list_indent, begin_off, begin_len]
+  if rs_opt == None {
+    return false;
+  }
+
+  let mut range_stack: VecU64 = match (rs_opt) {
+    Some(v) => v, None => VecU64.empty()
+  }; // triples: [list_indent, begin_off, begin_len]
 
   var in_vars: bool = false;
   var in_exts: bool = false;
@@ -970,6 +1223,7 @@ fn parse_sublime_syntax (
     while i < b.len && std::runtime::mem::load_u8(b.ptr, i) != 10 {
       i = i + 1;
     }
+
     let line_end: i64 = i;
     if i < b.len && std::runtime::mem::load_u8(b.ptr, i) == 10 {
       i = i + 1;
@@ -985,6 +1239,7 @@ fn parse_sublime_syntax (
         j = j + 1;
         continue;
       }
+
       break;
     }
 
@@ -1006,8 +1261,16 @@ fn parse_sublime_syntax (
 
         // Variable substitution (best-effort; bounded).
         let ok_sub: bool = yaml_subst_vars(fl_block.ptr, fl_block.len, var_pack.ptr, var_pack.len, mut scratch2);
-        let pat_ptr: u64 = if ok_sub { scratch2.ptr } else { fl_block.ptr };
-        let pat_len: i64 = if ok_sub { scratch2.len } else { fl_block.len };
+        let pat_ptr: u64 = if ok_sub {
+          scratch2.ptr
+        } else {
+          fl_block.ptr
+        };
+        let pat_len: i64 = if ok_sub {
+          scratch2.len
+        } else {
+          fl_block.len
+        };
         if pat_ptr != 0 && pat_len > 0 {
           let _ = out_first_line.push_ptr_len(pat_ptr, pat_len);
           let _ = out_first_line.push_u8(0);
@@ -1023,6 +1286,7 @@ fn parse_sublime_syntax (
         if content_start < line_end {
           let _ = fl_block.push_ptr_len(b.ptr + (content_start as u64), line_end - content_start);
         }
+
         let _ = fl_block.push_u8(10); // '\n'
         continue;
       }
@@ -1043,6 +1307,7 @@ fn parse_sublime_syntax (
         range_stack.len = range_stack.len - 3;
         continue;
       }
+
       break;
     }
 
@@ -1050,9 +1315,11 @@ fn parse_sublime_syntax (
     if std::runtime::mem::load_u8(t_ptr, 0) == 37 { // '%'
       continue;
     }
+
     if t_len >= 3 && std::runtime::mem::load_u8(t_ptr, 0) == 45 && std::runtime::mem::load_u8(t_ptr, 1) == 45 && std::runtime::mem::load_u8(t_ptr, 2) == 45 {
       continue;
     }
+
     if t_len == 3 && std::runtime::mem::load_u8(t_ptr, 0) == 46 && std::runtime::mem::load_u8(t_ptr, 1) == 46 && std::runtime::mem::load_u8(t_ptr, 2) == 46 { // "..."
       continue;
     }
@@ -1075,10 +1342,13 @@ fn parse_sublime_syntax (
       in_vars = true;
       continue;
     }
+
     if in_vars && indent >= 2 {
       // name: value
       var k: i64 = 0;
-      while k < t_len && std::runtime::mem::load_u8(t_ptr, k) != 58 { k = k + 1; } // ':'
+      while k < t_len && std::runtime::mem::load_u8(t_ptr, k) != 58 {
+        k = k + 1;
+      } // ':'
       if k < t_len {
         let n0: Span = trim_ascii_ws(t_ptr, k);
         let n_ptr0: u64 = n0.ptr;
@@ -1104,6 +1374,7 @@ fn parse_sublime_syntax (
           }
         }
       }
+
       continue;
     }
 
@@ -1113,7 +1384,10 @@ fn parse_sublime_syntax (
       exts_indent = 2;
       // Inline list?
       var k2: i64 = 0;
-      while k2 < t_len && std::runtime::mem::load_u8(t_ptr, k2) != 58 { k2 = k2 + 1; }
+      while k2 < t_len && std::runtime::mem::load_u8(t_ptr, k2) != 58 {
+        k2 = k2 + 1;
+      }
+
       if k2 < t_len {
         let vv2: Span = trim_ascii_ws(t_ptr + ((k2 + 1) as u64), t_len - (k2 + 1));
         let vv_ptr2: u64 = vv2.ptr;
@@ -1132,16 +1406,24 @@ fn parse_sublime_syntax (
                 let _ = out_exts.push_ptr_len(x.ptr, x.len);
                 let _ = out_exts.push_u8(0);
               }
+
               tok_start = p + 1;
             }
-            if c == 93 { break; }
+
+            if c == 93 {
+              break;
+            }
+
             p = p + 1;
           }
+
           in_exts = false;
         }
       }
+
       continue;
     }
+
     if in_exts && indent >= exts_indent && t_len >= 2 && std::runtime::mem::load_u8(t_ptr, 0) == 45 { // '-'
       let x0: Span = trim_ascii_ws(t_ptr + 1, t_len - 1);
       let x: Span = yaml_decode_string(x0.ptr, x0.len, mut scratch2);
@@ -1149,6 +1431,7 @@ fn parse_sublime_syntax (
         let _ = out_exts.push_ptr_len(x.ptr, x.len);
         let _ = out_exts.push_u8(0);
       }
+
       continue;
     }
 
@@ -1158,7 +1441,10 @@ fn parse_sublime_syntax (
       hidden_indent = 2;
       // Inline list?
       var hk: i64 = 0;
-      while hk < t_len && std::runtime::mem::load_u8(t_ptr, hk) != 58 { hk = hk + 1; }
+      while hk < t_len && std::runtime::mem::load_u8(t_ptr, hk) != 58 {
+        hk = hk + 1;
+      }
+
       if hk < t_len {
         let vv: Span = trim_ascii_ws(t_ptr + ((hk + 1) as u64), t_len - (hk + 1));
         let vv_ptr: u64 = vv.ptr;
@@ -1177,16 +1463,24 @@ fn parse_sublime_syntax (
                 let _ = out_exts.push_ptr_len(x.ptr, x.len);
                 let _ = out_exts.push_u8(0);
               }
+
               tok_start = p + 1;
             }
-            if c == 93 { break; }
+
+            if c == 93 {
+              break;
+            }
+
             p = p + 1;
           }
+
           in_hidden_exts = false;
         }
       }
+
       continue;
     }
+
     if in_hidden_exts && indent >= hidden_indent && t_len >= 2 && std::runtime::mem::load_u8(t_ptr, 0) == 45 { // '-'
       let x0: Span = trim_ascii_ws(t_ptr + 1, t_len - 1);
       let x: Span = yaml_decode_string(x0.ptr, x0.len, mut scratch2);
@@ -1194,6 +1488,7 @@ fn parse_sublime_syntax (
         let _ = out_exts.push_ptr_len(x.ptr, x.len);
         let _ = out_exts.push_u8(0);
       }
+
       continue;
     }
 
@@ -1201,7 +1496,9 @@ fn parse_sublime_syntax (
     if indent == 0 && has_prefix_nocase(t_ptr, t_len, "first_line_match:") {
       // Parse the scalar value (inline string or `|` block).
       var fk: i64 = 0;
-      while fk < t_len && std::runtime::mem::load_u8(t_ptr, fk) != 58 { fk = fk + 1; } // ':'
+      while fk < t_len && std::runtime::mem::load_u8(t_ptr, fk) != 58 {
+        fk = fk + 1;
+      } // ':'
       if fk < t_len {
         let rest: Span = trim_ascii_ws(t_ptr + ((fk + 1) as u64), t_len - (fk + 1));
         let r_ptr: u64 = rest.ptr;
@@ -1214,6 +1511,7 @@ fn parse_sublime_syntax (
             let c1: u8 = std::runtime::mem::load_u8(r_ptr, 1);
             fl_chomp_strip = c1 == 45; // '-'
           }
+
           fl_block.clear();
           continue;
         }
@@ -1221,14 +1519,23 @@ fn parse_sublime_syntax (
         let p: Span = yaml_decode_string(r_ptr, r_len, mut scratch2);
         if p.ptr != 0 && p.len > 0 {
           let ok_sub: bool = yaml_subst_vars(p.ptr, p.len, var_pack.ptr, var_pack.len, mut scratch);
-          let src_ptr: u64 = if ok_sub { scratch.ptr } else { p.ptr };
-          let src_len: i64 = if ok_sub { scratch.len } else { p.len };
+          let src_ptr: u64 = if ok_sub {
+            scratch.ptr
+          } else {
+            p.ptr
+          };
+          let src_len: i64 = if ok_sub {
+            scratch.len
+          } else {
+            p.len
+          };
           if src_ptr != 0 && src_len > 0 {
             let _ = out_first_line.push_ptr_len(src_ptr, src_len);
             let _ = out_first_line.push_u8(0);
           }
         }
       }
+
       continue;
     }
 
@@ -1237,6 +1544,7 @@ fn parse_sublime_syntax (
       in_contexts = true;
       continue;
     }
+
     if in_contexts {
       // New list item begins at any indent within contexts (including nested push blocks).
       if t_len >= 1 && std::runtime::mem::load_u8(t_ptr, 0) == 45 { // '-'
@@ -1254,28 +1562,45 @@ fn parse_sublime_syntax (
         if rest_ptr0 != 0 && rest_len0 > 0 {
           if has_prefix_nocase(rest_ptr0, rest_len0, "match:") {
             var k3: i64 = 0;
-            while k3 < rest_len0 && std::runtime::mem::load_u8(rest_ptr0, k3) != 58 { k3 = k3 + 1; }
+            while k3 < rest_len0 && std::runtime::mem::load_u8(rest_ptr0, k3) != 58 {
+              k3 = k3 + 1;
+            }
+
             let p: Span = yaml_decode_string(rest_ptr0 + ((k3 + 1) as u64), rest_len0 - (k3 + 1), mut scratch2);
             if p.ptr != 0 && p.len > 0 {
               let ok_sub: bool = yaml_subst_vars(p.ptr, p.len, var_pack.ptr, var_pack.len, mut scratch);
-              let src_ptr: u64 = if ok_sub { scratch.ptr } else { p.ptr };
-              let src_len: i64 = if ok_sub { scratch.len } else { p.len };
+              let src_ptr: u64 = if ok_sub {
+                scratch.ptr
+              } else {
+                p.ptr
+              };
+              let src_len: i64 = if ok_sub {
+                scratch.len
+              } else {
+                p.len
+              };
               let off_opt: i64? = pack_push_checked(mut pack, src_ptr, src_len);
               if off_opt != None {
-                let off: i64 = match (off_opt) { Some(v) => v, None => 0 };
+                let off: i64 = match (off_opt) {
+                  Some(v) => v, None => 0
+                };
                 item_match_off = off;
                 item_match_len = src_len;
               }
             }
           } else if has_prefix_nocase(rest_ptr0, rest_len0, "scope:") {
             var k4: i64 = 0;
-            while k4 < rest_len0 && std::runtime::mem::load_u8(rest_ptr0, k4) != 58 { k4 = k4 + 1; }
+            while k4 < rest_len0 && std::runtime::mem::load_u8(rest_ptr0, k4) != 58 {
+              k4 = k4 + 1;
+            }
+
             let s: Span = yaml_decode_string(rest_ptr0 + ((k4 + 1) as u64), rest_len0 - (k4 + 1), mut scratch2);
             if s.ptr != 0 && s.len > 0 {
               item_tok = tok_from_scope(s.ptr, s.len);
             }
           }
         }
+
         continue;
       }
 
@@ -1283,22 +1608,38 @@ fn parse_sublime_syntax (
       if have_item && indent > item_indent {
         if has_prefix_nocase(t_ptr, t_len, "match:") {
           var k5: i64 = 0;
-          while k5 < t_len && std::runtime::mem::load_u8(t_ptr, k5) != 58 { k5 = k5 + 1; }
+          while k5 < t_len && std::runtime::mem::load_u8(t_ptr, k5) != 58 {
+            k5 = k5 + 1;
+          }
+
           let p2: Span = yaml_decode_string(t_ptr + ((k5 + 1) as u64), t_len - (k5 + 1), mut scratch2);
           if p2.ptr != 0 && p2.len > 0 {
             let ok_sub2: bool = yaml_subst_vars(p2.ptr, p2.len, var_pack.ptr, var_pack.len, mut scratch);
-            let src_ptr2: u64 = if ok_sub2 { scratch.ptr } else { p2.ptr };
-            let src_len2: i64 = if ok_sub2 { scratch.len } else { p2.len };
+            let src_ptr2: u64 = if ok_sub2 {
+              scratch.ptr
+            } else {
+              p2.ptr
+            };
+            let src_len2: i64 = if ok_sub2 {
+              scratch.len
+            } else {
+              p2.len
+            };
             let off_opt2: i64? = pack_push_checked(mut pack, src_ptr2, src_len2);
             if off_opt2 != None {
-              let off2: i64 = match (off_opt2) { Some(v) => v, None => 0 };
+              let off2: i64 = match (off_opt2) {
+                Some(v) => v, None => 0
+              };
               item_match_off = off2;
               item_match_len = src_len2;
             }
           }
         } else if has_prefix_nocase(t_ptr, t_len, "scope:") {
           var k6: i64 = 0;
-          while k6 < t_len && std::runtime::mem::load_u8(t_ptr, k6) != 58 { k6 = k6 + 1; }
+          while k6 < t_len && std::runtime::mem::load_u8(t_ptr, k6) != 58 {
+            k6 = k6 + 1;
+          }
+
           let s2: Span = yaml_decode_string(t_ptr + ((k6 + 1) as u64), t_len - (k6 + 1), mut scratch2);
           if s2.ptr != 0 && s2.len > 0 {
             item_tok = tok_from_scope(s2.ptr, s2.len);
@@ -1309,14 +1650,21 @@ fn parse_sublime_syntax (
           if item_match_off >= 0 && item_match_len > 0 && pack.ptr != 0 {
             let list_indent: int = indent + 2;
             let before: i64 = range_stack.len;
-            if range_stack.push(list_indent as u64) != None { range_stack.len = before; }
-            else if range_stack.push(item_match_off as u64) != None { range_stack.len = before; }
-            else if range_stack.push(item_match_len as u64) != None { range_stack.len = before; }
+            if range_stack.push(list_indent as u64) != None {
+              range_stack.len = before;
+            } else if range_stack.push(item_match_off as u64) != None {
+              range_stack.len = before;
+            } else if range_stack.push(item_match_len as u64) != None {
+              range_stack.len = before;
+            }
           }
         } else if has_prefix_nocase(t_ptr, t_len, "pop:") {
           // pop: true
           var k7: i64 = 0;
-          while k7 < t_len && std::runtime::mem::load_u8(t_ptr, k7) != 58 { k7 = k7 + 1; }
+          while k7 < t_len && std::runtime::mem::load_u8(t_ptr, k7) != 58 {
+            k7 = k7 + 1;
+          }
+
           let v: Span = yaml_decode_string(t_ptr + ((k7 + 1) as u64), t_len - (k7 + 1), mut scratch2);
           if v.ptr != 0 && v.len > 0 && eq_nocase(v.ptr, v.len, "true") {
             if item_match_off >= 0 && item_match_len > 0 && range_stack.len >= 3 && pack.ptr != 0 {
@@ -1348,8 +1696,16 @@ fn parse_sublime_syntax (
     }
 
     let ok_sub: bool = yaml_subst_vars(fl_block.ptr, fl_block.len, var_pack.ptr, var_pack.len, mut scratch2);
-    let pat_ptr: u64 = if ok_sub { scratch2.ptr } else { fl_block.ptr };
-    let pat_len: i64 = if ok_sub { scratch2.len } else { fl_block.len };
+    let pat_ptr: u64 = if ok_sub {
+      scratch2.ptr
+    } else {
+      fl_block.ptr
+    };
+    let pat_len: i64 = if ok_sub {
+      scratch2.len
+    } else {
+      fl_block.len
+    };
     if pat_ptr != 0 && pat_len > 0 {
       let _ = out_first_line.push_ptr_len(pat_ptr, pat_len);
       let _ = out_first_line.push_u8(0);
@@ -1373,22 +1729,51 @@ fn xml_entity_decode (src_ptr: u64, src_len: i64, mut out: &BufferU8) -> bool {
       if (i + 3) < src_len {
         // Find ';'
         var j: i64 = i + 1;
-        while j < src_len && std::runtime::mem::load_u8(src_ptr, j) != 59 { j = j + 1; }
+        while j < src_len && std::runtime::mem::load_u8(src_ptr, j) != 59 {
+          j = j + 1;
+        }
+
         if j < src_len {
           let name_ptr: u64 = src_ptr + ((i + 1) as u64);
           let name_len: i64 = j - (i + 1);
-          if eq_nocase(name_ptr, name_len, "lt") { let _ = out.push_u8(60); i = j + 1; continue; }
-          if eq_nocase(name_ptr, name_len, "gt") { let _ = out.push_u8(62); i = j + 1; continue; }
-          if eq_nocase(name_ptr, name_len, "amp") { let _ = out.push_u8(38); i = j + 1; continue; }
-          if eq_nocase(name_ptr, name_len, "quot") { let _ = out.push_u8(34); i = j + 1; continue; }
-          if eq_nocase(name_ptr, name_len, "apos") { let _ = out.push_u8(39); i = j + 1; continue; }
+          if eq_nocase(name_ptr, name_len, "lt") {
+            let _ = out.push_u8(60);
+            i = j + 1;
+            continue;
+          }
+
+          if eq_nocase(name_ptr, name_len, "gt") {
+            let _ = out.push_u8(62);
+            i = j + 1;
+            continue;
+          }
+
+          if eq_nocase(name_ptr, name_len, "amp") {
+            let _ = out.push_u8(38);
+            i = j + 1;
+            continue;
+          }
+
+          if eq_nocase(name_ptr, name_len, "quot") {
+            let _ = out.push_u8(34);
+            i = j + 1;
+            continue;
+          }
+
+          if eq_nocase(name_ptr, name_len, "apos") {
+            let _ = out.push_u8(39);
+            i = j + 1;
+            continue;
+          }
           // Unknown: drop the '&' and keep literal text.
         }
       }
     }
+
     let _ = out.push_u8(b);
     i = i + 1;
   }
+
   return true;
 }
 
@@ -1399,6 +1784,7 @@ fn find_tag (ptr: u64, len: i64, tag: string, start: i64) -> i64? {
   if tag_ptr == 0 || tag_len <= 0 {
     return None;
   }
+
   if start < 0 || start >= len {
     return None;
   }
@@ -1412,13 +1798,17 @@ fn find_tag (ptr: u64, len: i64, tag: string, start: i64) -> i64? {
         ok = false;
         break;
       }
+
       j = j + 1;
     }
+
     if ok {
       return Some(i);
     }
+
     i = i + 1;
   }
+
   return None;
 }
 
@@ -1457,15 +1847,43 @@ fn tm_key_id (ptr: u64, len: i64) -> u8 {
   if ptr == 0 || len <= 0 {
     return TM_KEY_NONE;
   }
-  if eq_nocase(ptr, len, "match") { return TM_KEY_MATCH; }
-  if eq_nocase(ptr, len, "begin") { return TM_KEY_BEGIN; }
-  if eq_nocase(ptr, len, "end") { return TM_KEY_END; }
-  if eq_nocase(ptr, len, "name") { return TM_KEY_NAME; }
-  if eq_nocase(ptr, len, "fileTypes") { return TM_KEY_FILETYPES; }
-  if eq_nocase(ptr, len, "firstLineMatch") { return TM_KEY_FIRST_LINE_MATCH; }
-  if eq_nocase(ptr, len, "captures") { return TM_KEY_CAPTURES; }
-  if eq_nocase(ptr, len, "beginCaptures") { return TM_KEY_BEGIN_CAPTURES; }
-  if eq_nocase(ptr, len, "endCaptures") { return TM_KEY_END_CAPTURES; }
+
+  if eq_nocase(ptr, len, "match") {
+    return TM_KEY_MATCH;
+  }
+
+  if eq_nocase(ptr, len, "begin") {
+    return TM_KEY_BEGIN;
+  }
+
+  if eq_nocase(ptr, len, "end") {
+    return TM_KEY_END;
+  }
+
+  if eq_nocase(ptr, len, "name") {
+    return TM_KEY_NAME;
+  }
+
+  if eq_nocase(ptr, len, "fileTypes") {
+    return TM_KEY_FILETYPES;
+  }
+
+  if eq_nocase(ptr, len, "firstLineMatch") {
+    return TM_KEY_FIRST_LINE_MATCH;
+  }
+
+  if eq_nocase(ptr, len, "captures") {
+    return TM_KEY_CAPTURES;
+  }
+
+  if eq_nocase(ptr, len, "beginCaptures") {
+    return TM_KEY_BEGIN_CAPTURES;
+  }
+
+  if eq_nocase(ptr, len, "endCaptures") {
+    return TM_KEY_END_CAPTURES;
+  }
+
   return TM_KEY_NONE;
 }
 
@@ -1480,6 +1898,7 @@ fn tm_flush_ctx (ctx: &TMDictCtx, pack: &BufferU8, mut out_rules: &BufferU8, mut
   if ctx.skip {
     return;
   }
+
   if pack.ptr == 0 {
     return;
   }
@@ -1538,11 +1957,21 @@ fn parse_textmate_syntax (
 
   // Scratch and packed storage for decoded strings.
   let scratch_opt: BufferU8? = BufferU8.init(1024);
-  if scratch_opt == None { return false; }
-  let mut scratch: BufferU8 = match (scratch_opt) { Some(v) => v, None => BufferU8.empty() };
+  if scratch_opt == None {
+    return false;
+  }
+
+  let mut scratch: BufferU8 = match (scratch_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
   let pack_opt: BufferU8? = BufferU8.init(4096);
-  if pack_opt == None { return false; }
-  let mut pack: BufferU8 = match (pack_opt) { Some(v) => v, None => BufferU8.empty() };
+  if pack_opt == None {
+    return false;
+  }
+
+  let mut pack: BufferU8 = match (pack_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
 
   // Dict context stack (heap array; grows as needed).
   let ctx_bytes: i64 = (sizeof (TMDictCtx)) as i64;
@@ -1551,6 +1980,7 @@ fn parse_textmate_syntax (
   if ctx_ptr == 0 {
     return false;
   }
+
   var ctx_len: i64 = 0;
 
   var depth: int = 0;
@@ -1560,7 +1990,10 @@ fn parse_textmate_syntax (
   var i: i64 = 0;
   while i < b.len {
     // Find '<'
-    while i < b.len && std::runtime::mem::load_u8(b.ptr, i) != 60 { i = i + 1; }
+    while i < b.len && std::runtime::mem::load_u8(b.ptr, i) != 60 {
+      i = i + 1;
+    }
+
     if i >= b.len {
       break;
     }
@@ -1578,8 +2011,10 @@ fn parse_textmate_syntax (
           j = j + 3;
           break;
         }
+
         j = j + 1;
       }
+
       i = j;
       continue;
     }
@@ -1592,8 +2027,10 @@ fn parse_textmate_syntax (
           j2 = j2 + 2;
           break;
         }
+
         j2 = j2 + 1;
       }
+
       i = j2;
       continue;
     }
@@ -1601,8 +2038,14 @@ fn parse_textmate_syntax (
     // Skip <!DOCTYPE ...> and other declarations.
     if (i + 1) < b.len && std::runtime::mem::load_u8(b.ptr, i + 1) == 33 {
       var j3: i64 = i + 2;
-      while j3 < b.len && std::runtime::mem::load_u8(b.ptr, j3) != 62 { j3 = j3 + 1; }
-      if j3 < b.len { j3 = j3 + 1; }
+      while j3 < b.len && std::runtime::mem::load_u8(b.ptr, j3) != 62 {
+        j3 = j3 + 1;
+      }
+
+      if j3 < b.len {
+        j3 = j3 + 1;
+      }
+
       i = j3;
       continue;
     }
@@ -1614,26 +2057,41 @@ fn parse_textmate_syntax (
       is_end = true;
       name_start = name_start + 1;
     }
+
     var j4: i64 = name_start;
     while j4 < b.len {
       let c: u8 = std::runtime::mem::load_u8(b.ptr, j4);
-      if c == 62 || c == 47 || tm_is_ascii_ws(c) { break; }
+      if c == 62 || c == 47 || tm_is_ascii_ws(c) {
+        break;
+      }
+
       j4 = j4 + 1;
     }
+
     let name_ptr: u64 = b.ptr + (name_start as u64);
     let name_len: i64 = j4 - name_start;
 
     var gt: i64 = j4;
-    while gt < b.len && std::runtime::mem::load_u8(b.ptr, gt) != 62 { gt = gt + 1; }
+    while gt < b.len && std::runtime::mem::load_u8(b.ptr, gt) != 62 {
+      gt = gt + 1;
+    }
+
     if gt >= b.len {
       break;
     }
+
     var is_self: bool = false;
     if !is_end {
       var k: i64 = gt - 1;
-      while k > i && tm_is_ascii_ws(std::runtime::mem::load_u8(b.ptr, k)) { k = k - 1; }
-      if k > i && std::runtime::mem::load_u8(b.ptr, k) == 47 { is_self = true; }
+      while k > i && tm_is_ascii_ws(std::runtime::mem::load_u8(b.ptr, k)) {
+        k = k - 1;
+      }
+
+      if k > i && std::runtime::mem::load_u8(b.ptr, k) == 47 {
+        is_self = true;
+      }
     }
+
     let tag_end: i64 = gt + 1;
 
     if name_len <= 0 {
@@ -1646,7 +2104,10 @@ fn parse_textmate_syntax (
         if filetypes_depth == depth {
           filetypes_depth = -1;
         }
-        if depth > 0 { depth = depth - 1; }
+
+        if depth > 0 {
+          depth = depth - 1;
+        }
       } else if eq_nocase(name_ptr, name_len, "dict") {
         if ctx_len > 0 {
           let idx: i64 = ctx_len - 1;
@@ -1654,7 +2115,10 @@ fn parse_textmate_syntax (
           tm_flush_ctx(&ctx, &pack, mut out_rules, mut out_rule_toks, mut meta, mut scratch);
           ctx_len = idx;
         }
-        if depth > 0 { depth = depth - 1; }
+
+        if depth > 0 {
+          depth = depth - 1;
+        }
       }
 
       i = tag_end;
@@ -1719,7 +2183,10 @@ fn parse_textmate_syntax (
           tm_flush_ctx(&ctx1, &pack, mut out_rules, mut out_rule_toks, mut meta, mut scratch);
           ctx_len = idx1;
         }
-        if depth > 0 { depth = depth - 1; }
+
+        if depth > 0 {
+          depth = depth - 1;
+        }
       }
 
       i = tag_end;
@@ -1745,7 +2212,10 @@ fn parse_textmate_syntax (
         if filetypes_depth == depth {
           filetypes_depth = -1;
         }
-        if depth > 0 { depth = depth - 1; }
+
+        if depth > 0 {
+          depth = depth - 1;
+        }
       }
 
       i = tag_end;
@@ -1757,12 +2227,16 @@ fn parse_textmate_syntax (
         i = tag_end;
         continue;
       }
+
       let close_opt: i64? = find_tag(b.ptr, b.len, "</key>", tag_end);
       if close_opt == None {
         i = tag_end;
         continue;
       }
-      let close: i64 = match (close_opt) { Some(v) => v, None => tag_end };
+
+      let close: i64 = match (close_opt) {
+        Some(v) => v, None => tag_end
+      };
       let t: Span = trim_ascii_ws(b.ptr + (tag_end as u64), close - tag_end);
       if ctx_len > 0 {
         let idx3: i64 = ctx_len - 1;
@@ -1770,6 +2244,7 @@ fn parse_textmate_syntax (
         top3.pending = tm_key_id(t.ptr, t.len);
         (ctx_ptr as TMDictCtx[](ctx_cap as int))[idx3] = top3;
       }
+
       i = close + 6; // len("</key>")
       continue;
     }
@@ -1783,13 +2258,16 @@ fn parse_textmate_syntax (
           top4.pending = TM_KEY_NONE;
           (ctx_ptr as TMDictCtx[](ctx_cap as int))[idx4] = top4;
         }
+
         i = tag_end;
       } else {
         let close_opt2: i64? = find_tag(b.ptr, b.len, "</string>", tag_end);
         if close_opt2 == None {
           i = tag_end;
         } else {
-          let close2: i64 = match (close_opt2) { Some(v) => v, None => tag_end };
+          let close2: i64 = match (close_opt2) {
+            Some(v) => v, None => tag_end
+          };
           let raw_span: Span = trim_ascii_ws(b.ptr + (tag_end as u64), close2 - tag_end);
           if raw_span.ptr != 0 && raw_span.len > 0 {
             let _ = xml_entity_decode(raw_span.ptr, raw_span.len, mut scratch);
@@ -1826,6 +2304,7 @@ fn parse_textmate_syntax (
                 top5.name_len = val_len;
                 top5.have_name = val_len > 0;
               }
+
               top5.pending = TM_KEY_NONE;
               (ctx_ptr as TMDictCtx[](ctx_cap as int))[idx5] = top5;
             }
@@ -1912,6 +2391,7 @@ fn atom_flush_ctx (ctx: &AtomCtx, pack: &BufferU8, mut out_rules: &BufferU8, mut
   if ctx.skip {
     return;
   }
+
   if pack.ptr == 0 {
     return;
   }
@@ -1963,29 +2443,53 @@ fn cson_strip_comment_len (ptr: u64, len: i64) -> i64 {
         i = i + 1;
         continue;
       }
-      if c == 39 { in_s = false; }
-      i = i + 1;
-      continue;
-    }
-    if in_d {
-      if c == 92 { esc = true; i = i + 1; continue; }
-      if c == 34 { in_d = false; }
+
+      if c == 39 {
+        in_s = false;
+      }
+
       i = i + 1;
       continue;
     }
 
-    if c == 39 { in_s = true; i = i + 1; continue; }
-    if c == 34 { in_d = true; i = i + 1; continue; }
+    if in_d {
+      if c == 92 {
+        esc = true;
+        i = i + 1;
+        continue;
+      }
+
+      if c == 34 {
+        in_d = false;
+      }
+
+      i = i + 1;
+      continue;
+    }
+
+    if c == 39 {
+      in_s = true;
+      i = i + 1;
+      continue;
+    }
+
+    if c == 34 {
+      in_d = true;
+      i = i + 1;
+      continue;
+    }
 
     if c == 35 { // '#'
       return i;
     }
+
     if c == 47 && (i + 1) < len && std::runtime::mem::load_u8(ptr, i + 1) == 47 { // '//'
       return i;
     }
 
     i = i + 1;
   }
+
   return len;
 }
 
@@ -1996,20 +2500,46 @@ fn cson_unescape (src_ptr: u64, src_len: i64, mut out: &BufferU8) -> bool {
     let b: u8 = std::runtime::mem::load_u8(src_ptr, i);
     if b == 92 && (i + 1) < src_len { // '\\'
       let c: u8 = std::runtime::mem::load_u8(src_ptr, i + 1);
-      if c == 110 { let _ = out.push_u8(10); i = i + 2; continue; } // n
-      if c == 116 { let _ = out.push_u8(9); i = i + 2; continue; } // t
-      if c == 114 { let _ = out.push_u8(13); i = i + 2; continue; } // r
-      if c == 39 { let _ = out.push_u8(39); i = i + 2; continue; } // '
-      if c == 34 { let _ = out.push_u8(34); i = i + 2; continue; } // "
-      if c == 92 { let _ = out.push_u8(92); i = i + 2; continue; } // \
+      if c == 110 {
+        let _ = out.push_u8(10);
+        i = i + 2;
+        continue;
+      } // n
+      if c == 116 {
+        let _ = out.push_u8(9);
+        i = i + 2;
+        continue;
+      } // t
+      if c == 114 {
+        let _ = out.push_u8(13);
+        i = i + 2;
+        continue;
+      } // r
+      if c == 39 {
+        let _ = out.push_u8(39);
+        i = i + 2;
+        continue;
+      } // '
+      if c == 34 {
+        let _ = out.push_u8(34);
+        i = i + 2;
+        continue;
+      } // "
+      if c == 92 {
+        let _ = out.push_u8(92);
+        i = i + 2;
+        continue;
+      } // \
       // Unknown escape: keep the escaped char (drop the backslash).
       let _ = out.push_u8(c);
       i = i + 2;
       continue;
     }
+
     let _ = out.push_u8(b);
     i = i + 1;
   }
+
   return true;
 }
 
@@ -2060,14 +2590,29 @@ fn parse_atom_cson (
 
   // Scratch buffers + packed storage for decoded strings.
   let scratch_opt: BufferU8? = BufferU8.init(1024);
-  if scratch_opt == None { return false; }
-  let mut scratch: BufferU8 = match (scratch_opt) { Some(v) => v, None => BufferU8.empty() };
+  if scratch_opt == None {
+    return false;
+  }
+
+  let mut scratch: BufferU8 = match (scratch_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
   let scratch2_opt: BufferU8? = BufferU8.init(256);
-  if scratch2_opt == None { return false; }
-  let mut scratch2: BufferU8 = match (scratch2_opt) { Some(v) => v, None => BufferU8.empty() };
+  if scratch2_opt == None {
+    return false;
+  }
+
+  let mut scratch2: BufferU8 = match (scratch2_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
   let pack_opt: BufferU8? = BufferU8.init(4096);
-  if pack_opt == None { return false; }
-  let mut pack: BufferU8 = match (pack_opt) { Some(v) => v, None => BufferU8.empty() };
+  if pack_opt == None {
+    return false;
+  }
+
+  let mut pack: BufferU8 = match (pack_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
 
   // Object context stack (heap array; grows as needed).
   let ctx_bytes: i64 = (sizeof (AtomCtx)) as i64;
@@ -2076,6 +2621,7 @@ fn parse_atom_cson (
   if ctx_ptr == 0 {
     return false;
   }
+
   var ctx_len: i64 = 0;
 
   // Root implicit context to allow top-level `match`/`name` (rare, but cheap).
@@ -2097,16 +2643,26 @@ fn parse_atom_cson (
   var i: i64 = 0;
   while i < b.len {
     let line_start: i64 = i;
-    while i < b.len && std::runtime::mem::load_u8(b.ptr, i) != 10 { i = i + 1; }
+    while i < b.len && std::runtime::mem::load_u8(b.ptr, i) != 10 {
+      i = i + 1;
+    }
+
     let line_end: i64 = i;
-    if i < b.len && std::runtime::mem::load_u8(b.ptr, i) == 10 { i = i + 1; }
+    if i < b.len && std::runtime::mem::load_u8(b.ptr, i) == 10 {
+      i = i + 1;
+    }
 
     // Indent (spaces + tabs).
     var indent: int = 0;
     var j: i64 = line_start;
     while j < line_end {
       let c0: u8 = std::runtime::mem::load_u8(b.ptr, j);
-      if c0 == 32 || c0 == 9 { indent = indent + 1; j = j + 1; continue; }
+      if c0 == 32 || c0 == 9 {
+        indent = indent + 1;
+        j = j + 1;
+        continue;
+      }
+
       break;
     }
 
@@ -2128,6 +2684,7 @@ fn parse_atom_cson (
         ctx_len = idx0;
         continue;
       }
+
       break;
     }
 
@@ -2142,11 +2699,24 @@ fn parse_atom_cson (
           var qesc: bool = false;
           while qpos < t_len {
             let cc: u8 = std::runtime::mem::load_u8(t_ptr, qpos);
-            if qesc { qesc = false; qpos = qpos + 1; continue; }
-            if cc == 92 { qesc = true; qpos = qpos + 1; continue; } // '\\'
-            if cc == q { break; }
+            if qesc {
+              qesc = false;
+              qpos = qpos + 1;
+              continue;
+            }
+
+            if cc == 92 {
+              qesc = true;
+              qpos = qpos + 1;
+              continue;
+            } // '\\'
+            if cc == q {
+              break;
+            }
+
             qpos = qpos + 1;
           }
+
           if qpos < t_len && std::runtime::mem::load_u8(t_ptr, qpos) == q {
             let lit_ptr: u64 = t_ptr + (p as u64);
             let lit_len: i64 = (qpos - p) + 1;
@@ -2155,6 +2725,7 @@ fn parse_atom_cson (
               let _ = out_exts.push_ptr_len(s.ptr, s.len);
               let _ = out_exts.push_u8(0);
             }
+
             p = qpos + 1;
             continue;
           }
@@ -2164,7 +2735,9 @@ fn parse_atom_cson (
           ft_depth = ft_depth + 1;
           ft_started = true;
         } else if c1 == 93 { // ']'
-          if ft_depth > 0 { ft_depth = ft_depth - 1; }
+          if ft_depth > 0 {
+            ft_depth = ft_depth - 1;
+          }
         }
 
         p = p + 1;
@@ -2182,7 +2755,9 @@ fn parse_atom_cson (
     // firstLineMatch:
     if has_prefix_nocase(t_ptr, t_len, "firstLineMatch:") || has_prefix_nocase(t_ptr, t_len, "first_line_match:") {
       var k0: i64 = 0;
-      while k0 < t_len && std::runtime::mem::load_u8(t_ptr, k0) != 58 { k0 = k0 + 1; } // ':'
+      while k0 < t_len && std::runtime::mem::load_u8(t_ptr, k0) != 58 {
+        k0 = k0 + 1;
+      } // ':'
       if k0 < t_len {
         let v0: Span = cson_decode_string(t_ptr + ((k0 + 1) as u64), t_len - (k0 + 1), mut scratch);
         if v0.ptr != 0 && v0.len > 0 {
@@ -2190,6 +2765,7 @@ fn parse_atom_cson (
           let _ = out_first_line.push_u8(0);
         }
       }
+
       continue;
     }
 
@@ -2221,8 +2797,10 @@ fn parse_atom_cson (
         end_idx = end_idx - 1;
         continue;
       }
+
       break;
     }
+
     if end_idx >= 0 && std::runtime::mem::load_u8(t_ptr, end_idx) == 125 { // '}'
       closes_brace = true;
       let inner: Span = trim_ascii_ws(t_ptr, end_idx);
@@ -2238,13 +2816,18 @@ fn parse_atom_cson (
             ctx_len = idxc2;
           }
         }
+
         continue;
       }
     }
 
     // Handle leading '{' (open brace objects).
     if std::runtime::mem::load_u8(t_ptr, 0) == 123 { // '{'
-      let parent_skip2: bool = if ctx_len > 0 { (ctx_ptr as AtomCtx[](ctx_cap as int))[(ctx_len - 1) as int].skip } else { false };
+      let parent_skip2: bool = if ctx_len > 0 {
+        (ctx_ptr as AtomCtx[](ctx_cap as int))[(ctx_len - 1) as int].skip
+      } else {
+        false
+      };
       // Grow context stack if needed.
       if ctx_len >= ctx_cap {
         let new_cap: i64 = ctx_cap * 2;
@@ -2254,6 +2837,7 @@ fn parse_atom_cson (
           ctx_cap = new_cap;
         }
       }
+
       if ctx_len < ctx_cap {
         (ctx_ptr as AtomCtx[](ctx_cap as int))[ctx_len] = AtomCtx{
           kind: ATOM_CTX_BRACE, indent: 0,
@@ -2279,6 +2863,7 @@ fn parse_atom_cson (
             ctx_len = idxc3;
           }
         }
+
         continue;
       }
     }
@@ -2298,28 +2883,66 @@ fn parse_atom_cson (
       var k: i64 = 0;
       while k < seg_len {
         let c2: u8 = std::runtime::mem::load_u8(seg_ptr, k);
-        if esc2 { esc2 = false; k = k + 1; continue; }
+        if esc2 {
+          esc2 = false;
+          k = k + 1;
+          continue;
+        }
+
         if in_s2 {
-          if c2 == 92 { esc2 = true; k = k + 1; continue; }
-          if c2 == 39 { in_s2 = false; }
+          if c2 == 92 {
+            esc2 = true;
+            k = k + 1;
+            continue;
+          }
+
+          if c2 == 39 {
+            in_s2 = false;
+          }
+
           k = k + 1;
           continue;
         }
+
         if in_d2 {
-          if c2 == 92 { esc2 = true; k = k + 1; continue; }
-          if c2 == 34 { in_d2 = false; }
+          if c2 == 92 {
+            esc2 = true;
+            k = k + 1;
+            continue;
+          }
+
+          if c2 == 34 {
+            in_d2 = false;
+          }
+
           k = k + 1;
           continue;
         }
-        if c2 == 39 { in_s2 = true; k = k + 1; continue; }
-        if c2 == 34 { in_d2 = true; k = k + 1; continue; }
-        if c2 == 58 { colon = k; break; }
+
+        if c2 == 39 {
+          in_s2 = true;
+          k = k + 1;
+          continue;
+        }
+
+        if c2 == 34 {
+          in_d2 = true;
+          k = k + 1;
+          continue;
+        }
+
+        if c2 == 58 {
+          colon = k;
+          break;
+        }
+
         k = k + 1;
       }
 
       if colon < 0 {
         break;
       }
+
       saw_kv = true;
 
       let key0: Span = trim_ascii_ws(seg_ptr, colon);
@@ -2342,29 +2965,93 @@ fn parse_atom_cson (
       while p3 < val_region_len {
         let c3: u8 = std::runtime::mem::load_u8(val_region_ptr, p3);
 
-        if escv { escv = false; p3 = p3 + 1; continue; }
+        if escv {
+          escv = false;
+          p3 = p3 + 1;
+          continue;
+        }
+
         if in_sv {
-          if c3 == 92 { escv = true; p3 = p3 + 1; continue; }
-          if c3 == 39 { in_sv = false; }
+          if c3 == 92 {
+            escv = true;
+            p3 = p3 + 1;
+            continue;
+          }
+
+          if c3 == 39 {
+            in_sv = false;
+          }
+
           p3 = p3 + 1;
           continue;
         }
+
         if in_dv {
-          if c3 == 92 { escv = true; p3 = p3 + 1; continue; }
-          if c3 == 34 { in_dv = false; }
+          if c3 == 92 {
+            escv = true;
+            p3 = p3 + 1;
+            continue;
+          }
+
+          if c3 == 34 {
+            in_dv = false;
+          }
+
           p3 = p3 + 1;
           continue;
         }
 
-        if c3 == 39 { in_sv = true; p3 = p3 + 1; continue; }
-        if c3 == 34 { in_dv = true; p3 = p3 + 1; continue; }
+        if c3 == 39 {
+          in_sv = true;
+          p3 = p3 + 1;
+          continue;
+        }
 
-        if c3 == 91 { depth_brack = depth_brack + 1; p3 = p3 + 1; continue; } // '['
-        if c3 == 93 { if depth_brack > 0 { depth_brack = depth_brack - 1; } p3 = p3 + 1; continue; } // ']'
-        if c3 == 123 { depth_brace = depth_brace + 1; p3 = p3 + 1; continue; } // '{'
-        if c3 == 125 { if depth_brace > 0 { depth_brace = depth_brace - 1; } p3 = p3 + 1; continue; } // '}'
-        if c3 == 40 { depth_paren = depth_paren + 1; p3 = p3 + 1; continue; } // '('
-        if c3 == 41 { if depth_paren > 0 { depth_paren = depth_paren - 1; } p3 = p3 + 1; continue; } // ')'
+        if c3 == 34 {
+          in_dv = true;
+          p3 = p3 + 1;
+          continue;
+        }
+
+        if c3 == 91 {
+          depth_brack = depth_brack + 1;
+          p3 = p3 + 1;
+          continue;
+        } // '['
+        if c3 == 93 {
+          if depth_brack > 0 {
+            depth_brack = depth_brack - 1;
+          }
+
+          p3 = p3 + 1;
+          continue;
+        } // ']'
+        if c3 == 123 {
+          depth_brace = depth_brace + 1;
+          p3 = p3 + 1;
+          continue;
+        } // '{'
+        if c3 == 125 {
+          if depth_brace > 0 {
+            depth_brace = depth_brace - 1;
+          }
+
+          p3 = p3 + 1;
+          continue;
+        } // '}'
+        if c3 == 40 {
+          depth_paren = depth_paren + 1;
+          p3 = p3 + 1;
+          continue;
+        } // '('
+        if c3 == 41 {
+          if depth_paren > 0 {
+            depth_paren = depth_paren - 1;
+          }
+
+          p3 = p3 + 1;
+          continue;
+        } // ')'
 
         if c3 == 44 && depth_brack == 0 && depth_brace == 0 && depth_paren == 0 { // ','
           val_end = p3;
@@ -2395,11 +3082,25 @@ fn parse_atom_cson (
             var qesc2: bool = false;
             while qpos2 < vlen {
               let cc3: u8 = std::runtime::mem::load_u8(vptr, qpos2);
-              if qesc2 { qesc2 = false; qpos2 = qpos2 + 1; continue; }
-              if cc3 == 92 { qesc2 = true; qpos2 = qpos2 + 1; continue; }
-              if cc3 == q2 { break; }
+              if qesc2 {
+                qesc2 = false;
+                qpos2 = qpos2 + 1;
+                continue;
+              }
+
+              if cc3 == 92 {
+                qesc2 = true;
+                qpos2 = qpos2 + 1;
+                continue;
+              }
+
+              if cc3 == q2 {
+                break;
+              }
+
               qpos2 = qpos2 + 1;
             }
+
             if qpos2 < vlen && std::runtime::mem::load_u8(vptr, qpos2) == q2 {
               let lit_ptr2: u64 = vptr + (p2 as u64);
               let lit_len2: i64 = (qpos2 - p2) + 1;
@@ -2408,13 +3109,20 @@ fn parse_atom_cson (
                 let _ = out_exts.push_ptr_len(s2.ptr, s2.len);
                 let _ = out_exts.push_u8(0);
               }
+
               p2 = qpos2 + 1;
               continue;
             }
           }
 
-          if c4 == 91 { ft_depth = ft_depth + 1; ft_started = true; }
-          else if c4 == 93 { if ft_depth > 0 { ft_depth = ft_depth - 1; } }
+          if c4 == 91 {
+            ft_depth = ft_depth + 1;
+            ft_started = true;
+          } else if c4 == 93 {
+            if ft_depth > 0 {
+              ft_depth = ft_depth - 1;
+            }
+          }
 
           p2 = p2 + 1;
         }
@@ -2475,6 +3183,7 @@ fn parse_atom_cson (
                 ctx_cap = new_cap2;
               }
             }
+
             if ctx_len < ctx_cap {
               let parent_skip3: bool = top1.skip;
               (ctx_ptr as AtomCtx[](ctx_cap as int))[ctx_len] = AtomCtx{
@@ -2500,6 +3209,7 @@ fn parse_atom_cson (
                 ctx_cap = new_cap3;
               }
             }
+
             if ctx_len < ctx_cap {
               let parent_skip4: bool = top1.skip;
               (ctx_ptr as AtomCtx[](ctx_cap as int))[ctx_len] = AtomCtx{
@@ -2523,6 +3233,7 @@ fn parse_atom_cson (
       if val_end >= val_region_len {
         break;
       }
+
       let rest: Span = trim_ascii_ws(val_region_ptr + ((val_end + 1) as u64), val_region_len - (val_end + 1));
       seg_ptr = rest.ptr;
       seg_len = rest.len;
@@ -2538,6 +3249,7 @@ fn parse_atom_cson (
           ctx_len = idxc4;
         }
       }
+
       continue;
     }
 
@@ -2558,6 +3270,7 @@ fn parse_atom_cson (
     atom_flush_ctx(&topf, &pack, mut out_rules, mut out_rule_toks, mut meta, mut scratch2);
     ctx_len = idxf;
   }
+
   std::runtime::mem::free(ctx_ptr);
   let _ = cache_name;
   return out_rule_toks.len > 0 || meta.flags != 0;
@@ -2581,8 +3294,13 @@ fn write_syntax_cache (out_path: string, flags: u32, exts: &BufferU8, rules: &Bu
   // exts: repeated [len:u16][bytes]
   // rules: repeated [tok:u8][pat_len:u32][bytes]
   let out_opt: BufferU8? = BufferU8.init(4096);
-  if out_opt == None { return false; }
-  let mut out: BufferU8 = match (out_opt) { Some(v) => v, None => BufferU8.empty() };
+  if out_opt == None {
+    return false;
+  }
+
+  let mut out: BufferU8 = match (out_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
 
   buf_push_u64_le(mut out, MAGIC_SYNTAX);
   buf_push_u32_le(mut out, SYNTAX_VERSION);
@@ -2595,6 +3313,7 @@ fn write_syntax_cache (out_path: string, flags: u32, exts: &BufferU8, rules: &Bu
     if std::runtime::mem::load_u8(exts.ptr, i) == 0 {
       ext_count = ext_count + 1;
     }
+
     i = i + 1;
   }
 
@@ -2607,13 +3326,22 @@ fn write_syntax_cache (out_path: string, flags: u32, exts: &BufferU8, rules: &Bu
   var cur: i64 = 0;
   while cur < exts.len {
     let start: i64 = cur;
-    while cur < exts.len && std::runtime::mem::load_u8(exts.ptr, cur) != 0 { cur = cur + 1; }
+    while cur < exts.len && std::runtime::mem::load_u8(exts.ptr, cur) != 0 {
+      cur = cur + 1;
+    }
+
     let l: i64 = cur - start;
-    let ll: u32 = if l > 65535 { 65535 } else { l as u32 };
+    let ll: u32 = if l > 65535 {
+      65535
+    } else {
+      l as u32
+    };
     let _ = out.push_u8((ll & 255) as u8);
     let _ = out.push_u8(((ll >> 8) & 255) as u8);
     let _ = out.push_ptr_len(exts.ptr + (start as u64), ll as i64);
-    if cur < exts.len && std::runtime::mem::load_u8(exts.ptr, cur) == 0 { cur = cur + 1; }
+    if cur < exts.len && std::runtime::mem::load_u8(exts.ptr, cur) == 0 {
+      cur = cur + 1;
+    }
   }
 
   // Rules: toks[] aligned with NUL-separated patterns in `rules`.
@@ -2622,7 +3350,10 @@ fn write_syntax_cache (out_path: string, flags: u32, exts: &BufferU8, rules: &Bu
   while r_idx < toks.len && p_cur < rules.len {
     let tok: u8 = std::runtime::mem::load_u8(toks.ptr, r_idx);
     let p_start: i64 = p_cur;
-    while p_cur < rules.len && std::runtime::mem::load_u8(rules.ptr, p_cur) != 0 { p_cur = p_cur + 1; }
+    while p_cur < rules.len && std::runtime::mem::load_u8(rules.ptr, p_cur) != 0 {
+      p_cur = p_cur + 1;
+    }
+
     let p_len: i64 = p_cur - p_start;
 
     let _ = out.push_u8(tok);
@@ -2631,7 +3362,10 @@ fn write_syntax_cache (out_path: string, flags: u32, exts: &BufferU8, rules: &Bu
       let _ = out.push_ptr_len(rules.ptr + (p_start as u64), p_len);
     }
 
-    if p_cur < rules.len && std::runtime::mem::load_u8(rules.ptr, p_cur) == 0 { p_cur = p_cur + 1; }
+    if p_cur < rules.len && std::runtime::mem::load_u8(rules.ptr, p_cur) == 0 {
+      p_cur = p_cur + 1;
+    }
+
     r_idx = r_idx + 1;
   }
 
@@ -2644,8 +3378,13 @@ fn write_index_cache (out_path: string, entries_ptr: u64, entries_len: i64) -> b
   // [magic:u64][version:u32][count:u32]
   // entries: repeated [key_len:u16][key bytes][file_len:u16][file bytes]
   let out_opt: BufferU8? = BufferU8.init(4096);
-  if out_opt == None { return false; }
-  let mut out: BufferU8 = match (out_opt) { Some(v) => v, None => BufferU8.empty() };
+  if out_opt == None {
+    return false;
+  }
+
+  let mut out: BufferU8 = match (out_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
 
   buf_push_u64_le(mut out, MAGIC_INDEX);
   buf_push_u32_le(mut out, SYNTAX_VERSION);
@@ -2654,8 +3393,16 @@ fn write_index_cache (out_path: string, entries_ptr: u64, entries_len: i64) -> b
   var i: i64 = 0;
   while i < entries_len {
     let e: IndexEntry = (entries_ptr as IndexEntry[](entries_len as int))[i];
-    let k: u32 = if e.key_len > 65535 { 65535 } else { e.key_len as u32 };
-    let f: u32 = if e.cache_len > 65535 { 65535 } else { e.cache_len as u32 };
+    let k: u32 = if e.key_len > 65535 {
+      65535
+    } else {
+      e.key_len as u32
+    };
+    let f: u32 = if e.cache_len > 65535 {
+      65535
+    } else {
+      e.cache_len as u32
+    };
     let _ = out.push_u8((k & 255) as u8);
     let _ = out.push_u8(((k >> 8) & 255) as u8);
     let _ = out.push_ptr_len(e.key_ptr, k as i64);
@@ -2673,7 +3420,10 @@ fn ascii_lower_copy (s: string, mut out: &BufferU8) -> void {
   out.clear();
   let p: u64 = std::runtime::mem::string_ptr(s);
   let n: i64 = std::runtime::mem::string_len(s);
-  if p == 0 || n <= 0 { return; }
+  if p == 0 || n <= 0 {
+    return;
+  }
+
   let _ = out.push_ptr_len(p, n);
   to_lower_ascii_inplace(out.ptr, out.len);
 }
@@ -2682,12 +3432,14 @@ fn make_cache_name (file_name: string, suffix: string) -> string? {
   if !ends_with(file_name, suffix) {
     return None;
   }
+
   let n: i64 = std::runtime::mem::string_len(file_name);
   let s: i64 = std::runtime::mem::string_len(suffix);
   let base_len: i64 = n - s;
   if base_len <= 0 {
     return None;
   }
+
   let base_ptr: u64 = std::runtime::mem::string_ptr(file_name);
   let base: string = std::runtime::mem::string_from_ptr_len(base_ptr, base_len as int);
   let joined_opt: string? = join2(base, ".sagec");
@@ -2700,6 +3452,7 @@ fn make_cache_name_rel (rel_path: string, suffix: string, mut scratch: &BufferU8
   if !ends_with(rel_path, suffix) {
     return None;
   }
+
   let n: i64 = std::runtime::mem::string_len(rel_path);
   let s: i64 = std::runtime::mem::string_len(suffix);
   let base_len: i64 = n - s;
@@ -2712,6 +3465,7 @@ fn make_cache_name_rel (rel_path: string, suffix: string, mut scratch: &BufferU8
   if p == 0 {
     return None;
   }
+
   let _ = scratch.push_ptr_len(p, base_len);
 
   // Normalize: '/' -> '_' (cache file names are flat).
@@ -2720,6 +3474,7 @@ fn make_cache_name_rel (rel_path: string, suffix: string, mut scratch: &BufferU8
     if std::runtime::mem::load_u8(scratch.ptr, i) == 47 { // '/'
       std::runtime::mem::store_u8(scratch.ptr, i, 95); // '_'
     }
+
     i = i + 1;
   }
 
@@ -2737,7 +3492,10 @@ struct CompileStats {
 }
 
 fn vlog (verbose: bool, msg: string) -> void {
-  if !verbose { return; }
+  if !verbose {
+    return;
+  }
+
   let _ = write_str(2, "sage[v] ");
   let _ = write_str(2, msg);
   let _ = write_str(2, "\n");
@@ -2748,9 +3506,13 @@ fn buf_count_nul_terms (b: &BufferU8) -> i64 {
   var n: i64 = 0;
   var i: i64 = 0;
   while i < b.len {
-    if std::runtime::mem::load_u8(b.ptr, i) == 0 { n = n + 1; }
+    if std::runtime::mem::load_u8(b.ptr, i) == 0 {
+      n = n + 1;
+    }
+
     i = i + 1;
   }
+
   return n;
 }
 
@@ -2781,6 +3543,7 @@ fn compile_cache_scan_dir (
     if name_cstr == 0 {
       break;
     }
+
     let name_len: i64 = cstr_len_max(name_cstr, 4096);
     let name: string = std::runtime::mem::string_from_ptr_len(name_cstr, name_len as int);
 
@@ -2796,13 +3559,18 @@ fn compile_cache_scan_dir (
       std::runtime::mem::free(name_cstr);
       continue;
     }
-    let full_path: string = match (full_path_opt) { Some(v) => v, None => "" };
+
+    let full_path: string = match (full_path_opt) {
+      Some(v) => v, None => ""
+    };
 
     // Directory? Recurse. In this runtime snapshot, `opendir` is more reliable
     // when directory paths end with '/'.
     let child_dir_opt: string? = join2(full_path, "/");
     if child_dir_opt != None {
-      let child_dir: string = match (child_dir_opt) { Some(v) => v, None => "" };
+      let child_dir: string = match (child_dir_opt) {
+        Some(v) => v, None => ""
+      };
       let sub: u64 = std::runtime::posix::fs::opendir(child_dir);
       if sub != 0 {
         let _ = std::runtime::posix::fs::closedir(sub);
@@ -2811,7 +3579,9 @@ fn compile_cache_scan_dir (
         if std::runtime::mem::string_len(rel_prefix) > 0 {
           let tmp_opt: string? = join2(rel_prefix, name);
           if tmp_opt != None {
-            let tmp: string = match (tmp_opt) { Some(v) => v, None => "" };
+            let tmp: string = match (tmp_opt) {
+              Some(v) => v, None => ""
+            };
             child_rel_opt = join2(tmp, "/");
             free_joined(tmp);
           }
@@ -2820,7 +3590,9 @@ fn compile_cache_scan_dir (
         }
 
         if child_rel_opt != None {
-          let child_rel: string = match (child_rel_opt) { Some(v) => v, None => "" };
+          let child_rel: string = match (child_rel_opt) {
+            Some(v) => v, None => ""
+          };
           compile_cache_scan_dir(child_dir, child_rel, cache_syntax, verbose, mut file_buf, mut exts, mut first_lines, mut rules, mut toks, mut name_scratch, entries_ptr, entries_cap, first_ptr, first_cap, mut stats);
           free_joined(child_rel);
         }
@@ -2830,6 +3602,7 @@ fn compile_cache_scan_dir (
         std::runtime::mem::free(name_cstr);
         continue;
       }
+
       free_joined(child_dir);
     }
 
@@ -2861,12 +3634,16 @@ fn compile_cache_scan_dir (
     } else {
       rel_path_opt = join2("", name);
     }
+
     if rel_path_opt == None {
       free_joined(full_path);
       std::runtime::mem::free(name_cstr);
       continue;
     }
-    let rel_path: string = match (rel_path_opt) { Some(v) => v, None => "" };
+
+    let rel_path: string = match (rel_path_opt) {
+      Some(v) => v, None => ""
+    };
 
     if kind == 1 {
       cache_name_opt = make_cache_name_rel(rel_path, ".sublime-syntax", mut name_scratch);
@@ -2876,6 +3653,7 @@ fn compile_cache_scan_dir (
       if ends_with(name, ".tmlanguage") {
         suf = ".tmlanguage";
       }
+
       cache_name_opt = make_cache_name_rel(rel_path, suf, mut name_scratch);
     } else if kind == 4 {
       // TextMate JSON grammars.
@@ -2883,10 +3661,12 @@ fn compile_cache_scan_dir (
       if ends_with(name, ".tmlanguage.json") {
         suf2 = ".tmlanguage.json";
       }
+
       cache_name_opt = make_cache_name_rel(rel_path, suf2, mut name_scratch);
     } else {
       cache_name_opt = make_cache_name_rel(rel_path, ".cson", mut name_scratch);
     }
+
     free_joined(rel_path);
 
     stats.candidates = stats.candidates + 1;
@@ -2895,7 +3675,10 @@ fn compile_cache_scan_dir (
       std::runtime::mem::free(name_cstr);
       continue;
     }
-    let cache_name: string = match (cache_name_opt) { Some(v) => v, None => "" };
+
+    let cache_name: string = match (cache_name_opt) {
+      Some(v) => v, None => ""
+    };
 
     if verbose {
       let _ = write_str(2, "sage[v] candidate ");
@@ -2914,6 +3697,7 @@ fn compile_cache_scan_dir (
         let _ = write_str(2, name);
         let _ = write_str(2, "\n");
       }
+
       free_joined(cache_name);
       std::runtime::mem::free(name_cstr);
       continue;
@@ -2931,6 +3715,7 @@ fn compile_cache_scan_dir (
     } else {
       ok_parse = parse_atom_cson(file_buf, cache_name, mut exts, mut first_lines, mut rules, mut toks, mut meta);
     }
+
     if !ok_parse || (toks.len <= 0 && meta.flags == 0) {
       stats.failed = stats.failed + 1;
       if verbose {
@@ -2942,6 +3727,7 @@ fn compile_cache_scan_dir (
         write_i64_dec(2, meta.flags as i64);
         let _ = write_str(2, "\n");
       }
+
       free_joined(cache_name);
       std::runtime::mem::free(name_cstr);
       continue;
@@ -2966,13 +3752,21 @@ fn compile_cache_scan_dir (
       var p_cur: i64 = 0;
       var n: i64 = 0;
       while p_cur < rules.len && n < MAX_RULES_PER_SYNTAX {
-        while p_cur < rules.len && std::runtime::mem::load_u8(rules.ptr, p_cur) != 0 { p_cur = p_cur + 1; }
-        if p_cur < rules.len && std::runtime::mem::load_u8(rules.ptr, p_cur) == 0 { p_cur = p_cur + 1; }
+        while p_cur < rules.len && std::runtime::mem::load_u8(rules.ptr, p_cur) != 0 {
+          p_cur = p_cur + 1;
+        }
+
+        if p_cur < rules.len && std::runtime::mem::load_u8(rules.ptr, p_cur) == 0 {
+          p_cur = p_cur + 1;
+        }
+
         n = n + 1;
       }
+
       if p_cur < rules.len {
         rules.len = p_cur;
       }
+
       if verbose {
         let _ = write_str(2, "sage[v] rule cap applied: ");
         let _ = write_str(2, name);
@@ -2985,7 +3779,9 @@ fn compile_cache_scan_dir (
     // Write cache file.
     let out_path_opt: string? = join2(cache_syntax, cache_name);
     if out_path_opt != None {
-      let out_path: string = match (out_path_opt) { Some(v) => v, None => "" };
+      let out_path: string = match (out_path_opt) {
+        Some(v) => v, None => ""
+      };
       let ok_write: bool = write_syntax_cache(out_path, meta.flags, exts, rules, toks);
       free_joined(out_path);
       if ok_write {
@@ -2994,6 +3790,7 @@ fn compile_cache_scan_dir (
           let _ = write_str(2, cache_name);
           let _ = write_str(2, "\n");
         }
+
         stats.compiled = stats.compiled + 1;
         stats.rules_total = stats.rules_total + (toks.len as i64);
 
@@ -3001,7 +3798,10 @@ fn compile_cache_scan_dir (
         var cur_e: i64 = 0;
         while cur_e < exts.len {
           let start: i64 = cur_e;
-          while cur_e < exts.len && std::runtime::mem::load_u8(exts.ptr, cur_e) != 0 { cur_e = cur_e + 1; }
+          while cur_e < exts.len && std::runtime::mem::load_u8(exts.ptr, cur_e) != 0 {
+            cur_e = cur_e + 1;
+          }
+
           let l: i64 = cur_e - start;
           if l > 0 && stats.entries_len < entries_cap {
             let key_p: u64 = std::runtime::mem::alloc(l);
@@ -3031,14 +3831,20 @@ fn compile_cache_scan_dir (
               }
             }
           }
-          if cur_e < exts.len && std::runtime::mem::load_u8(exts.ptr, cur_e) == 0 { cur_e = cur_e + 1; }
+
+          if cur_e < exts.len && std::runtime::mem::load_u8(exts.ptr, cur_e) == 0 {
+            cur_e = cur_e + 1;
+          }
         }
 
         // Add first-line entries: each `firstLineMatch` -> cache_name.
         var cur_p: i64 = 0;
         while cur_p < first_lines.len {
           let start_p: i64 = cur_p;
-          while cur_p < first_lines.len && std::runtime::mem::load_u8(first_lines.ptr, cur_p) != 0 { cur_p = cur_p + 1; }
+          while cur_p < first_lines.len && std::runtime::mem::load_u8(first_lines.ptr, cur_p) != 0 {
+            cur_p = cur_p + 1;
+          }
+
           let l2: i64 = cur_p - start_p;
           if l2 > 0 && stats.first_line_entries_len < first_cap {
             let key_p2: u64 = std::runtime::mem::alloc(l2);
@@ -3068,7 +3874,10 @@ fn compile_cache_scan_dir (
               }
             }
           }
-          if cur_p < first_lines.len && std::runtime::mem::load_u8(first_lines.ptr, cur_p) == 0 { cur_p = cur_p + 1; }
+
+          if cur_p < first_lines.len && std::runtime::mem::load_u8(first_lines.ptr, cur_p) == 0 {
+            cur_p = cur_p + 1;
+          }
         }
       }
     }
@@ -3086,16 +3895,23 @@ export fn compile_cache (verbose: bool) -> int {
     let _ = write_str(2, "sage: XDG config dir unavailable\n");
     return 2;
   }
+
   let cache_home_opt: string? = xdg_cache_home();
   if cache_home_opt == None {
     let _ = write_str(2, "sage: XDG cache dir unavailable\n");
-    let conf_home: string = match (conf_home_opt) { Some(v) => v, None => "" };
+    let conf_home: string = match (conf_home_opt) {
+      Some(v) => v, None => ""
+    };
     free_joined(conf_home);
     return 2;
   }
 
-  let conf_home: string = match (conf_home_opt) { Some(v) => v, None => "" };
-  let cache_home: string = match (cache_home_opt) { Some(v) => v, None => "" };
+  let conf_home: string = match (conf_home_opt) {
+    Some(v) => v, None => ""
+  };
+  let cache_home: string = match (cache_home_opt) {
+    Some(v) => v, None => ""
+  };
 
   // Build directories.
   let conf_sage_opt: string? = join2(conf_home, "/sage/");
@@ -3104,7 +3920,10 @@ export fn compile_cache (verbose: bool) -> int {
     free_joined(cache_home);
     return 2;
   }
-  let conf_sage: string = match (conf_sage_opt) { Some(v) => v, None => "" };
+
+  let conf_sage: string = match (conf_sage_opt) {
+    Some(v) => v, None => ""
+  };
   let conf_syntax_opt: string? = join2(conf_home, "/sage/syntax/");
   if conf_syntax_opt == None {
     free_joined(conf_sage);
@@ -3112,7 +3931,10 @@ export fn compile_cache (verbose: bool) -> int {
     free_joined(cache_home);
     return 2;
   }
-  let conf_syntax: string = match (conf_syntax_opt) { Some(v) => v, None => "" };
+
+  let conf_syntax: string = match (conf_syntax_opt) {
+    Some(v) => v, None => ""
+  };
 
   let cache_sage_opt: string? = join2(cache_home, "/sage/");
   if cache_sage_opt == None {
@@ -3122,7 +3944,10 @@ export fn compile_cache (verbose: bool) -> int {
     free_joined(cache_home);
     return 2;
   }
-  let cache_sage: string = match (cache_sage_opt) { Some(v) => v, None => "" };
+
+  let cache_sage: string = match (cache_sage_opt) {
+    Some(v) => v, None => ""
+  };
   let cache_syntax_opt: string? = join2(cache_home, "/sage/syntax/");
   if cache_syntax_opt == None {
     free_joined(cache_sage);
@@ -3132,7 +3957,10 @@ export fn compile_cache (verbose: bool) -> int {
     free_joined(cache_home);
     return 2;
   }
-  let cache_syntax: string = match (cache_syntax_opt) { Some(v) => v, None => "" };
+
+  let cache_syntax: string = match (cache_syntax_opt) {
+    Some(v) => v, None => ""
+  };
 
   if verbose {
     let _ = write_str(2, "sage[v] config_syntax=");
@@ -3185,14 +4013,20 @@ export fn compile_cache_dir (conf_syntax_dir: string, cache_syntax_dir: string, 
   if conf_syntax_opt == None {
     return 2;
   }
-  let conf_syntax: string = match (conf_syntax_opt) { Some(v) => v, None => "" };
+
+  let conf_syntax: string = match (conf_syntax_opt) {
+    Some(v) => v, None => ""
+  };
 
   let cache_syntax_opt: string? = dir_slash_owned(cache_syntax_dir);
   if cache_syntax_opt == None {
     free_joined(conf_syntax);
     return 2;
   }
-  let cache_syntax: string = match (cache_syntax_opt) { Some(v) => v, None => "" };
+
+  let cache_syntax: string = match (cache_syntax_opt) {
+    Some(v) => v, None => ""
+  };
 
   // Ensure output directory exists.
   if !mkdir_p(cache_syntax, 493) {
@@ -3221,6 +4055,7 @@ fn compile_cache_impl (conf_syntax: string, cache_syntax: string, verbose: bool)
       let _ = write_str(2, conf_syntax);
       let _ = write_str(2, " (add .sublime-syntax / .tmLanguage / .tmLanguage.json / .cson files)\n");
     }
+
     return 2;
   }
 
@@ -3230,45 +4065,71 @@ fn compile_cache_impl (conf_syntax: string, cache_syntax: string, verbose: bool)
     let _ = std::runtime::posix::fs::closedir(dir);
     return 2;
   }
-  let mut file_buf: BufferU8 = match (file_buf_opt) { Some(v) => v, None => BufferU8.empty() };
+
+  let mut file_buf: BufferU8 = match (file_buf_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
   let exts_opt: BufferU8? = BufferU8.init(1024);
   if exts_opt == None {
     let _ = std::runtime::posix::fs::closedir(dir);
     return 2;
   }
-  let mut exts: BufferU8 = match (exts_opt) { Some(v) => v, None => BufferU8.empty() };
+
+  let mut exts: BufferU8 = match (exts_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
   let rules_opt: BufferU8? = BufferU8.init(4096);
   if rules_opt == None {
     let _ = std::runtime::posix::fs::closedir(dir);
     return 2;
   }
-  let mut rules: BufferU8 = match (rules_opt) { Some(v) => v, None => BufferU8.empty() };
+
+  let mut rules: BufferU8 = match (rules_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
   let toks_opt: BufferU8? = BufferU8.init(1024);
   if toks_opt == None {
     let _ = std::runtime::posix::fs::closedir(dir);
     return 2;
   }
-  let mut toks: BufferU8 = match (toks_opt) { Some(v) => v, None => BufferU8.empty() };
+
+  let mut toks: BufferU8 = match (toks_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
 
   let first_lines_opt: BufferU8? = BufferU8.init(1024);
   if first_lines_opt == None {
     let _ = std::runtime::posix::fs::closedir(dir);
     return 2;
   }
-  let mut first_lines: BufferU8 = match (first_lines_opt) { Some(v) => v, None => BufferU8.empty() };
+
+  let mut first_lines: BufferU8 = match (first_lines_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
 
   let name_scratch_opt: BufferU8? = BufferU8.init(512);
   if name_scratch_opt == None {
     let _ = std::runtime::posix::fs::closedir(dir);
     return 2;
   }
-  let mut name_scratch: BufferU8 = match (name_scratch_opt) { Some(v) => v, None => BufferU8.empty() };
+
+  let mut name_scratch: BufferU8 = match (name_scratch_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
 
   // Index entries (heap array).
   let entries_ptr: u64 = std::runtime::mem::alloc(8192 * INDEX_ENTRY_BYTES);
-  var entries_cap: i64 = if entries_ptr != 0 { 8192 } else { 0 };
+  var entries_cap: i64 = if entries_ptr != 0 {
+    8192
+  } else {
+    0
+  };
   let first_ptr: u64 = std::runtime::mem::alloc(2048 * INDEX_ENTRY_BYTES);
-  let first_cap: i64 = if first_ptr != 0 { 2048 } else { 0 };
+  let first_cap: i64 = if first_ptr != 0 {
+    2048
+  } else {
+    0
+  };
   let mut stats: CompileStats = CompileStats{
     candidates: 0,
     compiled: 0,
@@ -3280,7 +4141,10 @@ fn compile_cache_impl (conf_syntax: string, cache_syntax: string, verbose: bool)
 
   // Close the probe handle and scan recursively.
   let _ = std::runtime::posix::fs::closedir(dir);
-  if verbose { vlog(verbose, "scan start"); }
+  if verbose {
+    vlog(verbose, "scan start");
+  }
+
   compile_cache_scan_dir(conf_syntax, "", cache_syntax, verbose, mut file_buf, mut exts, mut first_lines, mut rules, mut toks, mut name_scratch, entries_ptr, entries_cap, first_ptr, first_cap, mut stats);
   if verbose {
     let _ = write_str(2, "sage[v] scan done candidates=");
@@ -3298,7 +4162,9 @@ fn compile_cache_impl (conf_syntax: string, cache_syntax: string, verbose: bool)
   let idx_path_opt: string? = join2(cache_syntax, "index.bin");
   var ok_idx: bool = false;
   if idx_path_opt != None {
-    let idx_path: string = match (idx_path_opt) { Some(v) => v, None => "" };
+    let idx_path: string = match (idx_path_opt) {
+      Some(v) => v, None => ""
+    };
     ok_idx = write_index_cache(idx_path, entries_ptr, stats.entries_len);
     free_joined(idx_path);
   }
@@ -3307,7 +4173,9 @@ fn compile_cache_impl (conf_syntax: string, cache_syntax: string, verbose: bool)
   let fl_path_opt: string? = join2(cache_syntax, "first_line.bin");
   var ok_fl: bool = false;
   if fl_path_opt != None {
-    let fl_path: string = match (fl_path_opt) { Some(v) => v, None => "" };
+    let fl_path: string = match (fl_path_opt) {
+      Some(v) => v, None => ""
+    };
     ok_fl = write_index_cache(fl_path, first_ptr, stats.first_line_entries_len);
     free_joined(fl_path);
   }
@@ -3316,21 +4184,39 @@ fn compile_cache_impl (conf_syntax: string, cache_syntax: string, verbose: bool)
   var ii: i64 = 0;
   while ii < stats.entries_len {
     let e: IndexEntry = (entries_ptr as IndexEntry[](stats.entries_len as int))[ii];
-    if e.key_ptr != 0 { std::runtime::mem::free(e.key_ptr); }
-    if e.cache_ptr != 0 { std::runtime::mem::free(e.cache_ptr); }
+    if e.key_ptr != 0 {
+      std::runtime::mem::free(e.key_ptr);
+    }
+
+    if e.cache_ptr != 0 {
+      std::runtime::mem::free(e.cache_ptr);
+    }
+
     ii = ii + 1;
   }
-  if entries_ptr != 0 { std::runtime::mem::free(entries_ptr); }
+
+  if entries_ptr != 0 {
+    std::runtime::mem::free(entries_ptr);
+  }
 
   // Cleanup first-line entry strings.
   var fi: i64 = 0;
   while fi < stats.first_line_entries_len {
     let e2: IndexEntry = (first_ptr as IndexEntry[](stats.first_line_entries_len as int))[fi];
-    if e2.key_ptr != 0 { std::runtime::mem::free(e2.key_ptr); }
-    if e2.cache_ptr != 0 { std::runtime::mem::free(e2.cache_ptr); }
+    if e2.key_ptr != 0 {
+      std::runtime::mem::free(e2.key_ptr);
+    }
+
+    if e2.cache_ptr != 0 {
+      std::runtime::mem::free(e2.cache_ptr);
+    }
+
     fi = fi + 1;
   }
-  if first_ptr != 0 { std::runtime::mem::free(first_ptr); }
+
+  if first_ptr != 0 {
+    std::runtime::mem::free(first_ptr);
+  }
 
   // Print summary.
   if stats.compiled == 0 {
@@ -3344,6 +4230,7 @@ fn compile_cache_impl (conf_syntax: string, cache_syntax: string, verbose: bool)
       let _ = write_str(2, ") — check file format subset support\n");
     }
   }
+
   let _ = write_str(2, "sage: compiled ");
   let _ = write_str(2, "syntaxes=");
   write_i64_dec(2, stats.compiled);
@@ -3358,10 +4245,15 @@ fn compile_cache_impl (conf_syntax: string, cache_syntax: string, verbose: bool)
   } else {
     let _ = write_str(2, " (index failed)");
   }
+
   let _ = write_str(2, "\n");
 
   let ok_all: bool = ok_idx && (ok_fl || stats.first_line_entries_len == 0);
-  return if ok_all { 0 } else { 2 };
+  return if ok_all {
+    0
+  } else {
+    2
+  };
 }
 
 export fn list_compiled_syntax (verbose: bool) -> int {
@@ -3369,7 +4261,10 @@ export fn list_compiled_syntax (verbose: bool) -> int {
   if idx_opt == None {
     return 2;
   }
-  let mut idx: BufferU8 = match (idx_opt) { Some(v) => v, None => BufferU8.empty() };
+
+  let mut idx: BufferU8 = match (idx_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
 
   let ok_read: bool = load_index_file(mut idx);
   if !ok_read {
@@ -3382,36 +4277,46 @@ export fn list_compiled_syntax (verbose: bool) -> int {
     let _ = write_str(2, "sage: invalid syntax index (too short)\n");
     return 2;
   }
+
   let magic: u64 = u64_at(b.ptr, 0);
   if magic != MAGIC_INDEX {
     let _ = write_str(2, "sage: invalid syntax index (bad magic)\n");
     return 2;
   }
+
   let ver: u32 = u32_at(b.ptr, 8);
   if ver != SYNTAX_VERSION {
     let _ = write_str(2, "sage: unsupported syntax index version\n");
     return 2;
   }
+
   let count: u32 = u32_at(b.ptr, 12);
 
   if verbose {
     let dir_opt: string? = env_get_string(CACHE_DIR_OVERRIDE_ENV);
     if dir_opt != None {
-      let dir: string = match (dir_opt) { Some(v) => v, None => "" };
+      let dir: string = match (dir_opt) {
+        Some(v) => v, None => ""
+      };
       if std::runtime::mem::string_len(dir) > 0 {
         let _ = write_str(2, "sage[v] syntax cache dir (override): ");
         let _ = write_str(2, dir);
         let _ = write_str(2, "\n");
       }
+
       free_joined(dir);
     } else {
       let cache_home_opt: string? = xdg_cache_home();
       if cache_home_opt != None {
-        let cache_home: string = match (cache_home_opt) { Some(v) => v, None => "" };
+        let cache_home: string = match (cache_home_opt) {
+          Some(v) => v, None => ""
+        };
         let cache_syntax_opt: string? = join2(cache_home, "/sage/syntax/");
         free_joined(cache_home);
         if cache_syntax_opt != None {
-          let cache_syntax: string = match (cache_syntax_opt) { Some(v) => v, None => "" };
+          let cache_syntax: string = match (cache_syntax_opt) {
+            Some(v) => v, None => ""
+          };
           let _ = write_str(2, "sage[v] syntax cache dir: ");
           let _ = write_str(2, cache_syntax);
           let _ = write_str(2, "\n");
@@ -3419,6 +4324,7 @@ export fn list_compiled_syntax (verbose: bool) -> int {
         }
       }
     }
+
     let _ = write_str(2, "sage[v] index entries=");
     write_i64_dec(2, count as i64);
     let _ = write_str(2, "\n");
@@ -3429,28 +4335,46 @@ export fn list_compiled_syntax (verbose: bool) -> int {
   if keys_data_opt == None {
     return 2;
   }
-  let mut keys_data: BufferU8 = match (keys_data_opt) { Some(v) => v, None => BufferU8.empty() };
+
+  let mut keys_data: BufferU8 = match (keys_data_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
 
   let keys_idx2_opt: VecU64? = VecU64.init((count as i64) * 2);
   if keys_idx2_opt == None {
     return 2;
   }
-  let mut keys_idx: VecU64 = match (keys_idx2_opt) { Some(v) => v, None => VecU64.empty() };
+
+  let mut keys_idx: VecU64 = match (keys_idx2_opt) {
+    Some(v) => v, None => VecU64.empty()
+  };
 
   // Parse entries and build unique key list.
   var off: i64 = 16;
   var i: u32 = 0;
   while i < count {
-    if (off + 2) > b.len { break; }
+    if (off + 2) > b.len {
+      break;
+    }
+
     let k_len: u32 = u16_at(b.ptr, off);
     off = off + 2;
-    if (off + (k_len as i64)) > b.len { break; }
+    if (off + (k_len as i64)) > b.len {
+      break;
+    }
+
     let k_ptr: u64 = b.ptr + (off as u64);
     off = off + (k_len as i64);
-    if (off + 2) > b.len { break; }
+    if (off + 2) > b.len {
+      break;
+    }
+
     let f_len: u32 = u16_at(b.ptr, off);
     off = off + 2;
-    if (off + (f_len as i64)) > b.len { break; }
+    if (off + (f_len as i64)) > b.len {
+      break;
+    }
+
     let f_ptr: u64 = b.ptr + (off as u64);
     off = off + (f_len as i64);
 
@@ -3472,9 +4396,11 @@ export fn list_compiled_syntax (verbose: bool) -> int {
           f_show = f_show - 6;
         }
       }
+
       if f_show > 0 {
         let _ = write_all(2, f_ptr, f_show);
       }
+
       let _ = write_str(2, "\n");
     }
 
@@ -3485,7 +4411,10 @@ export fn list_compiled_syntax (verbose: bool) -> int {
       var s: i64 = 0;
       while s < keys_data.len {
         let start: i64 = s;
-        while s < keys_data.len && std::runtime::mem::load_u8(keys_data.ptr, s) != 0 { s = s + 1; }
+        while s < keys_data.len && std::runtime::mem::load_u8(keys_data.ptr, s) != 0 {
+          s = s + 1;
+        }
+
         let l: i64 = s - start;
         if l == (k_len as i64) {
           var ok: bool = true;
@@ -3495,14 +4424,19 @@ export fn list_compiled_syntax (verbose: bool) -> int {
               ok = false;
               break;
             }
+
             j = j + 1;
           }
+
           if ok {
             seen = true;
             break;
           }
         }
-        if s < keys_data.len && std::runtime::mem::load_u8(keys_data.ptr, s) == 0 { s = s + 1; }
+
+        if s < keys_data.len && std::runtime::mem::load_u8(keys_data.ptr, s) == 0 {
+          s = s + 1;
+        }
       }
 
       if !seen {
@@ -3535,22 +4469,40 @@ export fn list_compiled_syntax (verbose: bool) -> int {
 
       // Lex compare (ASCII).
       var k: i64 = 0;
-      let m: i64 = if al < bl { al } else { bl };
+      let m: i64 = if al < bl {
+        al
+      } else {
+        bl
+      };
       var cmp: int = 0;
       while k < m {
         let ca: u8 = std::runtime::mem::load_u8(ap, k);
         let cb: u8 = std::runtime::mem::load_u8(bp, k);
-        if ca < cb { cmp = -1; break; }
-        if ca > cb { cmp = 1; break; }
+        if ca < cb {
+          cmp = -1;
+          break;
+        }
+
+        if ca > cb {
+          cmp = 1;
+          break;
+        }
+
         k = k + 1;
       }
+
       if cmp == 0 {
-        if al < bl { cmp = -1; }
-        else if al > bl { cmp = 1; }
+        if al < bl {
+          cmp = -1;
+        } else if al > bl {
+          cmp = 1;
+        }
       }
+
       if cmp > 0 {
         min = b_i;
       }
+
       b_i = b_i + 1;
     }
 
@@ -3578,6 +4530,7 @@ export fn list_compiled_syntax (verbose: bool) -> int {
       let _ = write_all(1, keys_data.ptr + (st as u64), ln);
       let _ = write_str(1, "\n");
     }
+
     p_i = p_i + 1;
   }
 
@@ -3674,6 +4627,7 @@ export fn hl_state_on_newline (mut st: &HLState) -> void {
   if st.mode == HL_MODE_STRING && st.esc {
     st.esc = false;
   }
+
   st.pending = 0;
 }
 
@@ -3681,6 +4635,7 @@ fn style_set (out_styles: u64, i: i64, tok: u8) -> void {
   if out_styles == 0 {
     return;
   }
+
   std::runtime::mem::store_u8(out_styles, i, tok);
 }
 
@@ -3688,6 +4643,7 @@ fn scan_ranges (flags: u32, ptr: u64, len: i64, mut st: &HLState, out_styles: u6
   if ptr == 0 || len <= 0 {
     return;
   }
+
   if flags == 0 {
     // No known range rules for this syntax.
     st.mode = HL_MODE_NONE;
@@ -3723,6 +4679,7 @@ fn scan_ranges (flags: u32, ptr: u64, len: i64, mut st: &HLState, out_styles: u6
       st.mode = HL_MODE_NONE;
       i = 1;
     }
+
     st.pending = 0;
   }
 
@@ -3740,6 +4697,7 @@ fn scan_ranges (flags: u32, ptr: u64, len: i64, mut st: &HLState, out_styles: u6
           break;
         }
       }
+
       continue;
     }
 
@@ -3754,8 +4712,10 @@ fn scan_ranges (flags: u32, ptr: u64, len: i64, mut st: &HLState, out_styles: u6
           st.mode = HL_MODE_NONE;
           break;
         }
+
         i = i + 1;
       }
+
       continue;
     }
 
@@ -3770,6 +4730,7 @@ fn scan_ranges (flags: u32, ptr: u64, len: i64, mut st: &HLState, out_styles: u6
           i = i + 1;
           continue;
         }
+
         if b2 == 92 { // '\\'
           // Escape next byte (if present).
           if (i + 1) < len {
@@ -3779,8 +4740,10 @@ fn scan_ranges (flags: u32, ptr: u64, len: i64, mut st: &HLState, out_styles: u6
             st.esc = true;
             i = i + 1;
           }
+
           continue;
         }
+
         if b2 == q {
           i = i + 1;
           st.mode = HL_MODE_NONE;
@@ -3788,8 +4751,10 @@ fn scan_ranges (flags: u32, ptr: u64, len: i64, mut st: &HLState, out_styles: u6
           st.esc = false;
           break;
         }
+
         i = i + 1;
       }
+
       continue;
     }
 
@@ -3802,6 +4767,7 @@ fn scan_ranges (flags: u32, ptr: u64, len: i64, mut st: &HLState, out_styles: u6
       i = i + 2;
       continue;
     }
+
     if has_block && b == 47 && (i + 1) < len && std::runtime::mem::load_u8(ptr, i + 1) == 42 { // '/*'
       style_set(out_styles, i, TOK_COMMENT);
       style_set(out_styles, i + 1, TOK_COMMENT);
@@ -3809,6 +4775,7 @@ fn scan_ranges (flags: u32, ptr: u64, len: i64, mut st: &HLState, out_styles: u6
       i = i + 2;
       continue;
     }
+
     if has_sq && b == 39 { // '\''
       style_set(out_styles, i, TOK_STRING);
       st.mode = HL_MODE_STRING;
@@ -3817,6 +4784,7 @@ fn scan_ranges (flags: u32, ptr: u64, len: i64, mut st: &HLState, out_styles: u6
       i = i + 1;
       continue;
     }
+
     if has_dq && b == 34 { // '"'
       style_set(out_styles, i, TOK_STRING);
       st.mode = HL_MODE_STRING;
@@ -3825,6 +4793,7 @@ fn scan_ranges (flags: u32, ptr: u64, len: i64, mut st: &HLState, out_styles: u6
       i = i + 1;
       continue;
     }
+
     if has_bt && b == 96 { // '`'
       style_set(out_styles, i, TOK_STRING);
       st.mode = HL_MODE_STRING;
@@ -3905,6 +4874,7 @@ fn parse_basename_and_ext (path: string) -> PathParts {
     if std::runtime::mem::load_u8(p, i) == 47 { // '/'
       base0 = i + 1;
     }
+
     i = i + 1;
   }
 
@@ -3918,6 +4888,7 @@ fn parse_basename_and_ext (path: string) -> PathParts {
     if std::runtime::mem::load_u8(base_ptr, j) == 46 { // '.'
       dot = j;
     }
+
     j = j + 1;
   }
 
@@ -3928,8 +4899,10 @@ fn parse_basename_and_ext (path: string) -> PathParts {
       let ext_len0: i64 = base_len - 1;
       return PathParts{ base_ptr: base_ptr, base_len: base_len, ext_ptr: ext_ptr0, ext_len: ext_len0 };
     }
+
     return PathParts{ base_ptr: base_ptr, base_len: base_len, ext_ptr: 0, ext_len: 0 };
   }
+
   let ext_ptr: u64 = base_ptr + ((dot + 1) as u64);
   let ext_len: i64 = base_len - (dot + 1);
   return PathParts{ base_ptr: base_ptr, base_len: base_len, ext_ptr: ext_ptr, ext_len: ext_len };
@@ -3943,29 +4916,44 @@ fn find_in_index (idx: &BufferU8, key_ptr: u64, key_len: i64, mut out_cache: &Bu
   if b.ptr == 0 || b.len < 16 {
     return false;
   }
+
   if u64_at(b.ptr, 0) != MAGIC_INDEX {
     return false;
   }
+
   let ver: u32 = u32_at(b.ptr, 8);
   if ver != SYNTAX_VERSION {
     return false;
   }
+
   let count: u32 = u32_at(b.ptr, 12);
 
   var found: bool = false;
   var off: i64 = 16;
   var i: u32 = 0;
   while i < count {
-    if (off + 2) > b.len { break; }
+    if (off + 2) > b.len {
+      break;
+    }
+
     let k_len: u32 = u16_at(b.ptr, off);
     off = off + 2;
-    if (off + (k_len as i64)) > b.len { break; }
+    if (off + (k_len as i64)) > b.len {
+      break;
+    }
+
     let k_ptr: u64 = b.ptr + (off as u64);
     off = off + (k_len as i64);
-    if (off + 2) > b.len { break; }
+    if (off + 2) > b.len {
+      break;
+    }
+
     let f_len: u32 = u16_at(b.ptr, off);
     off = off + 2;
-    if (off + (f_len as i64)) > b.len { break; }
+    if (off + (f_len as i64)) > b.len {
+      break;
+    }
+
     let f_ptr: u64 = b.ptr + (off as u64);
     off = off + (f_len as i64);
 
@@ -3977,8 +4965,10 @@ fn find_in_index (idx: &BufferU8, key_ptr: u64, key_len: i64, mut out_cache: &Bu
           ok = false;
           break;
         }
+
         j = j + 1;
       }
+
       if ok {
         out_cache.clear();
         let err0 = out_cache.push_ptr_len(f_ptr, f_len as i64);
@@ -4033,6 +5023,7 @@ fn strip_extended_regex (src_ptr: u64, src_len: i64, mut out: &BufferU8) -> void
       i = i + 1;
       continue;
     }
+
     if in_class && b == 93 { // ']'
       in_class = false;
       let _ = out.push_u8(b);
@@ -4055,8 +5046,10 @@ fn strip_extended_regex (src_ptr: u64, src_len: i64, mut out: &BufferU8) -> void
           if c == 10 || c == 13 { // '\n' / '\r'
             break;
           }
+
           i = i + 1;
         }
+
         continue;
       }
     }
@@ -4104,10 +5097,19 @@ fn parse_first_line_pattern (
       if c < 97 || c > 122 { // not 'a'..'z'
         break;
       }
-      if c == 105 { flag_i = true; } // 'i'
-      else if c == 109 { flag_m = true; } // 'm'
-      else if c == 115 { flag_s = true; } // 's'
-      else if c == 120 { flag_x = true; } // 'x'
+
+      if c == 105 {
+        flag_i = true;
+      } // 'i'
+      else if c == 109 {
+        flag_m = true;
+      } // 'm'
+      else if c == 115 {
+        flag_s = true;
+      } // 's'
+      else if c == 120 {
+        flag_x = true;
+      } // 'x'
       k = k + 1;
     }
 
@@ -4124,9 +5126,15 @@ fn parse_first_line_pattern (
         let _ = pat_scratch.push_ptr_len(body_ptr, body_len);
       }
 
-      if flag_i { let _ = flags_scratch.push_u8(105); } // 'i'
-      if flag_m { let _ = flags_scratch.push_u8(109); } // 'm'
-      if flag_s { let _ = flags_scratch.push_u8(115); } // 's'
+      if flag_i {
+        let _ = flags_scratch.push_u8(105);
+      } // 'i'
+      if flag_m {
+        let _ = flags_scratch.push_u8(109);
+      } // 'm'
+      if flag_s {
+        let _ = flags_scratch.push_u8(115);
+      } // 's'
 
       return FirstLinePattern{
         pat_ptr: pat_scratch.ptr,
@@ -4147,9 +5155,15 @@ fn parse_first_line_pattern (
         let _ = pat_scratch.push_ptr_len(body_ptr2, body_len2);
       }
 
-      if flag_i { let _ = flags_scratch.push_u8(105); } // 'i'
-      if flag_m { let _ = flags_scratch.push_u8(109); } // 'm'
-      if flag_s { let _ = flags_scratch.push_u8(115); } // 's'
+      if flag_i {
+        let _ = flags_scratch.push_u8(105);
+      } // 'i'
+      if flag_m {
+        let _ = flags_scratch.push_u8(109);
+      } // 'm'
+      if flag_s {
+        let _ = flags_scratch.push_u8(115);
+      } // 's'
 
       return FirstLinePattern{
         pat_ptr: pat_scratch.ptr,
@@ -4177,39 +5191,60 @@ fn find_first_line_match (idx: &BufferU8, line_ptr: u64, line_len: i64, mut out_
   if pat_scratch_opt == None {
     return false;
   }
-  let mut pat_scratch: BufferU8 = match (pat_scratch_opt) { Some(v) => v, None => BufferU8.empty() };
+
+  let mut pat_scratch: BufferU8 = match (pat_scratch_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
   let flags_scratch_opt: BufferU8? = BufferU8.init(16);
   if flags_scratch_opt == None {
     return false;
   }
-  let mut flags_scratch: BufferU8 = match (flags_scratch_opt) { Some(v) => v, None => BufferU8.empty() };
+
+  let mut flags_scratch: BufferU8 = match (flags_scratch_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
 
   let b = idx.as_bytes();
   if b.ptr == 0 || b.len < 16 {
     return false;
   }
+
   if u64_at(b.ptr, 0) != MAGIC_INDEX {
     return false;
   }
+
   let ver: u32 = u32_at(b.ptr, 8);
   if ver != SYNTAX_VERSION {
     return false;
   }
+
   let count: u32 = u32_at(b.ptr, 12);
 
   var off: i64 = 16;
   var i: u32 = 0;
   while i < count {
-    if (off + 2) > b.len { break; }
+    if (off + 2) > b.len {
+      break;
+    }
+
     let p_len: u32 = u16_at(b.ptr, off);
     off = off + 2;
-    if (off + (p_len as i64)) > b.len { break; }
+    if (off + (p_len as i64)) > b.len {
+      break;
+    }
+
     let p_ptr: u64 = b.ptr + (off as u64);
     off = off + (p_len as i64);
-    if (off + 2) > b.len { break; }
+    if (off + 2) > b.len {
+      break;
+    }
+
     let f_len: u32 = u16_at(b.ptr, off);
     off = off + 2;
-    if (off + (f_len as i64)) > b.len { break; }
+    if (off + (f_len as i64)) > b.len {
+      break;
+    }
+
     let f_ptr: u64 = b.ptr + (off as u64);
     off = off + (f_len as i64);
 
@@ -4235,6 +5270,7 @@ fn find_first_line_match (idx: &BufferU8, line_ptr: u64, line_len: i64, mut out_
           if out_cache.push_ptr_len(f_ptr, f_len as i64) == None {
             return true;
           }
+
           return false;
         }
       }
@@ -4251,11 +5287,21 @@ fn load_index_file (mut out: &BufferU8) -> bool {
 
   // Merge user + bundled caches (user entries override bundled keys).
   let user_opt: BufferU8? = BufferU8.init(8192);
-  if user_opt == None { return false; }
-  let mut user: BufferU8 = match (user_opt) { Some(v) => v, None => BufferU8.empty() };
+  if user_opt == None {
+    return false;
+  }
+
+  let mut user: BufferU8 = match (user_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
   let bundled_opt: BufferU8? = BufferU8.init(8192);
-  if bundled_opt == None { return false; }
-  let mut bundled: BufferU8 = match (bundled_opt) { Some(v) => v, None => BufferU8.empty() };
+  if bundled_opt == None {
+    return false;
+  }
+
+  let mut bundled: BufferU8 = match (bundled_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
 
   var have_user: bool = false;
   var have_bundled: bool = false;
@@ -4263,12 +5309,16 @@ fn load_index_file (mut out: &BufferU8) -> bool {
   // Read bundled cache index (build/installed layout).
   let dir_opt: string? = env_get_string(CACHE_DIR_OVERRIDE_ENV);
   if dir_opt != None {
-    let dir: string = match (dir_opt) { Some(v) => v, None => "" };
+    let dir: string = match (dir_opt) {
+      Some(v) => v, None => ""
+    };
     if std::runtime::mem::string_len(dir) > 0 {
       let path_opt: string? = join_dir_file(dir, "index.bin");
       free_joined(dir);
       if path_opt != None {
-        let path2: string = match (path_opt) { Some(v) => v, None => "" };
+        let path2: string = match (path_opt) {
+          Some(v) => v, None => ""
+        };
         have_bundled = read_file_all(path2, mut bundled);
         free_joined(path2);
       }
@@ -4280,10 +5330,14 @@ fn load_index_file (mut out: &BufferU8) -> bool {
   // Read user cache index (from `--compile-cache`).
   let cache_home_opt: string? = xdg_cache_home();
   if cache_home_opt != None {
-    let cache_home: string = match (cache_home_opt) { Some(v) => v, None => "" };
+    let cache_home: string = match (cache_home_opt) {
+      Some(v) => v, None => ""
+    };
     let cache_syntax_opt: string? = join2(cache_home, "/sage/syntax/index.bin");
     if cache_syntax_opt != None {
-      let path: string = match (cache_syntax_opt) { Some(v) => v, None => "" };
+      let path: string = match (cache_syntax_opt) {
+        Some(v) => v, None => ""
+      };
       have_user = read_file_all(path, mut user);
       free_joined(path);
       free_joined(cache_home);
@@ -4300,9 +5354,11 @@ fn load_index_file (mut out: &BufferU8) -> bool {
   if bundled_ok && !user_ok {
     return out.push_ptr_len(bb.ptr, bb.len) == None;
   }
+
   if user_ok && !bundled_ok {
     return out.push_ptr_len(ub.ptr, ub.len) == None;
   }
+
   if !user_ok && !bundled_ok {
     return false;
   }
@@ -4319,10 +5375,15 @@ fn load_index_file (mut out: &BufferU8) -> bool {
   // For key lookups, `find_in_index` returns the *last* match, so append
   // user entries after bundled entries to let user overrides win.
   if (bb.len - 16) > 0 {
-    if out.push_ptr_len(bb.ptr + 16, bb.len - 16) != None { return false; }
+    if out.push_ptr_len(bb.ptr + 16, bb.len - 16) != None {
+      return false;
+    }
   }
+
   if (ub.len - 16) > 0 {
-    if out.push_ptr_len(ub.ptr + 16, ub.len - 16) != None { return false; }
+    if out.push_ptr_len(ub.ptr + 16, ub.len - 16) != None {
+      return false;
+    }
   }
 
   return true;
@@ -4333,11 +5394,21 @@ fn load_first_line_file (mut out: &BufferU8) -> bool {
 
   // Merge user + bundled first-line patterns (user patterns checked first).
   let user_opt: BufferU8? = BufferU8.init(8192);
-  if user_opt == None { return false; }
-  let mut user: BufferU8 = match (user_opt) { Some(v) => v, None => BufferU8.empty() };
+  if user_opt == None {
+    return false;
+  }
+
+  let mut user: BufferU8 = match (user_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
   let bundled_opt: BufferU8? = BufferU8.init(8192);
-  if bundled_opt == None { return false; }
-  let mut bundled: BufferU8 = match (bundled_opt) { Some(v) => v, None => BufferU8.empty() };
+  if bundled_opt == None {
+    return false;
+  }
+
+  let mut bundled: BufferU8 = match (bundled_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
 
   var have_user: bool = false;
   var have_bundled: bool = false;
@@ -4345,12 +5416,16 @@ fn load_first_line_file (mut out: &BufferU8) -> bool {
   // Read bundled patterns (build/installed layout).
   let dir_opt: string? = env_get_string(CACHE_DIR_OVERRIDE_ENV);
   if dir_opt != None {
-    let dir: string = match (dir_opt) { Some(v) => v, None => "" };
+    let dir: string = match (dir_opt) {
+      Some(v) => v, None => ""
+    };
     if std::runtime::mem::string_len(dir) > 0 {
       let path_opt: string? = join_dir_file(dir, "first_line.bin");
       free_joined(dir);
       if path_opt != None {
-        let path2: string = match (path_opt) { Some(v) => v, None => "" };
+        let path2: string = match (path_opt) {
+          Some(v) => v, None => ""
+        };
         have_bundled = read_file_all(path2, mut bundled);
         free_joined(path2);
       }
@@ -4362,10 +5437,14 @@ fn load_first_line_file (mut out: &BufferU8) -> bool {
   // Read user patterns (from `--compile-cache`).
   let cache_home_opt: string? = xdg_cache_home();
   if cache_home_opt != None {
-    let cache_home: string = match (cache_home_opt) { Some(v) => v, None => "" };
+    let cache_home: string = match (cache_home_opt) {
+      Some(v) => v, None => ""
+    };
     let cache_syntax_opt: string? = join2(cache_home, "/sage/syntax/first_line.bin");
     if cache_syntax_opt != None {
-      let path: string = match (cache_syntax_opt) { Some(v) => v, None => "" };
+      let path: string = match (cache_syntax_opt) {
+        Some(v) => v, None => ""
+      };
       have_user = read_file_all(path, mut user);
       free_joined(path);
       free_joined(cache_home);
@@ -4382,9 +5461,11 @@ fn load_first_line_file (mut out: &BufferU8) -> bool {
   if bundled_ok && !user_ok {
     return out.push_ptr_len(bb.ptr, bb.len) == None;
   }
+
   if user_ok && !bundled_ok {
     return out.push_ptr_len(ub.ptr, ub.len) == None;
   }
+
   if !user_ok && !bundled_ok {
     return false;
   }
@@ -4400,10 +5481,15 @@ fn load_first_line_file (mut out: &BufferU8) -> bool {
   // `find_first_line_match` returns the *first* matching pattern, so put user
   // patterns first to let them override bundled ones.
   if (ub.len - 16) > 0 {
-    if out.push_ptr_len(ub.ptr + 16, ub.len - 16) != None { return false; }
+    if out.push_ptr_len(ub.ptr + 16, ub.len - 16) != None {
+      return false;
+    }
   }
+
   if (bb.len - 16) > 0 {
-    if out.push_ptr_len(bb.ptr + 16, bb.len - 16) != None { return false; }
+    if out.push_ptr_len(bb.ptr + 16, bb.len - 16) != None {
+      return false;
+    }
   }
 
   return true;
@@ -4413,14 +5499,20 @@ fn load_syntax_file (file_name: string, mut out: &BufferU8) -> bool {
   out.clear();
   let cache_home_opt: string? = xdg_cache_home();
   if cache_home_opt != None {
-    let cache_home: string = match (cache_home_opt) { Some(v) => v, None => "" };
+    let cache_home: string = match (cache_home_opt) {
+      Some(v) => v, None => ""
+    };
     let base_opt: string? = join2(cache_home, "/sage/syntax/");
     if base_opt != None {
-      let base: string = match (base_opt) { Some(v) => v, None => "" };
+      let base: string = match (base_opt) {
+        Some(v) => v, None => ""
+      };
       let path_opt: string? = join2(base, file_name);
       free_joined(base);
       if path_opt != None {
-        let path: string = match (path_opt) { Some(v) => v, None => "" };
+        let path: string = match (path_opt) {
+          Some(v) => v, None => ""
+        };
         let ok: bool = read_file_all(path, mut out);
         free_joined(path);
         free_joined(cache_home);
@@ -4438,12 +5530,16 @@ fn load_syntax_file (file_name: string, mut out: &BufferU8) -> bool {
   // Fallback: bundled cache directory override.
   let dir_opt: string? = env_get_string(CACHE_DIR_OVERRIDE_ENV);
   if dir_opt != None {
-    let dir: string = match (dir_opt) { Some(v) => v, None => "" };
+    let dir: string = match (dir_opt) {
+      Some(v) => v, None => ""
+    };
     if std::runtime::mem::string_len(dir) > 0 {
       let path_opt2: string? = join_dir_file(dir, file_name);
       free_joined(dir);
       if path_opt2 != None {
-        let path2: string = match (path_opt2) { Some(v) => v, None => "" };
+        let path2: string = match (path_opt2) {
+          Some(v) => v, None => ""
+        };
         let ok2: bool = read_file_all(path2, mut out);
         free_joined(path2);
         return ok2;
@@ -4463,20 +5559,38 @@ fn alt_append (mut out: &BufferU8, pat_ptr: u64, pat_len: i64) -> bool {
     return true;
   }
 
-  let sep: i64 = if out.len > 0 { 1 } else { 0 }; // '|'
+  let sep: i64 = if out.len > 0 {
+    1
+  } else {
+    0
+  }; // '|'
   let need: i64 = sep + 3 + pat_len + 1; // "(?:" + pat + ")"
   if (out.len + need) > MAX_COMBINED_PAT_BYTES {
     return false;
   }
 
   if out.len > 0 {
-    if out.push_u8(124) != None { return false; } // '|'
+    if out.push_u8(124) != None {
+      return false;
+    } // '|'
   }
-  if out.push_u8(40) != None { return false; } // '('
-  if out.push_u8(63) != None { return false; } // '?'
-  if out.push_u8(58) != None { return false; } // ':'
-  if out.push_ptr_len(pat_ptr, pat_len) != None { return false; }
-  if out.push_u8(41) != None { return false; } // ')'
+
+  if out.push_u8(40) != None {
+    return false;
+  } // '('
+  if out.push_u8(63) != None {
+    return false;
+  } // '?'
+  if out.push_u8(58) != None {
+    return false;
+  } // ':'
+  if out.push_ptr_len(pat_ptr, pat_len) != None {
+    return false;
+  }
+
+  if out.push_u8(41) != None {
+    return false;
+  } // ')'
   return true;
 }
 
@@ -4492,8 +5606,13 @@ fn cache_name_for_path (idx: &BufferU8, path: string, mut out_cache_name: &Buffe
   }
 
   let key_buf_opt: BufferU8? = BufferU8.init(base_len + 1);
-  if key_buf_opt == None { return false; }
-  let mut key_buf: BufferU8 = match (key_buf_opt) { Some(v) => v, None => BufferU8.empty() };
+  if key_buf_opt == None {
+    return false;
+  }
+
+  let mut key_buf: BufferU8 = match (key_buf_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
 
   // Prefer full basename (for ".gitignore", "Makefile").
   key_buf.clear();
@@ -4520,8 +5639,13 @@ fn cache_name_for_path (idx: &BufferU8, path: string, mut out_cache_name: &Buffe
 fn load_for_cache_name (file_name: string) -> Highlighter? {
   // Load compiled syntax file.
   let syn_buf_opt: BufferU8? = BufferU8.init(16384);
-  if syn_buf_opt == None { return None; }
-  let mut syn_buf: BufferU8 = match (syn_buf_opt) { Some(v) => v, None => BufferU8.empty() };
+  if syn_buf_opt == None {
+    return None;
+  }
+
+  let mut syn_buf: BufferU8 = match (syn_buf_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
   if !load_syntax_file(file_name, mut syn_buf) {
     return None;
   }
@@ -4536,17 +5660,27 @@ fn load_for_cache_name (file_name: string) -> Highlighter? {
   let file_name_ptr: u64 = std::runtime::mem::string_ptr(file_name);
   let file_name_len: i64 = std::runtime::mem::string_len(file_name);
   let merge_base_c: bool = ends_with(file_name, "c++.sagec");
-  let merge_name_opt: BufferU8? = if merge_base_c { BufferU8.init(256) } else { None };
-  let mut merge_name: BufferU8 = match (merge_name_opt) { Some(v) => v, None => BufferU8.empty() };
+  let merge_name_opt: BufferU8? = if merge_base_c {
+    BufferU8.init(256)
+  } else {
+    None
+  };
+  let mut merge_name: BufferU8 = match (merge_name_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
   var have_merge: bool = false;
   if merge_base_c {
     let idx_opt: BufferU8? = BufferU8.init(8192);
     if idx_opt != None {
-      let mut idx: BufferU8 = match (idx_opt) { Some(v) => v, None => BufferU8.empty() };
+      let mut idx: BufferU8 = match (idx_opt) {
+        Some(v) => v, None => BufferU8.empty()
+      };
       if load_index_file(mut idx) {
         let key_buf_opt: BufferU8? = BufferU8.init(8);
         if key_buf_opt != None {
-          let mut key_buf: BufferU8 = match (key_buf_opt) { Some(v) => v, None => BufferU8.empty() };
+          let mut key_buf: BufferU8 = match (key_buf_opt) {
+            Some(v) => v, None => BufferU8.empty()
+          };
           let _ = key_buf.push_str("c");
           have_merge = find_in_index(&idx, key_buf.ptr, key_buf.len, mut merge_name);
         }
@@ -4559,8 +5693,10 @@ fn load_for_cache_name (file_name: string) -> Highlighter? {
               same = false;
               break;
             }
+
             si = si + 1;
           }
+
           if same {
             have_merge = false;
           }
@@ -4569,8 +5705,14 @@ fn load_for_cache_name (file_name: string) -> Highlighter? {
     }
   }
 
-  let merge_buf_opt: BufferU8? = if have_merge { BufferU8.init(16384) } else { None };
-  let mut merge_buf: BufferU8 = match (merge_buf_opt) { Some(v) => v, None => BufferU8.empty() };
+  let merge_buf_opt: BufferU8? = if have_merge {
+    BufferU8.init(16384)
+  } else {
+    None
+  };
+  let mut merge_buf: BufferU8 = match (merge_buf_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
   if have_merge {
     let merge_file: string = std::runtime::mem::string_from_ptr_len(merge_name.ptr, merge_name.len as int);
     if !load_syntax_file(merge_file, mut merge_buf) {
@@ -4583,13 +5725,16 @@ fn load_for_cache_name (file_name: string) -> Highlighter? {
   if b.ptr == 0 || b.len < 24 {
     return None;
   }
+
   if u64_at(b.ptr, 0) != MAGIC_SYNTAX {
     return None;
   }
+
   let ver: u32 = u32_at(b.ptr, 8);
   if ver != SYNTAX_VERSION {
     return None;
   }
+
   var flags: u32 = u32_at(b.ptr, 12);
   let ext_count: u32 = u32_at(b.ptr, 16);
   let rule_count: u32 = u32_at(b.ptr, 20);
@@ -4598,47 +5743,108 @@ fn load_for_cache_name (file_name: string) -> Highlighter? {
   // Skip extensions.
   var ei: u32 = 0;
   while ei < ext_count {
-    if (off + 2) > b.len { return None; }
+    if (off + 2) > b.len {
+      return None;
+    }
+
     let l: u32 = u16_at(b.ptr, off);
     off = off + 2 + (l as i64);
-    if off > b.len { return None; }
+    if off > b.len {
+      return None;
+    }
+
     ei = ei + 1;
   }
 
   // Build per-token combined patterns (OR of individual rules).
   let pc_opt: BufferU8? = BufferU8.init(2048);
-  if pc_opt == None { return None; }
-  let mut pat_comment: BufferU8 = match (pc_opt) { Some(v) => v, None => BufferU8.empty() };
+  if pc_opt == None {
+    return None;
+  }
+
+  let mut pat_comment: BufferU8 = match (pc_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
   let ps_opt: BufferU8? = BufferU8.init(2048);
-  if ps_opt == None { return None; }
-  let mut pat_string: BufferU8 = match (ps_opt) { Some(v) => v, None => BufferU8.empty() };
+  if ps_opt == None {
+    return None;
+  }
+
+  let mut pat_string: BufferU8 = match (ps_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
   let pn_opt: BufferU8? = BufferU8.init(1024);
-  if pn_opt == None { return None; }
-  let mut pat_number: BufferU8 = match (pn_opt) { Some(v) => v, None => BufferU8.empty() };
+  if pn_opt == None {
+    return None;
+  }
+
+  let mut pat_number: BufferU8 = match (pn_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
   let pk_opt: BufferU8? = BufferU8.init(2048);
-  if pk_opt == None { return None; }
-  let mut pat_keyword: BufferU8 = match (pk_opt) { Some(v) => v, None => BufferU8.empty() };
+  if pk_opt == None {
+    return None;
+  }
+
+  let mut pat_keyword: BufferU8 = match (pk_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
   let pt_opt: BufferU8? = BufferU8.init(2048);
-  if pt_opt == None { return None; }
-  let mut pat_ty: BufferU8 = match (pt_opt) { Some(v) => v, None => BufferU8.empty() };
+  if pt_opt == None {
+    return None;
+  }
+
+  let mut pat_ty: BufferU8 = match (pt_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
   let pf_opt: BufferU8? = BufferU8.init(2048);
-  if pf_opt == None { return None; }
-  let mut pat_function: BufferU8 = match (pf_opt) { Some(v) => v, None => BufferU8.empty() };
+  if pf_opt == None {
+    return None;
+  }
+
+  let mut pat_function: BufferU8 = match (pf_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
   let pc2_opt: BufferU8? = BufferU8.init(2048);
-  if pc2_opt == None { return None; }
-  let mut pat_constant: BufferU8 = match (pc2_opt) { Some(v) => v, None => BufferU8.empty() };
+  if pc2_opt == None {
+    return None;
+  }
+
+  let mut pat_constant: BufferU8 = match (pc2_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
   let po_opt: BufferU8? = BufferU8.init(1024);
-  if po_opt == None { return None; }
-  let mut pat_operator: BufferU8 = match (po_opt) { Some(v) => v, None => BufferU8.empty() };
+  if po_opt == None {
+    return None;
+  }
+
+  let mut pat_operator: BufferU8 = match (po_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
   let ph_opt: BufferU8? = BufferU8.init(1024);
-  if ph_opt == None { return None; }
-  let mut pat_heading: BufferU8 = match (ph_opt) { Some(v) => v, None => BufferU8.empty() };
+  if ph_opt == None {
+    return None;
+  }
+
+  let mut pat_heading: BufferU8 = match (ph_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
   let pe_opt: BufferU8? = BufferU8.init(1024);
-  if pe_opt == None { return None; }
-  let mut pat_emphasis: BufferU8 = match (pe_opt) { Some(v) => v, None => BufferU8.empty() };
+  if pe_opt == None {
+    return None;
+  }
+
+  let mut pat_emphasis: BufferU8 = match (pe_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
   let pp_opt: BufferU8? = BufferU8.init(1024);
-  if pp_opt == None { return None; }
-  let mut pat_preproc: BufferU8 = match (pp_opt) { Some(v) => v, None => BufferU8.empty() };
+  if pp_opt == None {
+    return None;
+  }
+
+  let mut pat_preproc: BufferU8 = match (pp_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
 
   var ok_comment: bool = true;
   var ok_string: bool = true;
@@ -4654,25 +5860,42 @@ fn load_for_cache_name (file_name: string) -> Highlighter? {
 
   var ri: u32 = 0;
   while ri < rule_count {
-    if (off + 1 + 4) > b.len { break; }
+    if (off + 1 + 4) > b.len {
+      break;
+    }
+
     let tok: u8 = std::runtime::mem::load_u8(b.ptr, off);
     let pat_len: u32 = u32_at(b.ptr, off + 1);
     off = off + 5;
-    if (off + (pat_len as i64)) > b.len { break; }
+    if (off + (pat_len as i64)) > b.len {
+      break;
+    }
 
     let pat_ptr: u64 = b.ptr + (off as u64);
     let pat_len_i64: i64 = pat_len as i64;
-    if tok == TOK_COMMENT && ok_comment { ok_comment = alt_append(mut pat_comment, pat_ptr, pat_len_i64); }
-    else if tok == TOK_STRING && ok_string { ok_string = alt_append(mut pat_string, pat_ptr, pat_len_i64); }
-    else if tok == TOK_NUMBER && ok_number { ok_number = alt_append(mut pat_number, pat_ptr, pat_len_i64); }
-    else if tok == TOK_KEYWORD && ok_keyword { ok_keyword = alt_append(mut pat_keyword, pat_ptr, pat_len_i64); }
-    else if tok == TOK_TYPE && ok_ty { ok_ty = alt_append(mut pat_ty, pat_ptr, pat_len_i64); }
-    else if tok == TOK_FUNCTION && ok_function { ok_function = alt_append(mut pat_function, pat_ptr, pat_len_i64); }
-    else if tok == TOK_CONSTANT && ok_constant { ok_constant = alt_append(mut pat_constant, pat_ptr, pat_len_i64); }
-    else if tok == TOK_OPERATOR && ok_operator { ok_operator = alt_append(mut pat_operator, pat_ptr, pat_len_i64); }
-    else if tok == TOK_HEADING && ok_heading { ok_heading = alt_append(mut pat_heading, pat_ptr, pat_len_i64); }
-    else if tok == TOK_EMPHASIS && ok_emphasis { ok_emphasis = alt_append(mut pat_emphasis, pat_ptr, pat_len_i64); }
-    else if tok == TOK_PREPROC && ok_preproc { ok_preproc = alt_append(mut pat_preproc, pat_ptr, pat_len_i64); }
+    if tok == TOK_COMMENT && ok_comment {
+      ok_comment = alt_append(mut pat_comment, pat_ptr, pat_len_i64);
+    } else if tok == TOK_STRING && ok_string {
+      ok_string = alt_append(mut pat_string, pat_ptr, pat_len_i64);
+    } else if tok == TOK_NUMBER && ok_number {
+      ok_number = alt_append(mut pat_number, pat_ptr, pat_len_i64);
+    } else if tok == TOK_KEYWORD && ok_keyword {
+      ok_keyword = alt_append(mut pat_keyword, pat_ptr, pat_len_i64);
+    } else if tok == TOK_TYPE && ok_ty {
+      ok_ty = alt_append(mut pat_ty, pat_ptr, pat_len_i64);
+    } else if tok == TOK_FUNCTION && ok_function {
+      ok_function = alt_append(mut pat_function, pat_ptr, pat_len_i64);
+    } else if tok == TOK_CONSTANT && ok_constant {
+      ok_constant = alt_append(mut pat_constant, pat_ptr, pat_len_i64);
+    } else if tok == TOK_OPERATOR && ok_operator {
+      ok_operator = alt_append(mut pat_operator, pat_ptr, pat_len_i64);
+    } else if tok == TOK_HEADING && ok_heading {
+      ok_heading = alt_append(mut pat_heading, pat_ptr, pat_len_i64);
+    } else if tok == TOK_EMPHASIS && ok_emphasis {
+      ok_emphasis = alt_append(mut pat_emphasis, pat_ptr, pat_len_i64);
+    } else if tok == TOK_PREPROC && ok_preproc {
+      ok_preproc = alt_append(mut pat_preproc, pat_ptr, pat_len_i64);
+    }
 
     off = off + (pat_len as i64);
     ri = ri + 1;
@@ -4688,34 +5911,57 @@ fn load_for_cache_name (file_name: string) -> Highlighter? {
       // Skip extensions.
       var mei: u32 = 0;
       while mei < m_ext_count {
-        if (moff + 2) > mb.len { break; }
+        if (moff + 2) > mb.len {
+          break;
+        }
+
         let ml: u32 = u16_at(mb.ptr, moff);
         moff = moff + 2 + (ml as i64);
-        if moff > mb.len { break; }
+        if moff > mb.len {
+          break;
+        }
+
         mei = mei + 1;
       }
 
       var mri: u32 = 0;
       while mri < m_rule_count {
-        if (moff + 1 + 4) > mb.len { break; }
+        if (moff + 1 + 4) > mb.len {
+          break;
+        }
+
         let mtok: u8 = std::runtime::mem::load_u8(mb.ptr, moff);
         let mpat_len: u32 = u32_at(mb.ptr, moff + 1);
         moff = moff + 5;
-        if (moff + (mpat_len as i64)) > mb.len { break; }
+        if (moff + (mpat_len as i64)) > mb.len {
+          break;
+        }
 
         let mpat_ptr: u64 = mb.ptr + (moff as u64);
         let mpat_len_i64: i64 = mpat_len as i64;
-        if mtok == TOK_COMMENT && ok_comment { ok_comment = alt_append(mut pat_comment, mpat_ptr, mpat_len_i64); }
-        else if mtok == TOK_STRING && ok_string { ok_string = alt_append(mut pat_string, mpat_ptr, mpat_len_i64); }
-        else if mtok == TOK_NUMBER && ok_number { ok_number = alt_append(mut pat_number, mpat_ptr, mpat_len_i64); }
-        else if mtok == TOK_KEYWORD && ok_keyword { ok_keyword = alt_append(mut pat_keyword, mpat_ptr, mpat_len_i64); }
-        else if mtok == TOK_TYPE && ok_ty { ok_ty = alt_append(mut pat_ty, mpat_ptr, mpat_len_i64); }
-        else if mtok == TOK_FUNCTION && ok_function { ok_function = alt_append(mut pat_function, mpat_ptr, mpat_len_i64); }
-        else if mtok == TOK_CONSTANT && ok_constant { ok_constant = alt_append(mut pat_constant, mpat_ptr, mpat_len_i64); }
-        else if mtok == TOK_OPERATOR && ok_operator { ok_operator = alt_append(mut pat_operator, mpat_ptr, mpat_len_i64); }
-        else if mtok == TOK_HEADING && ok_heading { ok_heading = alt_append(mut pat_heading, mpat_ptr, mpat_len_i64); }
-        else if mtok == TOK_EMPHASIS && ok_emphasis { ok_emphasis = alt_append(mut pat_emphasis, mpat_ptr, mpat_len_i64); }
-        else if mtok == TOK_PREPROC && ok_preproc { ok_preproc = alt_append(mut pat_preproc, mpat_ptr, mpat_len_i64); }
+        if mtok == TOK_COMMENT && ok_comment {
+          ok_comment = alt_append(mut pat_comment, mpat_ptr, mpat_len_i64);
+        } else if mtok == TOK_STRING && ok_string {
+          ok_string = alt_append(mut pat_string, mpat_ptr, mpat_len_i64);
+        } else if mtok == TOK_NUMBER && ok_number {
+          ok_number = alt_append(mut pat_number, mpat_ptr, mpat_len_i64);
+        } else if mtok == TOK_KEYWORD && ok_keyword {
+          ok_keyword = alt_append(mut pat_keyword, mpat_ptr, mpat_len_i64);
+        } else if mtok == TOK_TYPE && ok_ty {
+          ok_ty = alt_append(mut pat_ty, mpat_ptr, mpat_len_i64);
+        } else if mtok == TOK_FUNCTION && ok_function {
+          ok_function = alt_append(mut pat_function, mpat_ptr, mpat_len_i64);
+        } else if mtok == TOK_CONSTANT && ok_constant {
+          ok_constant = alt_append(mut pat_constant, mpat_ptr, mpat_len_i64);
+        } else if mtok == TOK_OPERATOR && ok_operator {
+          ok_operator = alt_append(mut pat_operator, mpat_ptr, mpat_len_i64);
+        } else if mtok == TOK_HEADING && ok_heading {
+          ok_heading = alt_append(mut pat_heading, mpat_ptr, mpat_len_i64);
+        } else if mtok == TOK_EMPHASIS && ok_emphasis {
+          ok_emphasis = alt_append(mut pat_emphasis, mpat_ptr, mpat_len_i64);
+        } else if mtok == TOK_PREPROC && ok_preproc {
+          ok_preproc = alt_append(mut pat_preproc, mpat_ptr, mpat_len_i64);
+        }
 
         moff = moff + (mpat_len as i64);
         mri = mri + 1;
@@ -4737,6 +5983,7 @@ fn load_for_cache_name (file_name: string) -> Highlighter? {
       any = true;
     }
   }
+
   if pat_string.len > 0 {
     let s: string = std::runtime::mem::string_from_ptr_len(pat_string.ptr, pat_string.len as int);
     let cr: ReCompileResult = RegExp.compile(s, "");
@@ -4747,6 +5994,7 @@ fn load_for_cache_name (file_name: string) -> Highlighter? {
       any = true;
     }
   }
+
   if pat_preproc.len > 0 {
     let s: string = std::runtime::mem::string_from_ptr_len(pat_preproc.ptr, pat_preproc.len as int);
     let cr: ReCompileResult = RegExp.compile(s, "");
@@ -4757,6 +6005,7 @@ fn load_for_cache_name (file_name: string) -> Highlighter? {
       any = true;
     }
   }
+
   if pat_number.len > 0 {
     let s: string = std::runtime::mem::string_from_ptr_len(pat_number.ptr, pat_number.len as int);
     let cr: ReCompileResult = RegExp.compile(s, "");
@@ -4767,6 +6016,7 @@ fn load_for_cache_name (file_name: string) -> Highlighter? {
       any = true;
     }
   }
+
   if pat_keyword.len > 0 {
     let s: string = std::runtime::mem::string_from_ptr_len(pat_keyword.ptr, pat_keyword.len as int);
     let cr: ReCompileResult = RegExp.compile(s, "");
@@ -4777,6 +6027,7 @@ fn load_for_cache_name (file_name: string) -> Highlighter? {
       any = true;
     }
   }
+
   if pat_ty.len > 0 {
     let s: string = std::runtime::mem::string_from_ptr_len(pat_ty.ptr, pat_ty.len as int);
     let cr: ReCompileResult = RegExp.compile(s, "");
@@ -4787,6 +6038,7 @@ fn load_for_cache_name (file_name: string) -> Highlighter? {
       any = true;
     }
   }
+
   if pat_function.len > 0 {
     let s: string = std::runtime::mem::string_from_ptr_len(pat_function.ptr, pat_function.len as int);
     let cr: ReCompileResult = RegExp.compile(s, "");
@@ -4797,6 +6049,7 @@ fn load_for_cache_name (file_name: string) -> Highlighter? {
       any = true;
     }
   }
+
   if pat_constant.len > 0 {
     let s: string = std::runtime::mem::string_from_ptr_len(pat_constant.ptr, pat_constant.len as int);
     let cr: ReCompileResult = RegExp.compile(s, "");
@@ -4807,6 +6060,7 @@ fn load_for_cache_name (file_name: string) -> Highlighter? {
       any = true;
     }
   }
+
   if pat_heading.len > 0 {
     let s: string = std::runtime::mem::string_from_ptr_len(pat_heading.ptr, pat_heading.len as int);
     let cr: ReCompileResult = RegExp.compile(s, "");
@@ -4817,6 +6071,7 @@ fn load_for_cache_name (file_name: string) -> Highlighter? {
       any = true;
     }
   }
+
   if pat_emphasis.len > 0 {
     let s: string = std::runtime::mem::string_from_ptr_len(pat_emphasis.ptr, pat_emphasis.len as int);
     let cr: ReCompileResult = RegExp.compile(s, "");
@@ -4827,6 +6082,7 @@ fn load_for_cache_name (file_name: string) -> Highlighter? {
       any = true;
     }
   }
+
   if pat_operator.len > 0 {
     let s: string = std::runtime::mem::string_from_ptr_len(pat_operator.ptr, pat_operator.len as int);
     let cr: ReCompileResult = RegExp.compile(s, "");
@@ -4847,15 +6103,25 @@ fn load_for_cache_name (file_name: string) -> Highlighter? {
 
 export fn load_for_path (path: string) -> Highlighter? {
   let idx_opt: BufferU8? = BufferU8.init(8192);
-  if idx_opt == None { return None; }
-  let mut idx: BufferU8 = match (idx_opt) { Some(v) => v, None => BufferU8.empty() };
+  if idx_opt == None {
+    return None;
+  }
+
+  let mut idx: BufferU8 = match (idx_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
   if !load_index_file(mut idx) {
     return None;
   }
 
   let cache_name_opt: BufferU8? = BufferU8.init(256);
-  if cache_name_opt == None { return None; }
-  let mut cache_name: BufferU8 = match (cache_name_opt) { Some(v) => v, None => BufferU8.empty() };
+  if cache_name_opt == None {
+    return None;
+  }
+
+  let mut cache_name: BufferU8 = match (cache_name_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
   if !cache_name_for_path(&idx, path, mut cache_name) {
     return None;
   }
@@ -4877,21 +6143,33 @@ export fn load_for_key (key: string) -> Highlighter? {
   }
 
   let idx_opt: BufferU8? = BufferU8.init(8192);
-  if idx_opt == None { return None; }
-  let mut idx: BufferU8 = match (idx_opt) { Some(v) => v, None => BufferU8.empty() };
+  if idx_opt == None {
+    return None;
+  }
+
+  let mut idx: BufferU8 = match (idx_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
   if !load_index_file(mut idx) {
     return None;
   }
 
   let cache_name_opt: BufferU8? = BufferU8.init(256);
-  if cache_name_opt == None { return None; }
-  let mut cache_name: BufferU8 = match (cache_name_opt) { Some(v) => v, None => BufferU8.empty() };
+  if cache_name_opt == None {
+    return None;
+  }
+
+  let mut cache_name: BufferU8 = match (cache_name_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
 
   var found: bool = find_in_index(&idx, key_ptr, key_len, mut cache_name);
   if !found {
     let tmp_opt: BufferU8? = BufferU8.init(key_len);
     if tmp_opt != None {
-      let mut tmp: BufferU8 = match (tmp_opt) { Some(v) => v, None => BufferU8.empty() };
+      let mut tmp: BufferU8 = match (tmp_opt) {
+        Some(v) => v, None => BufferU8.empty()
+      };
       let _ = tmp.push_ptr_len(key_ptr, key_len);
       to_lower_ascii_inplace(tmp.ptr, tmp.len);
       found = find_in_index(&idx, tmp.ptr, tmp.len, mut cache_name);
@@ -4908,13 +6186,23 @@ export fn load_for_key (key: string) -> Highlighter? {
 
 export fn load_for_path_or_first_line (path: string, line_ptr: u64, line_len: i64) -> Highlighter? {
   let idx_opt: BufferU8? = BufferU8.init(8192);
-  if idx_opt == None { return None; }
-  let mut idx: BufferU8 = match (idx_opt) { Some(v) => v, None => BufferU8.empty() };
+  if idx_opt == None {
+    return None;
+  }
+
+  let mut idx: BufferU8 = match (idx_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
   let have_index: bool = load_index_file(mut idx);
 
   let cache_name_opt: BufferU8? = BufferU8.init(256);
-  if cache_name_opt == None { return None; }
-  let mut cache_name: BufferU8 = match (cache_name_opt) { Some(v) => v, None => BufferU8.empty() };
+  if cache_name_opt == None {
+    return None;
+  }
+
+  let mut cache_name: BufferU8 = match (cache_name_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
 
   if have_index && cache_name_for_path(&idx, path, mut cache_name) {
     let file_name: string = std::runtime::mem::string_from_ptr_len(cache_name.ptr, cache_name.len as int);
@@ -4923,11 +6211,17 @@ export fn load_for_path_or_first_line (path: string, line_ptr: u64, line_len: i6
 
   // Fallback: first-line matches extracted from syntax sources.
   let fl_opt: BufferU8? = BufferU8.init(8192);
-  if fl_opt == None { return None; }
-  let mut fl: BufferU8 = match (fl_opt) { Some(v) => v, None => BufferU8.empty() };
+  if fl_opt == None {
+    return None;
+  }
+
+  let mut fl: BufferU8 = match (fl_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
   if !load_first_line_file(mut fl) {
     return None;
   }
+
   if !find_first_line_match(&fl, line_ptr, line_len, mut cache_name) {
     return None;
   }
@@ -4938,27 +6232,44 @@ export fn load_for_path_or_first_line (path: string, line_ptr: u64, line_len: i6
 
 export fn has_syntax_for_path_or_first_line (path: string, line_ptr: u64, line_len: i64) -> bool {
   let idx_opt: BufferU8? = BufferU8.init(8192);
-  if idx_opt == None { return false; }
-  let mut idx: BufferU8 = match (idx_opt) { Some(v) => v, None => BufferU8.empty() };
+  if idx_opt == None {
+    return false;
+  }
+
+  let mut idx: BufferU8 = match (idx_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
   let have_index: bool = load_index_file(mut idx);
 
   let tmp_opt: BufferU8? = BufferU8.init(256);
-  if tmp_opt == None { return false; }
-  let mut tmp: BufferU8 = match (tmp_opt) { Some(v) => v, None => BufferU8.empty() };
+  if tmp_opt == None {
+    return false;
+  }
+
+  let mut tmp: BufferU8 = match (tmp_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
 
   if have_index && cache_name_for_path(&idx, path, mut tmp) {
     return true;
   }
 
   let fl_opt: BufferU8? = BufferU8.init(8192);
-  if fl_opt == None { return false; }
-  let mut fl: BufferU8 = match (fl_opt) { Some(v) => v, None => BufferU8.empty() };
+  if fl_opt == None {
+    return false;
+  }
+
+  let mut fl: BufferU8 = match (fl_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
   if !load_first_line_file(mut fl) {
     return false;
   }
+
   if find_first_line_match(&fl, line_ptr, line_len, mut tmp) {
     return true;
   }
+
   return false;
 }
 
@@ -4975,19 +6286,34 @@ export fn has_syntax_for_path (path: string) -> bool {
   }
 
   let key_buf_opt: BufferU8? = BufferU8.init(base_len + 1);
-  if key_buf_opt == None { return false; }
-  let mut key_buf: BufferU8 = match (key_buf_opt) { Some(v) => v, None => BufferU8.empty() };
+  if key_buf_opt == None {
+    return false;
+  }
+
+  let mut key_buf: BufferU8 = match (key_buf_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
   let idx_opt: BufferU8? = BufferU8.init(8192);
-  if idx_opt == None { return false; }
-  let mut idx: BufferU8 = match (idx_opt) { Some(v) => v, None => BufferU8.empty() };
+  if idx_opt == None {
+    return false;
+  }
+
+  let mut idx: BufferU8 = match (idx_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
 
   if !load_index_file(mut idx) {
     return false;
   }
 
   let tmp_opt: BufferU8? = BufferU8.init(256);
-  if tmp_opt == None { return false; }
-  let mut tmp: BufferU8 = match (tmp_opt) { Some(v) => v, None => BufferU8.empty() };
+  if tmp_opt == None {
+    return false;
+  }
+
+  let mut tmp: BufferU8 = match (tmp_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
 
   // Prefer full basename (for ".gitignore", "Makefile").
   key_buf.clear();
@@ -5040,6 +6366,7 @@ fn apply_re (tok: u8, re: &RegExp, ptr: u64, len: i64, out_styles: u64) -> bool 
           if std::runtime::mem::load_u8(out_styles, j) == TOK_NONE {
             std::runtime::mem::store_u8(out_styles, j, tok);
           }
+
           j = j + 1;
         }
       }
@@ -5049,12 +6376,15 @@ fn apply_re (tok: u8, re: &RegExp, ptr: u64, len: i64, out_styles: u64) -> bool 
       } else {
         start = r.end;
       }
+
       if (start as i64) >= len {
         break;
       }
+
       iters = iters + 1;
       continue;
     }
+
     if r.code == EXEC_NO_MATCH {
       break;
     }
@@ -5074,6 +6404,7 @@ export fn highlight_segment_stateful (h: &Highlighter, mut st: &HLState, ptr: u6
   if ptr == 0 || len <= 0 || out_styles == 0 {
     return false;
   }
+
   if len > MAX_I32 {
     return false;
   }
@@ -5110,17 +6441,49 @@ export fn highlight_segment_stateful (h: &Highlighter, mut st: &HLState, ptr: u6
   }
 
   // Priority order: earlier tokens win (we only paint TOK_NONE bytes).
-  if h.has_comment && !range_comments { let _ = apply_re(TOK_COMMENT, &h.comment, ptr, len, out_styles); }
-  if h.has_string && !range_strings { let _ = apply_re(TOK_STRING, &h.string, ptr, len, out_styles); }
-  if h.has_preproc { let _ = apply_re(TOK_PREPROC, &h.preproc, ptr, len, out_styles); }
-  if h.has_number { let _ = apply_re(TOK_NUMBER, &h.number, ptr, len, out_styles); }
-  if h.has_keyword { let _ = apply_re(TOK_KEYWORD, &h.keyword, ptr, len, out_styles); }
-  if h.has_ty { let _ = apply_re(TOK_TYPE, &h.ty, ptr, len, out_styles); }
-  if h.has_function { let _ = apply_re(TOK_FUNCTION, &h.function, ptr, len, out_styles); }
-  if h.has_constant { let _ = apply_re(TOK_CONSTANT, &h.constant, ptr, len, out_styles); }
-  if h.has_heading { let _ = apply_re(TOK_HEADING, &h.heading, ptr, len, out_styles); }
-  if h.has_emphasis { let _ = apply_re(TOK_EMPHASIS, &h.emphasis, ptr, len, out_styles); }
-  if h.has_operator { let _ = apply_re(TOK_OPERATOR, &h.operator, ptr, len, out_styles); }
+  if h.has_comment && !range_comments {
+    let _ = apply_re(TOK_COMMENT, &h.comment, ptr, len, out_styles);
+  }
+
+  if h.has_string && !range_strings {
+    let _ = apply_re(TOK_STRING, &h.string, ptr, len, out_styles);
+  }
+
+  if h.has_preproc {
+    let _ = apply_re(TOK_PREPROC, &h.preproc, ptr, len, out_styles);
+  }
+
+  if h.has_number {
+    let _ = apply_re(TOK_NUMBER, &h.number, ptr, len, out_styles);
+  }
+
+  if h.has_keyword {
+    let _ = apply_re(TOK_KEYWORD, &h.keyword, ptr, len, out_styles);
+  }
+
+  if h.has_ty {
+    let _ = apply_re(TOK_TYPE, &h.ty, ptr, len, out_styles);
+  }
+
+  if h.has_function {
+    let _ = apply_re(TOK_FUNCTION, &h.function, ptr, len, out_styles);
+  }
+
+  if h.has_constant {
+    let _ = apply_re(TOK_CONSTANT, &h.constant, ptr, len, out_styles);
+  }
+
+  if h.has_heading {
+    let _ = apply_re(TOK_HEADING, &h.heading, ptr, len, out_styles);
+  }
+
+  if h.has_emphasis {
+    let _ = apply_re(TOK_EMPHASIS, &h.emphasis, ptr, len, out_styles);
+  }
+
+  if h.has_operator {
+    let _ = apply_re(TOK_OPERATOR, &h.operator, ptr, len, out_styles);
+  }
 
   return true;
 }
@@ -5162,7 +6525,10 @@ fn test_exts_has (exts: &BufferU8, s: string) -> bool {
   var i: i64 = 0;
   while i < exts.len {
     let start: i64 = i;
-    while i < exts.len && std::runtime::mem::load_u8(exts.ptr, i) != 0 { i = i + 1; }
+    while i < exts.len && std::runtime::mem::load_u8(exts.ptr, i) != 0 {
+      i = i + 1;
+    }
+
     let l: i64 = i - start;
     if l == s_len {
       var j: i64 = 0;
@@ -5172,11 +6538,18 @@ fn test_exts_has (exts: &BufferU8, s: string) -> bool {
           ok = false;
           break;
         }
+
         j = j + 1;
       }
-      if ok { return true; }
+
+      if ok {
+        return true;
+      }
     }
-    if i < exts.len && std::runtime::mem::load_u8(exts.ptr, i) == 0 { i = i + 1; }
+
+    if i < exts.len && std::runtime::mem::load_u8(exts.ptr, i) == 0 {
+      i = i + 1;
+    }
   }
 
   return false;
@@ -5186,20 +6559,25 @@ fn test_toks_has (toks: &BufferU8, tok: u8) -> bool {
   if toks.ptr == 0 || toks.len <= 0 {
     return false;
   }
+
   var i: i64 = 0;
   while i < toks.len {
     if std::runtime::mem::load_u8(toks.ptr, i) == tok {
       return true;
     }
+
     i = i + 1;
   }
+
   return false;
 }
 
 test "parse_atom_cson extracts fileTypes and match rules" {
   let buf_opt: BufferU8? = BufferU8.init(1024);
   assert(buf_opt != None, "buf init");
-  let mut buf: BufferU8 = match (buf_opt) { Some(v) => v, None => BufferU8.empty() };
+  let mut buf: BufferU8 = match (buf_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
   let _ = buf.push_str("scopeName: 'source.test'\n");
   let _ = buf.push_str("fileTypes: [ 'js', 'jsx' ]\n");
   let _ = buf.push_str("patterns: [\n");
@@ -5211,16 +6589,24 @@ test "parse_atom_cson extracts fileTypes and match rules" {
 
   let exts_opt: BufferU8? = BufferU8.init(64);
   assert(exts_opt != None, "exts init");
-  let mut exts: BufferU8 = match (exts_opt) { Some(v) => v, None => BufferU8.empty() };
+  let mut exts: BufferU8 = match (exts_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
   let first_lines_opt: BufferU8? = BufferU8.init(128);
   assert(first_lines_opt != None, "first_lines init");
-  let mut first_lines: BufferU8 = match (first_lines_opt) { Some(v) => v, None => BufferU8.empty() };
+  let mut first_lines: BufferU8 = match (first_lines_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
   let rules_opt: BufferU8? = BufferU8.init(128);
   assert(rules_opt != None, "rules init");
-  let mut rules: BufferU8 = match (rules_opt) { Some(v) => v, None => BufferU8.empty() };
+  let mut rules: BufferU8 = match (rules_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
   let toks_opt: BufferU8? = BufferU8.init(32);
   assert(toks_opt != None, "toks init");
-  let mut toks: BufferU8 = match (toks_opt) { Some(v) => v, None => BufferU8.empty() };
+  let mut toks: BufferU8 = match (toks_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
 
   let mut meta: SyntaxMeta = SyntaxMeta{ flags: 0 };
   let ok: bool = parse_atom_cson(&buf, "test.sagec", mut exts, mut first_lines, mut rules, mut toks, mut meta);
@@ -5236,7 +6622,9 @@ test "parse_atom_cson extracts fileTypes and match rules" {
 test "parse_sublime_syntax extracts nested context rules + range flags" {
   let buf_opt: BufferU8? = BufferU8.init(2048);
   assert(buf_opt != None, "buf init");
-  let mut buf: BufferU8 = match (buf_opt) { Some(v) => v, None => BufferU8.empty() };
+  let mut buf: BufferU8 = match (buf_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
 
   let _ = buf.push_str("%YAML 1.2\n---\n");
   let _ = buf.push_str("name: Test\n");
@@ -5267,16 +6655,24 @@ test "parse_sublime_syntax extracts nested context rules + range flags" {
 
   let exts_opt: BufferU8? = BufferU8.init(64);
   assert(exts_opt != None, "exts init");
-  let mut exts: BufferU8 = match (exts_opt) { Some(v) => v, None => BufferU8.empty() };
+  let mut exts: BufferU8 = match (exts_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
   let first_lines_opt: BufferU8? = BufferU8.init(64);
   assert(first_lines_opt != None, "first_lines init");
-  let mut first_lines: BufferU8 = match (first_lines_opt) { Some(v) => v, None => BufferU8.empty() };
+  let mut first_lines: BufferU8 = match (first_lines_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
   let rules_opt: BufferU8? = BufferU8.init(128);
   assert(rules_opt != None, "rules init");
-  let mut rules: BufferU8 = match (rules_opt) { Some(v) => v, None => BufferU8.empty() };
+  let mut rules: BufferU8 = match (rules_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
   let toks_opt: BufferU8? = BufferU8.init(64);
   assert(toks_opt != None, "toks init");
-  let mut toks: BufferU8 = match (toks_opt) { Some(v) => v, None => BufferU8.empty() };
+  let mut toks: BufferU8 = match (toks_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
 
   let mut meta: SyntaxMeta = SyntaxMeta{ flags: 0 };
   let ok: bool = parse_sublime_syntax(&buf, "test.sagec", mut exts, mut first_lines, mut rules, mut toks, mut meta);
@@ -5290,7 +6686,9 @@ test "parse_sublime_syntax extracts nested context rules + range flags" {
 test "parse_atom_cson extracts begin/end range flags" {
   let buf_opt: BufferU8? = BufferU8.init(1024);
   assert(buf_opt != None, "buf init");
-  let mut buf: BufferU8 = match (buf_opt) { Some(v) => v, None => BufferU8.empty() };
+  let mut buf: BufferU8 = match (buf_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
   let _ = buf.push_str("scopeName: 'source.test'\n");
   let _ = buf.push_str("fileTypes: [ 'js' ]\n");
   let _ = buf.push_str("patterns: [\n");
@@ -5301,16 +6699,24 @@ test "parse_atom_cson extracts begin/end range flags" {
 
   let exts_opt: BufferU8? = BufferU8.init(64);
   assert(exts_opt != None, "exts init");
-  let mut exts: BufferU8 = match (exts_opt) { Some(v) => v, None => BufferU8.empty() };
+  let mut exts: BufferU8 = match (exts_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
   let first_lines_opt: BufferU8? = BufferU8.init(64);
   assert(first_lines_opt != None, "first_lines init");
-  let mut first_lines: BufferU8 = match (first_lines_opt) { Some(v) => v, None => BufferU8.empty() };
+  let mut first_lines: BufferU8 = match (first_lines_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
   let rules_opt: BufferU8? = BufferU8.init(64);
   assert(rules_opt != None, "rules init");
-  let mut rules: BufferU8 = match (rules_opt) { Some(v) => v, None => BufferU8.empty() };
+  let mut rules: BufferU8 = match (rules_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
   let toks_opt: BufferU8? = BufferU8.init(16);
   assert(toks_opt != None, "toks init");
-  let mut toks: BufferU8 = match (toks_opt) { Some(v) => v, None => BufferU8.empty() };
+  let mut toks: BufferU8 = match (toks_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
 
   let mut meta: SyntaxMeta = SyntaxMeta{ flags: 0 };
   let ok: bool = parse_atom_cson(&buf, "test.sagec", mut exts, mut first_lines, mut rules, mut toks, mut meta);
@@ -5323,7 +6729,9 @@ test "parse_atom_cson extracts begin/end range flags" {
 test "parse_textmate_syntax extracts begin/end range flags" {
   let buf_opt: BufferU8? = BufferU8.init(2048);
   assert(buf_opt != None, "buf init");
-  let mut buf: BufferU8 = match (buf_opt) { Some(v) => v, None => BufferU8.empty() };
+  let mut buf: BufferU8 = match (buf_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
   let _ = buf.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
   let _ = buf.push_str("<plist version=\"1.0\"><dict>\n");
   let _ = buf.push_str("<key>fileTypes</key><array><string>c</string><string>C</string></array>\n");
@@ -5334,16 +6742,24 @@ test "parse_textmate_syntax extracts begin/end range flags" {
 
   let exts_opt: BufferU8? = BufferU8.init(64);
   assert(exts_opt != None, "exts init");
-  let mut exts: BufferU8 = match (exts_opt) { Some(v) => v, None => BufferU8.empty() };
+  let mut exts: BufferU8 = match (exts_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
   let first_lines_opt: BufferU8? = BufferU8.init(64);
   assert(first_lines_opt != None, "first_lines init");
-  let mut first_lines: BufferU8 = match (first_lines_opt) { Some(v) => v, None => BufferU8.empty() };
+  let mut first_lines: BufferU8 = match (first_lines_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
   let rules_opt: BufferU8? = BufferU8.init(64);
   assert(rules_opt != None, "rules init");
-  let mut rules: BufferU8 = match (rules_opt) { Some(v) => v, None => BufferU8.empty() };
+  let mut rules: BufferU8 = match (rules_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
   let toks_opt: BufferU8? = BufferU8.init(16);
   assert(toks_opt != None, "toks init");
-  let mut toks: BufferU8 = match (toks_opt) { Some(v) => v, None => BufferU8.empty() };
+  let mut toks: BufferU8 = match (toks_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
 
   let mut meta: SyntaxMeta = SyntaxMeta{ flags: 0 };
   let ok: bool = parse_textmate_syntax(&buf, "test.sagec", mut exts, mut first_lines, mut rules, mut toks, mut meta);
@@ -5356,7 +6772,9 @@ test "parse_textmate_syntax extracts begin/end range flags" {
 test "parse_textmate_json extracts fileTypes + range flags" {
   let buf_opt: BufferU8? = BufferU8.init(4096);
   assert(buf_opt != None, "buf init");
-  let mut buf: BufferU8 = match (buf_opt) { Some(v) => v, None => BufferU8.empty() };
+  let mut buf: BufferU8 = match (buf_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
 
   let _ = buf.push_str("{\n");
   let _ = buf.push_str("  \"name\": \"Test\",\n");
@@ -5372,16 +6790,24 @@ test "parse_textmate_json extracts fileTypes + range flags" {
 
   let exts_opt: BufferU8? = BufferU8.init(64);
   assert(exts_opt != None, "exts init");
-  let mut exts: BufferU8 = match (exts_opt) { Some(v) => v, None => BufferU8.empty() };
+  let mut exts: BufferU8 = match (exts_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
   let first_lines_opt: BufferU8? = BufferU8.init(64);
   assert(first_lines_opt != None, "first_lines init");
-  let mut first_lines: BufferU8 = match (first_lines_opt) { Some(v) => v, None => BufferU8.empty() };
+  let mut first_lines: BufferU8 = match (first_lines_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
   let rules_opt: BufferU8? = BufferU8.init(256);
   assert(rules_opt != None, "rules init");
-  let mut rules: BufferU8 = match (rules_opt) { Some(v) => v, None => BufferU8.empty() };
+  let mut rules: BufferU8 = match (rules_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
   let toks_opt: BufferU8? = BufferU8.init(64);
   assert(toks_opt != None, "toks init");
-  let mut toks: BufferU8 = match (toks_opt) { Some(v) => v, None => BufferU8.empty() };
+  let mut toks: BufferU8 = match (toks_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
 
   let mut meta: SyntaxMeta = SyntaxMeta{ flags: 0 };
   let ok: bool = parse_textmate_json(&buf, "test.sagec", mut exts, mut first_lines, mut rules, mut toks, mut meta);
@@ -5411,7 +6837,9 @@ test "highlight_segment_stateful keeps keywords out of wrapped strings" {
   let n1: i64 = std::runtime::mem::string_len(s1);
   let styles1_opt: BufferU8? = BufferU8.init(n1);
   assert(styles1_opt != None, "styles1 init");
-  let styles1: BufferU8 = match (styles1_opt) { Some(v) => v, None => BufferU8.empty() };
+  let styles1: BufferU8 = match (styles1_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
   let ok1: bool = highlight_segment_stateful(&h, mut st, p1, n1, styles1.ptr);
   assert(ok1, "hl1 ok");
   assert(st.mode == HL_MODE_STRING, "inside string after seg1");
@@ -5422,7 +6850,9 @@ test "highlight_segment_stateful keeps keywords out of wrapped strings" {
   let n2: i64 = std::runtime::mem::string_len(s2);
   let styles2_opt: BufferU8? = BufferU8.init(n2);
   assert(styles2_opt != None, "styles2 init");
-  let styles2: BufferU8 = match (styles2_opt) { Some(v) => v, None => BufferU8.empty() };
+  let styles2: BufferU8 = match (styles2_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
   let ok2: bool = highlight_segment_stateful(&h, mut st, p2, n2, styles2.ptr);
   assert(ok2, "hl2 ok");
   assert(std::runtime::mem::load_u8(styles2.ptr, 0) == TOK_STRING, "keyword painted as string");
@@ -5439,7 +6869,9 @@ test "highlight_segment_stateful handles */ split across segments" {
   let n1: i64 = std::runtime::mem::string_len(s1);
   let styles1_opt: BufferU8? = BufferU8.init(n1);
   assert(styles1_opt != None, "styles1 init");
-  let styles1: BufferU8 = match (styles1_opt) { Some(v) => v, None => BufferU8.empty() };
+  let styles1: BufferU8 = match (styles1_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
   let ok1: bool = highlight_segment_stateful(&h, mut st, p1, n1, styles1.ptr);
   assert(ok1, "hl1 ok");
   assert(st.mode == HL_MODE_BLOCK_COMMENT, "inside block comment after seg1");
@@ -5449,7 +6881,9 @@ test "highlight_segment_stateful handles */ split across segments" {
   let n2: i64 = std::runtime::mem::string_len(s2);
   let styles2_opt: BufferU8? = BufferU8.init(n2);
   assert(styles2_opt != None, "styles2 init");
-  let styles2: BufferU8 = match (styles2_opt) { Some(v) => v, None => BufferU8.empty() };
+  let styles2: BufferU8 = match (styles2_opt) {
+    Some(v) => v, None => BufferU8.empty()
+  };
   let ok2: bool = highlight_segment_stateful(&h, mut st, p2, n2, styles2.ptr);
   assert(ok2, "hl2 ok");
   assert(std::runtime::mem::load_u8(styles2.ptr, 0) == TOK_COMMENT, "closing '/' is comment");

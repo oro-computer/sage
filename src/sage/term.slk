@@ -20,11 +20,13 @@ export fn get_size (fd: int) -> Size {
   if packed == 0 {
     return size_default();
   }
+
   let rows: int = (packed >> 32) as int;
   let cols: int = (packed & (0xFFFFFFFF as u64)) as int;
   if rows <= 0 || cols <= 0 {
     return size_default();
   }
+
   return Size{ rows: rows, cols: cols };
 }
 
@@ -42,10 +44,13 @@ export fn raw_mode_enable (fd: int) -> RawMode? {
     return None;
   }
 
-  let h: u64 = match (h_r) { Ok(v) => v, Err(_) => 0 };
+  let h: u64 = match (h_r) {
+    Ok(v) => v, Err(_) => 0
+  };
   if h == 0 {
     return None;
   }
+
   return Some(RawMode{ handle: h, enabled: true });
 }
 
@@ -58,6 +63,7 @@ impl RawMode {
     if !self.enabled {
       return;
     }
+
     let _ = std::runtime::io::tty_raw_leave(self.handle);
     self.handle = 0;
     self.enabled = false;

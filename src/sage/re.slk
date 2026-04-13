@@ -66,6 +66,7 @@ impl RegExp {
     if r.code != 0 {
       return RegExpCompileResult.err(CompileFailed{ code: r.code as int });
     }
+
     return RegExpCompileResult.ok(RegExp{ ptr: r.ptr, len: r.len });
   }
 }
@@ -75,6 +76,7 @@ impl RegExp as std::interfaces::Drop {
     if self.ptr != 0 {
       silk_rt_regexp_free(self.ptr, self.len);
     }
+
     self.ptr = 0;
     self.len = 0;
   }
@@ -89,6 +91,7 @@ export fn search_bytes (re: &RegExp, input_ptr: u64, input_len: i64, start: int)
   if input_ptr == 0 || input_len < 0 {
     return ExecResult{ code: EXEC_ERR_INVALID_INPUT, start: 0, end: 0 };
   }
+
   let start_i64: i64 = start as i64;
   if start_i64 < 0 || start_i64 > input_len {
     return ExecResult{ code: EXEC_ERR_INVALID_INPUT, start: 0, end: 0 };
@@ -100,6 +103,7 @@ export fn search_bytes (re: &RegExp, input_ptr: u64, input_len: i64, start: int)
   if r.code != EXEC_MATCH {
     return r;
   }
+
   return ExecResult{
     code: EXEC_MATCH,
     start: r.start + start,
