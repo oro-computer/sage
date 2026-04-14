@@ -1197,6 +1197,7 @@ export async fn run (package_root: string, action: string) -> int {
 
   b.target_add_input(t, "src/native/sage_qjs.c");
   b.target_add_input(t, "quickjs/quickjs.c");
+  b.target_add_input(t, "quickjs/cutils.h");
   if os::PLATFORM_NAME == "linux" {
     b.target_add_input(t, "quickjs/dtoa.c");
     b.target_add_input(t, "quickjs/libregexp.c");
